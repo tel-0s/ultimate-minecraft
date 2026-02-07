@@ -1,0 +1,106 @@
+use std::sync::Arc;
+use ultimate_engine::world::World;
+
+#[tokio::main]
+async fn main() {
+    let demo_mode = std::env::args().any(|a| a == "--demo");
+    let bind_addr = std::env::args()
+        .skip_while(|a| a != "--bind")
+        .nth(1)
+        .unwrap_or_else(|| "0.0.0.0:25565".into());
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".parse().unwrap()),
+        )
+        .init();
+
+    if demo_mode {
+        run_demo();
+        return;
+    }
+
+    tracing::info!("Ultimate Minecraft -- causal voxel engine server");
+    tracing::info!("Generating flat world...");
+
+    let world = Arc::new(World::new());
+
+    tracing::info!("Starting Minecraft 1.21.11 server on {}", bind_addr);
+    if let Err(e) = ultimate_server::net::listener::run(world, &bind_addr).await {
+        tracing::error!("Server error: {}", e);
+    }
+}
+
+/// Original sand-drop demo for testing the causal engine.
+fn run_demo() {
+    use ultimate_engine::causal::event::{Event, EventPayload};
+    use ultimate_engine::causal::graph::CausalGraph;
+    use ultimate_engine::causal::scheduler::Scheduler;
+    use ultimate_engine::world::chunk::{Chunk, SECTION_SIZE};
+    use ultimate_engine::world::position::{BlockPos, ChunkPos, LocalBlockPos};
+    use ultimate_server::block;
+
+    let dump_dot = std::env::args().any(|a| a == "--dot");
+    let use_parallel = std::env::args().any(|a| a == "--parallel");
+
+    tracing::info!("Ultimate Minecraft -- causal engine demo");
+    tracing::info!("Generating flat world...");
+
+    let world = World::new();
+    for cx in -4..4 {
+        for cz in -4..4 {
+            let mut chunk = Chunk::new();
+            for x in 0..SECTION_SIZE as u8 {
+                for z in 0..SECTION_SIZE as u8 {
+                    chunk.set_block(LocalBlockPos { x, y: 0, z }, block::BEDROCK);
+                    for y in 1..=3i64 {
+                        chunk.set_block(LocalBlockPos { x, y, z }, block::STONE);
+                    }
+                    chunk.set_block(LocalBlockPos { x, y: 4, z }, block::DIRT);
+                }
+            }
+            world.insert_chunk(ChunkPos::new(cx, cz), chunk);
+        }
+    }
+
+    tracing::info!("World ready: {} chunks loaded", world.chunk_count());
+
+    let mut graph = CausalGraph::new();
+    let rules = ultimate_server::rules::standard();
+    let scheduler = Scheduler::new();
+
+    let sand_pos = BlockPos::new(8, 10, 8);
+    graph.insert_root(Event {
+        payload: EventPayload::BlockSet {
+            pos: sand_pos,
+            old: block::AIR,
+            new: block::SAND,
+        },
+    });
+
+    tracing::info!("Injected sand at {:?}", sand_pos);
+
+    let total = if use_parallel {
+        tracing::info!("Running PARALLEL scheduler...");
+        scheduler.run_until_quiet_parallel(&world, &mut graph, &rules, 100)
+    } else {
+        tracing::info!("Running sequential scheduler...");
+        scheduler.run_until_quiet(&world, &mut graph, &rules, 100)
+    };
+
+    tracing::info!("Quiescence after {} events ({} in graph)", total, graph.len());
+
+    let landed = world.get_block(BlockPos::new(8, 5, 8));
+    tracing::info!("Block at (8, 5, 8): {:?}", landed);
+
+    if landed == block::SAND {
+        tracing::info!("Sand landed correctly on the surface.");
+    } else {
+        tracing::warn!("Unexpected block -- something is off.");
+    }
+
+    if dump_dot {
+        print!("{}", graph.to_dot());
+    }
+}

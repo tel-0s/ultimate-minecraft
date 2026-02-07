@@ -1,0 +1,11 @@
+[package]
+name = "ultimate-engine"
+version = "0.1.0"
+edition = "2024"
+description = "Game-agnostic causal voxel engine: no global tick, maximal parallelism"
+
+[dependencies]
+rayon = "1.10"
+dashmap = "6"
+slotmap = "1"
+tracing = "0.1"

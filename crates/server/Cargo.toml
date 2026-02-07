@@ -1,0 +1,33 @@
+[package]
+name = "ultimate-server"
+version = "0.1.0"
+edition = "2024"
+description = "Minecraft 1.21.11 server built on the causal voxel engine"
+
+[dependencies]
+ultimate-engine = { path = "../engine" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# MC 1.21.11 protocol codec
+azalea-protocol = "0.15"
+azalea-core = "0.15"
+azalea-registry = "0.15"
+azalea-buf = "0.15"
+azalea-auth = "0.15"
+
+azalea-block = "0.15"
+azalea-chat = "0.15"
+azalea-entity = "0.15"
+azalea-crypto = "0.15"
+azalea-world = "0.15"
+
+# Supporting
+anyhow = "1"
+uuid = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+indexmap = "2.13.0"

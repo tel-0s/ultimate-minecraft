@@ -1,0 +1,36 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(where:*)",
+      "Bash(cargo --version:*)",
+      "Bash(cargo init:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo run:*)",
+      "Bash(cargo test:*)",
+      "Bash(taskkill:*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:minestom.net)",
+      "WebFetch(domain:minecraft.wiki)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:valence.rs)",
+      "WebFetch(domain:javadoc.minestom.net)",
+      "WebFetch(domain:crates.io)",
+      "WebFetch(domain:lib.rs)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:azalea.matdoes.dev)",
+      "Bash(cargo check:*)",
+      "Bash(rustup toolchain:*)",
+      "Bash(rustup run nightly rustc:*)",
+      "Bash(dir:*)",
+      "WebFetch(domain:misode.github.io)",
+      "WebFetch(domain:www.minecraft.net)",
+      "Bash(cargo add:*)",
+      "Bash(gh api:*)",
+      "WebFetch(domain:wiki.vg)",
+      "Bash(gh search code:*)",
+      "Bash(python:*)",
+      "Bash(findstr:*)"
+    ]
+  }
+}
