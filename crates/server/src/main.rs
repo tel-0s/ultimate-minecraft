@@ -25,6 +25,8 @@ async fn main() {
     tracing::info!("Generating flat world...");
 
     let world = Arc::new(World::new());
+    generate_flat_world_mc(&world, 8);
+    tracing::info!("World ready: {} chunks loaded", world.chunk_count());
 
     tracing::info!("Starting Minecraft 1.21.11 server on {}", bind_addr);
     if let Err(e) = ultimate_server::net::listener::run(world, &bind_addr).await {
@@ -102,5 +104,38 @@ fn run_demo() {
 
     if dump_dot {
         print!("{}", graph.to_dot());
+    }
+}
+
+/// Generate a flat world using MC block state IDs (for the real server).
+/// Bedrock at y=60, stone y=61-63, dirt at y=64-79. Player spawns at y=80.
+fn generate_flat_world_mc(world: &World, chunk_radius: i32) {
+    use ultimate_engine::world::position::{ChunkPos, LocalBlockPos};
+    use ultimate_engine::world::chunk::Chunk;
+    use ultimate_server::block;
+
+    for cx in -chunk_radius..chunk_radius {
+        for cz in -chunk_radius..chunk_radius {
+            let mut chunk = Chunk::new();
+
+            // Section 7 (y=48..63): bedrock at y=60, stone at y=61-63
+            for x in 0..16u8 {
+                for z in 0..16u8 {
+                    chunk.set_block(LocalBlockPos { x, y: 60, z }, block::BEDROCK);
+                    for y in 61..=63i64 {
+                        chunk.set_block(LocalBlockPos { x, y, z }, block::STONE);
+                    }
+                }
+            }
+
+            // Section 8 (y=64..79): dirt at y=64
+            for x in 0..16u8 {
+                for z in 0..16u8 {
+                    chunk.set_block(LocalBlockPos { x, y: 64, z }, block::DIRT);
+                }
+            }
+
+            world.insert_chunk(ChunkPos::new(cx, cz), chunk);
+        }
     }
 }

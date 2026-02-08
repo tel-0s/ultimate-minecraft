@@ -1,23 +1,26 @@
 //! Minecraft block type definitions and property lookups.
 //!
-//! The engine stores opaque `BlockId` values. This module gives them meaning
-//! for Minecraft: sand has gravity, water is fluid, bedrock is indestructible, etc.
+//! BlockId values are MC block state IDs (from azalea-block), so they can be
+//! used directly in protocol chunk data without any mapping layer.
 
 use ultimate_engine::world::block::BlockId;
 
-// -- Named constants for the block types we support so far. --
-// These IDs are arbitrary within our server; they don't need to match
-// Minecraft's internal state IDs (that mapping happens at the protocol layer).
+// -- MC block state IDs (from azalea-block for MC 1.21.11) --
+// These match the vanilla protocol, so BlockId can be used directly in chunks.
 
 pub const AIR: BlockId = BlockId(0);
 pub const STONE: BlockId = BlockId(1);
-pub const DIRT: BlockId = BlockId(2);
-pub const GRASS: BlockId = BlockId(3);
-pub const SAND: BlockId = BlockId(4);
-pub const WATER: BlockId = BlockId(5);
-pub const BEDROCK: BlockId = BlockId(6);
-pub const LOG: BlockId = BlockId(7);
-pub const LEAVES: BlockId = BlockId(8);
+pub const GRASS_BLOCK: BlockId = BlockId(9);  // snowy=false
+pub const DIRT: BlockId = BlockId(10);
+pub const BEDROCK: BlockId = BlockId(85);
+pub const SAND: BlockId = BlockId(118);
+pub const OAK_LOG: BlockId = BlockId(137);    // axis=y
+
+// Legacy aliases for engine tests (which use small sequential IDs)
+pub const GRASS: BlockId = GRASS_BLOCK;
+pub const LOG: BlockId = OAK_LOG;
+pub const LEAVES: BlockId = BlockId(259);     // oak_leaves default
+pub const WATER: BlockId = BlockId(80);       // level=0
 
 /// Does this block fall under gravity (like sand/gravel)?
 pub fn has_gravity(id: BlockId) -> bool {

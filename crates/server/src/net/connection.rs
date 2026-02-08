@@ -482,7 +482,7 @@ async fn handle_play<R, W>(
     compression: Option<u32>,
     cipher_enc: &mut Option<azalea_crypto::Aes128CfbEnc>,
     cipher_dec: &mut Option<azalea_crypto::Aes128CfbDec>,
-    _world: &World, // TODO: use engine world for chunk data
+    world: &World,
     player_name: &str,
 ) -> Result<()>
 where
@@ -565,7 +565,7 @@ where
     let view_distance = 4i32;
     for cx in (chunk_x - view_distance)..=(chunk_x + view_distance) {
         for cz in (chunk_z - view_distance)..=(chunk_z + view_distance) {
-            send_flat_chunk(write, compression, cipher_enc, cx, cz).await?;
+            send_chunk_from_world(write, compression, cipher_enc, world, cx, cz).await?;
         }
     }
 
@@ -587,9 +587,11 @@ where
     let rules = crate::rules::standard();
     let scheduler = Scheduler::new();
 
-    // MC block state IDs for placing (creative mode default = stone)
-    let stone_state: BlockState = mc_blocks::Stone {}.as_block_state();
-    let air_state: BlockState = BlockState::AIR;
+    // Track hotbar contents and selected slot for creative placement.
+    use azalea_inventory::ItemStack;
+    use azalea_registry::builtin::{BlockKind, ItemKind};
+    let mut hotbar: [BlockState; 9] = [BlockState::AIR; 9];
+    let mut selected_slot: usize = 0;
 
     // ── Main loop: keep-alive + handle incoming packets ─────────────────
     let mut keepalive_timer = tokio::time::interval(Duration::from_secs(15));
@@ -616,30 +618,38 @@ where
                                         pos.x as i64, pos.y as i64, pos.z as i64,
                                     );
 
-                                    // Inject into causal engine
-                                    let old = _world.get_block(epos);
-                                    graph.insert_root(Event {
+                                    // Inject block break + neighbor notifications
+                                    // into the causal engine. Neighbors are notified
+                                    // so gravity/fluid rules can react (e.g. sand above falls).
+                                    let old = world.get_block(epos);
+                                    let root = graph.insert_root(Event {
                                         payload: EventPayload::BlockSet {
                                             pos: epos,
                                             old,
                                             new: BlockId::AIR,
                                         },
                                     });
+                                    // Notify all 6 neighbors (causal children of the break)
+                                    for neighbor in epos.neighbors() {
+                                        graph.insert(Event {
+                                            payload: EventPayload::BlockNotify { pos: neighbor },
+                                        }, vec![root]);
+                                    }
 
-                                    // Run causal engine (gravity, fluid spread)
+                                    // Run causal engine -- gravity, fluid spread cascade
                                     let events_before = graph.len();
-                                    scheduler.run_until_quiet(_world, &mut graph, &rules, 100);
+                                    scheduler.run_until_quiet(world, &mut graph, &rules, 100);
+                                    let total_events = graph.len();
 
-                                    // Collect all BlockSet events that were just executed
-                                    // and send BlockUpdate packets for each
-                                    for id in graph.all_ids() {
-                                        if let Some(node) = graph.get(id) {
+                                    // Broadcast ONLY the new BlockSet events to the client
+                                    let all_ids = graph.all_ids();
+                                    for id in &all_ids {
+                                        if let Some(node) = graph.get(*id) {
                                             if node.executed {
                                                 if let EventPayload::BlockSet { pos: ep, new, .. } = &node.event.payload {
                                                     let mc_pos = azalea_core::position::BlockPos::new(
                                                         ep.x as i32, ep.y as i32, ep.z as i32,
                                                     );
-                                                    // Map our BlockId to MC BlockState
                                                     let mc_state = engine_block_to_mc(*new);
                                                     let update: ClientboundGamePacket = ClientboundBlockUpdate {
                                                         pos: mc_pos,
@@ -657,11 +667,11 @@ where
                                     }.into_variant();
                                     write_packet(&ack, write, compression, cipher_enc).await?;
 
-                                    let new_events = graph.len() - events_before;
-                                    if new_events > 0 {
+                                    let cascade_events = total_events - events_before;
+                                    if cascade_events > 0 {
                                         tracing::info!(
-                                            "Block break at ({},{},{}) -> {} causal events",
-                                            pos.x, pos.y, pos.z, new_events + 1
+                                            "Block break at ({},{},{}) -> {} causal cascade events",
+                                            pos.x, pos.y, pos.z, cascade_events
                                         );
                                     }
                                 }
@@ -684,9 +694,11 @@ where
                                     target.x as i64, target.y as i64, target.z as i64,
                                 );
 
-                                // Place stone (creative mode default)
-                                let old = _world.get_block(epos);
-                                let new_id = BlockId::new(u32::from(stone_state) as u16);
+                                // Place the held block
+                                let held = hotbar[selected_slot];
+                                if held == BlockState::AIR { continue; } // nothing to place
+                                let old = world.get_block(epos);
+                                let new_id = BlockId::new(u32::from(held) as u16);
                                 graph.insert_root(Event {
                                     payload: EventPayload::BlockSet {
                                         pos: epos,
@@ -695,13 +707,11 @@ where
                                     },
                                 });
 
-                                // Also directly set in world for immediate feedback
-                                _world.set_block(epos, new_id);
+                                world.set_block(epos, new_id);
 
-                                // Send block update
                                 let update: ClientboundGamePacket = ClientboundBlockUpdate {
                                     pos: target,
-                                    block_state: stone_state,
+                                    block_state: held,
                                 }.into_variant();
                                 write_packet(&update, write, compression, cipher_enc).await?;
 
@@ -710,6 +720,28 @@ where
                                     seq: place.seq,
                                 }.into_variant();
                                 write_packet(&ack, write, compression, cipher_enc).await?;
+                            }
+
+                            // ── Creative inventory slot update ───────────
+                            ServerboundGamePacket::SetCreativeModeSlot(slot) => {
+                                // Hotbar slots are 36-44 in the inventory window.
+                                let hotbar_idx = slot.slot_num as i32 - 36;
+                                if hotbar_idx >= 0 && hotbar_idx < 9 {
+                                    let bs = match &slot.item_stack {
+                                        ItemStack::Present(data) => {
+                                            item_to_block_kind(data.kind)
+                                                .map(BlockState::from)
+                                                .unwrap_or(BlockState::AIR)
+                                        }
+                                        ItemStack::Empty => BlockState::AIR,
+                                    };
+                                    hotbar[hotbar_idx as usize] = bs;
+                                }
+                            }
+
+                            // ── Hotbar slot selection ────────────────────
+                            ServerboundGamePacket::SetCarriedItem(carried) => {
+                                selected_slot = (carried.slot as usize).min(8);
                             }
 
                             // ── Ignored packets ─────────────────────────
@@ -737,6 +769,16 @@ where
     }
 }
 
+/// Try to convert an ItemKind to its corresponding BlockKind.
+/// Uses string name matching: ItemKind::OakPlanks displays as "minecraft:oak_planks",
+/// and BlockKind::from_str("oak_planks") parses it back.
+fn item_to_block_kind(item: azalea_registry::builtin::ItemKind) -> Option<azalea_registry::builtin::BlockKind> {
+    // Display gives "minecraft:oak_planks", strip prefix for FromStr which expects "oak_planks"
+    let full = format!("{}", item);
+    let name = full.strip_prefix("minecraft:").unwrap_or(&full);
+    name.parse::<azalea_registry::builtin::BlockKind>().ok()
+}
+
 /// Map engine BlockId to MC BlockState for protocol.
 fn engine_block_to_mc(id: ultimate_engine::world::block::BlockId) -> azalea_block::BlockState {
     // For now, treat BlockId as a direct MC block state ID.
@@ -746,60 +788,58 @@ fn engine_block_to_mc(id: ultimate_engine::world::block::BlockId) -> azalea_bloc
 
 // ── Chunk data ──────────────────────────────────────────────────────────
 
-/// Send a flat chunk at (cx, cz) in MC wire format.
-///
-/// The flat world has: bedrock at y=60, stone at y=61-63, dirt at y=64.
-/// Player spawns at y=65. World uses min_y=-64, height=384 (24 sections).
-async fn send_flat_chunk<W: AsyncWrite + Unpin + Send>(
+/// Send a chunk read from the World in MC 1.21.5+ wire format.
+/// Reads actual block state from the engine World, so edits persist.
+async fn send_chunk_from_world<W: AsyncWrite + Unpin + Send>(
     write: &mut W,
     compression: Option<u32>,
     cipher: &mut Option<azalea_crypto::Aes128CfbEnc>,
+    world: &World,
     cx: i32,
     cz: i32,
 ) -> Result<()> {
-    // Block state IDs (from azalea-block / MC vanilla registry)
-    const _AIR: u32 = 0;
-    const STONE: u32 = 1;
-    const DIRT: u32 = 10;      // approximate, will verify
-    const BEDROCK: u32 = 33;   // approximate
-    const _GRASS_BLOCK: u32 = 8; // approximate, for future use
-
-    // Build chunk section data
-    // 24 sections total: indices -4 to 19 (y = -64 to 320)
-    // Section at index 3 (y = -16 to -1): air
-    // Section at index 4 (y = 0 to 15): air
-    // Section at index 7 (y = 48 to 63): contains terrain at y=60-63
-    //   y=60 (section-local y=12): bedrock
-    //   y=61-63 (section-local y=13-15): stone
-    // Section at index 8 (y = 64 to 79): contains dirt at y=64 (section-local y=0)
-    // All other sections: air
-
-    // Get correct block state IDs from azalea-block.
-    use azalea_block::blocks;
-    use azalea_block::BlockTrait;
-    let stone_id: u32 = blocks::Stone {}.as_block_state().into();
-    let bedrock_id: u32 = blocks::Bedrock {}.as_block_state().into();
-    let dirt_id: u32 = blocks::Dirt {}.as_block_state().into();
-
-    // 24 sections total (y = -64 to 320).
-    // Flat world: bedrock layer, stone layers, dirt layer.
-    // Section 7 (y=48..63): all stone (we'll put bedrock + stone here as all-stone for simplicity)
-    // Section 8 (y=64..79): all dirt at bottom... but single-valued = whole section.
-    // Simpler flat world: sections 0-3 (y=-64 to -1) = stone, section 4 (y=0..15) = bedrock at y=0
-    // Actually, let's just do: section 7 = all stone, section 8 = all dirt.
-    // Player spawns at y=65 which is section 8 local y=1. Dirt at y=64 (local y=0).
-    // But single-valued means the ENTIRE section is dirt. That's fine for MVP.
+    use ultimate_engine::world::block::BlockId;
 
     let total_sections = 24;
+    let min_y: i64 = -64;
+    let base_x = (cx as i64) * 16;
+    let base_z = (cz as i64) * 16;
     let mut section_data = Vec::new();
 
     for section_i in 0..total_sections {
-        match section_i {
-            // Section 7: y=48..63, all stone
-            7 => write_single_section(&mut section_data, stone_id)?,
-            // Section 8: y=64..79, all dirt (player spawns on top at y=65)
-            8 => write_single_section(&mut section_data, dirt_id)?,
-            _ => write_empty_section(&mut section_data)?,
+        let section_base_y = min_y + (section_i as i64) * 16;
+
+        // Scan: is the section uniform? Count non-air blocks.
+        let first = world.get_block(ultimate_engine::world::position::BlockPos::new(
+            base_x, section_base_y, base_z,
+        ));
+        let mut all_same = true;
+        let mut non_air: u16 = 0;
+
+        for ly in 0..16i64 {
+            for lz in 0..16i64 {
+                for lx in 0..16i64 {
+                    let b = world.get_block(ultimate_engine::world::position::BlockPos::new(
+                        base_x + lx, section_base_y + ly, base_z + lz,
+                    ));
+                    if b != first { all_same = false; }
+                    if b != BlockId::AIR { non_air = non_air.saturating_add(1); }
+                }
+            }
+        }
+
+        if all_same {
+            if first == BlockId::AIR {
+                write_empty_section(&mut section_data)?;
+            } else {
+                write_single_section(&mut section_data, first.0 as u32)?;
+            }
+        } else {
+            // Mixed section: build palette + indirect encoding
+            write_section_from_world(
+                &mut section_data, world,
+                base_x, section_base_y, base_z, non_air,
+            )?;
         }
     }
 
@@ -855,6 +895,78 @@ async fn send_flat_chunk<W: AsyncWrite + Unpin + Send>(
 
     // Write the raw packet with framing
     azalea_protocol::write::write_raw_packet(&raw_packet, write, compression, cipher).await?;
+
+    Ok(())
+}
+
+/// Write a mixed chunk section by reading blocks from the World.
+/// Uses indirect palette encoding (1.21.5+ format: no VarInt data_length).
+fn write_section_from_world(
+    buf: &mut Vec<u8>,
+    world: &World,
+    base_x: i64,
+    base_y: i64,
+    base_z: i64,
+    non_air_count: u16,
+) -> Result<()> {
+    use azalea_buf::AzaleaWriteVar;
+    use ultimate_engine::world::block::BlockId;
+
+    // Build palette and block index array
+    let mut palette: Vec<u32> = vec![0]; // air always at index 0
+    let mut blocks = [0u8; 4096];
+
+    for ly in 0..16u64 {
+        for lz in 0..16u64 {
+            for lx in 0..16u64 {
+                let b = world.get_block(ultimate_engine::world::position::BlockPos::new(
+                    base_x + lx as i64, base_y + ly as i64, base_z + lz as i64,
+                ));
+                let state_id = b.0 as u32;
+                let palette_idx = match palette.iter().position(|&v| v == state_id) {
+                    Some(i) => i,
+                    None => {
+                        palette.push(state_id);
+                        palette.len() - 1
+                    }
+                };
+                let idx = (ly as usize) * 256 + (lz as usize) * 16 + (lx as usize);
+                blocks[idx] = palette_idx as u8;
+            }
+        }
+    }
+
+    // Bits per entry: minimum 4 for blocks
+    let bpe = (palette.len() as f64).log2().ceil().max(1.0) as u8;
+    let bpe = bpe.max(4); // MC minimum for indirect block palette
+
+    // Write block count
+    (non_air_count as i16).azalea_write(buf)?;
+    // Bits per entry
+    bpe.azalea_write(buf)?;
+    // Palette
+    (palette.len() as u32).azalea_write_var(buf)?;
+    for &id in &palette {
+        id.azalea_write_var(buf)?;
+    }
+    // Packed data (1.21.5+: NO VarInt length prefix)
+    let values_per_long = 64 / bpe as usize;
+    let num_longs = (4096 + values_per_long - 1) / values_per_long;
+    let mask = (1u64 << bpe) - 1;
+    for long_i in 0..num_longs {
+        let mut long_val: u64 = 0;
+        for vi in 0..values_per_long {
+            let block_i = long_i * values_per_long + vi;
+            if block_i < 4096 {
+                long_val |= ((blocks[block_i] as u64) & mask) << (vi * bpe as usize);
+            }
+        }
+        long_val.azalea_write(buf)?;
+    }
+
+    // Biomes: single-valued (plains = 0)
+    0u8.azalea_write(buf)?;
+    0u32.azalea_write_var(buf)?;
 
     Ok(())
 }
