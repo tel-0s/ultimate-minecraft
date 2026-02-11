@@ -14,8 +14,16 @@ fn print_block_state_ids() {
         // Water: check both ways of obtaining the ID
         ("water(level=0)", u32::from(blocks::Water{level:0.into()}.as_block_state())),
         ("water(default via BlockKind)", u32::from(BlockState::from(BlockKind::Water))),
+        // Lava
+        ("lava(level=0)", u32::from(blocks::Lava{level:0.into()}.as_block_state())),
+        ("lava(default via BlockKind)", u32::from(BlockState::from(BlockKind::Lava))),
     ];
     for (name, id) in &ids {
         eprintln!("{}: {}", name, id);
     }
+
+    // Verify our LAVA constant matches azalea
+    let lava_id = u32::from(blocks::Lava{level:0.into()}.as_block_state());
+    assert_eq!(lava_id, ultimate_server::block::LAVA.0 as u32,
+        "LAVA constant doesn't match azalea BlockState");
 }

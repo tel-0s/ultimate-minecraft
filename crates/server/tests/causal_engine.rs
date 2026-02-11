@@ -865,3 +865,208 @@ fn water_drains_behind_wall() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Lava tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn lava_spreads_on_surface() {
+    let world = flat_world(2);
+    let mut graph = CausalGraph::new();
+    let rules = ultimate_server::rules::standard();
+    let scheduler = Scheduler::new();
+
+    let source_pos = BlockPos::new(8, 5, 8);
+
+    // Place lava source on surface.
+    graph.insert_root(Event {
+        payload: EventPayload::BlockSet {
+            pos: source_pos,
+            old: block::AIR,
+            new: block::LAVA, // level 0 = source
+        },
+    });
+    scheduler.run_until_quiet(&world, &mut graph, &rules, 500);
+
+    // Source should still be lava.
+    assert_eq!(world.get_block(source_pos), block::LAVA);
+
+    // At least one horizontal neighbor should have flowing lava.
+    let neighbors = [
+        world.get_block(BlockPos::new(9, 5, 8)),
+        world.get_block(BlockPos::new(7, 5, 8)),
+        world.get_block(BlockPos::new(8, 5, 9)),
+        world.get_block(BlockPos::new(8, 5, 7)),
+    ];
+    assert!(
+        neighbors.iter().any(|&b| block::lava_level(b).is_some()),
+        "lava should spread to at least one neighbor"
+    );
+}
+
+#[test]
+fn lava_spread_limited_to_3_blocks() {
+    // Lava should spread at most 3 blocks from the source (max level = 3).
+    let world = flat_world(2);
+    let mut graph = CausalGraph::new();
+    let rules = ultimate_server::rules::standard();
+    let scheduler = Scheduler::new();
+
+    let source_pos = BlockPos::new(8, 5, 8);
+
+    graph.insert_root(Event {
+        payload: EventPayload::BlockSet {
+            pos: source_pos,
+            old: block::AIR,
+            new: block::LAVA,
+        },
+    });
+    scheduler.run_until_quiet(&world, &mut graph, &rules, 500);
+
+    // 3 blocks away in +X should be lava (level 3).
+    let at_3 = world.get_block(BlockPos::new(11, 5, 8));
+    assert!(
+        block::lava_level(at_3).is_some(),
+        "lava should reach 3 blocks away, got {:?}",
+        at_3,
+    );
+
+    // 4 blocks away in +X should be air (beyond max spread).
+    let at_4 = world.get_block(BlockPos::new(12, 5, 8));
+    assert_eq!(
+        at_4,
+        block::AIR,
+        "lava should NOT reach 4 blocks away, got {:?}",
+        at_4,
+    );
+}
+
+#[test]
+fn lava_falls_before_spreading() {
+    // Lava placed above air should fall, not spread horizontally.
+    let world = World::new();
+    let mut chunk = Chunk::new();
+    for x in 0..SECTION_SIZE as u8 {
+        for z in 0..SECTION_SIZE as u8 {
+            chunk.set_block(LocalBlockPos { x, y: 0, z }, block::STONE);
+        }
+    }
+    world.insert_chunk(ChunkPos::new(0, 0), chunk);
+
+    let mut graph = CausalGraph::new();
+    let rules = ultimate_server::rules::standard();
+    let scheduler = Scheduler::new();
+
+    graph.insert_root(Event {
+        payload: EventPayload::BlockSet {
+            pos: BlockPos::new(4, 5, 4),
+            old: block::AIR,
+            new: block::LAVA,
+        },
+    });
+
+    // Step 1: root event places lava.
+    scheduler.step(&world, &mut graph, &rules);
+    assert_eq!(world.get_block(BlockPos::new(4, 5, 4)), block::LAVA);
+
+    // Step 2: lava falls to y=4.
+    scheduler.step(&world, &mut graph, &rules);
+    assert!(
+        block::lava_level(world.get_block(BlockPos::new(4, 4, 4))).is_some(),
+        "lava should have fallen"
+    );
+
+    // Horizontal neighbors at y=5 should still be air.
+    assert_eq!(world.get_block(BlockPos::new(5, 5, 4)), block::AIR);
+    assert_eq!(world.get_block(BlockPos::new(3, 5, 4)), block::AIR);
+}
+
+#[test]
+fn flowing_lava_drains_when_source_removed() {
+    let world = flat_world(2);
+    let mut graph = CausalGraph::new();
+    let rules = ultimate_server::rules::standard();
+    let scheduler = Scheduler::new();
+
+    let source_pos = BlockPos::new(8, 5, 8);
+
+    // 1. Place lava source and let it spread fully.
+    graph.insert_root(Event {
+        payload: EventPayload::BlockSet {
+            pos: source_pos,
+            old: block::AIR,
+            new: block::LAVA,
+        },
+    });
+    scheduler.run_until_quiet(&world, &mut graph, &rules, 500);
+
+    // Sanity: source and at least one neighbor should be lava.
+    assert_eq!(world.get_block(source_pos), block::LAVA);
+    assert!(
+        block::lava_level(world.get_block(BlockPos::new(9, 5, 8))).is_some(),
+        "lava should have spread before removal"
+    );
+
+    // 2. Remove the source.
+    let mut graph2 = CausalGraph::new();
+    let root = graph2.insert_root(Event {
+        payload: EventPayload::BlockSet {
+            pos: source_pos,
+            old: block::LAVA,
+            new: block::AIR,
+        },
+    });
+    for neighbor in source_pos.neighbors() {
+        graph2.insert(
+            Event {
+                payload: EventPayload::BlockNotify { pos: neighbor },
+            },
+            vec![root],
+        );
+    }
+    scheduler.run_until_quiet(&world, &mut graph2, &rules, 2000);
+
+    // 3. All lava in the area should have drained.
+    for dx in -4i64..=4 {
+        for dz in -4i64..=4 {
+            let check = BlockPos::new(8 + dx, 5, 8 + dz);
+            assert_eq!(
+                world.get_block(check),
+                block::AIR,
+                "lava should have drained at ({}, 5, {})",
+                8 + dx,
+                8 + dz,
+            );
+        }
+    }
+}
+
+#[test]
+fn lava_source_does_not_drain() {
+    let world = flat_world(2);
+    let mut graph = CausalGraph::new();
+    let rules = ultimate_server::rules::standard();
+    let scheduler = Scheduler::new();
+
+    let source_pos = BlockPos::new(8, 5, 8);
+
+    graph.insert_root(Event {
+        payload: EventPayload::BlockSet {
+            pos: source_pos,
+            old: block::AIR,
+            new: block::LAVA,
+        },
+    });
+    scheduler.run_until_quiet(&world, &mut graph, &rules, 500);
+
+    // Notify the source as if a neighbor changed.
+    let mut graph2 = CausalGraph::new();
+    graph2.insert_root(Event {
+        payload: EventPayload::BlockNotify { pos: source_pos },
+    });
+    scheduler.run_until_quiet(&world, &mut graph2, &rules, 100);
+
+    // Source must still be lava.
+    assert_eq!(world.get_block(source_pos), block::LAVA);
+}
