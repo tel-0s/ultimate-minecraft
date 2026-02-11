@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use ultimate_engine::world::World;
+use ultimate_server::dashboard::{self, DashboardState};
 
 #[tokio::main]
 async fn main() {
@@ -8,6 +9,11 @@ async fn main() {
         .skip_while(|a| a != "--bind")
         .nth(1)
         .unwrap_or_else(|| "0.0.0.0:25565".into());
+    let dashboard_port: u16 = std::env::args()
+        .skip_while(|a| a != "--dashboard-port")
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8000);
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -28,8 +34,15 @@ async fn main() {
     generate_flat_world_mc(&world, 8);
     tracing::info!("World ready: {} chunks loaded", world.chunk_count());
 
+    // Start live dashboard (non-blocking — runs on its own tasks).
+    let dashboard = Arc::new(DashboardState::new(Arc::clone(&world)));
+    let dash = Arc::clone(&dashboard);
+    tokio::spawn(async move {
+        dashboard::server::start(dash, dashboard_port).await;
+    });
+
     tracing::info!("Starting Minecraft 1.21.11 server on {}", bind_addr);
-    if let Err(e) = ultimate_server::net::listener::run(world, &bind_addr).await {
+    if let Err(e) = ultimate_server::net::listener::run(world, dashboard, &bind_addr).await {
         tracing::error!("Server error: {}", e);
     }
 }

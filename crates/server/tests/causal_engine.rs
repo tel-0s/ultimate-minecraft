@@ -203,7 +203,7 @@ fn water_spreads_horizontally_on_surface() {
     // The origin should be water.
     assert_eq!(world.get_block(BlockPos::new(8, 5, 8)), block::WATER);
 
-    // At least one horizontal neighbor should also be water.
+    // At least one horizontal neighbor should also be water (flowing, level 1).
     let neighbors_water = [
         world.get_block(BlockPos::new(9, 5, 8)),
         world.get_block(BlockPos::new(7, 5, 8)),
@@ -211,7 +211,7 @@ fn water_spreads_horizontally_on_surface() {
         world.get_block(BlockPos::new(8, 5, 7)),
     ];
     assert!(
-        neighbors_water.iter().any(|&t| t == block::WATER),
+        neighbors_water.iter().any(|&t| block::is_fluid(t)),
         "water should spread to at least one neighbor"
     );
 }
@@ -246,9 +246,12 @@ fn water_falls_before_spreading() {
     scheduler.step(&world, &mut graph, &rules);
     assert_eq!(world.get_block(BlockPos::new(4, 5, 4)), block::WATER);
 
-    // Step 2: fall event places water at y=4.
+    // Step 2: fall event places flowing water (level 1) at y=4.
     scheduler.step(&world, &mut graph, &rules);
-    assert_eq!(world.get_block(BlockPos::new(4, 4, 4)), block::WATER);
+    assert!(
+        block::is_fluid(world.get_block(BlockPos::new(4, 4, 4))),
+        "fallen water should be a fluid"
+    );
 
     // Horizontal neighbors at y=5 should still be air -- the fluid rule
     // returns early when below is air (fall, don't spread).
@@ -681,6 +684,183 @@ fn parallel_water_and_sand_independent() {
                 column(&world_seq, x, z, 4..=6),
                 column(&world_par, x, z, 4..=6),
                 "seq vs par mismatch at ({x}, {z})"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Water drainage tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn flowing_water_drains_when_source_removed() {
+    // Place a water source, let it spread, remove the source, run to
+    // quiescence.  All flowing water should drain to air.
+    let world = flat_world(2);
+    let mut graph = CausalGraph::new();
+    let rules = ultimate_server::rules::standard();
+    let scheduler = Scheduler::new();
+
+    let source_pos = BlockPos::new(8, 5, 8);
+
+    // 1. Place water source and let it spread fully.
+    graph.insert_root(Event {
+        payload: EventPayload::BlockSet {
+            pos: source_pos,
+            old: block::AIR,
+            new: block::WATER, // level 0 = source
+        },
+    });
+    scheduler.run_until_quiet(&world, &mut graph, &rules, 500);
+
+    // Sanity: source block should still be water.
+    assert_eq!(world.get_block(source_pos), block::WATER);
+    // At least some neighbors should be flowing water.
+    assert!(
+        block::is_fluid(world.get_block(BlockPos::new(9, 5, 8))),
+        "water should have spread before we remove the source"
+    );
+
+    // 2. Remove the source block (simulate player breaking it).
+    let mut graph2 = CausalGraph::new();
+    let root = graph2.insert_root(Event {
+        payload: EventPayload::BlockSet {
+            pos: source_pos,
+            old: block::WATER,
+            new: block::AIR,
+        },
+    });
+    // Notify the 6 neighbours (same as the server does on block break).
+    for neighbor in source_pos.neighbors() {
+        graph2.insert(
+            Event {
+                payload: EventPayload::BlockNotify { pos: neighbor },
+            },
+            vec![root],
+        );
+    }
+
+    scheduler.run_until_quiet(&world, &mut graph2, &rules, 2000);
+
+    // 3. All blocks in the spread area should be air (except the solid ground).
+    //    Check a generous 9×9 area around the former source.
+    for dx in -8i64..=8 {
+        for dz in -8i64..=8 {
+            let check = BlockPos::new(8 + dx, 5, 8 + dz);
+            assert_eq!(
+                world.get_block(check),
+                block::AIR,
+                "water should have drained at ({}, 5, {})",
+                8 + dx,
+                8 + dz,
+            );
+        }
+    }
+}
+
+#[test]
+fn source_block_does_not_drain() {
+    // Source blocks (level 0) are permanent — they should not drain on notify.
+    let world = flat_world(2);
+    let mut graph = CausalGraph::new();
+    let rules = ultimate_server::rules::standard();
+    let scheduler = Scheduler::new();
+
+    let source_pos = BlockPos::new(8, 5, 8);
+
+    // Place a lone source block (no other water around).
+    graph.insert_root(Event {
+        payload: EventPayload::BlockSet {
+            pos: source_pos,
+            old: block::AIR,
+            new: block::WATER,
+        },
+    });
+    scheduler.run_until_quiet(&world, &mut graph, &rules, 500);
+
+    // Now notify the source as if a neighbor changed.
+    let mut graph2 = CausalGraph::new();
+    graph2.insert_root(Event {
+        payload: EventPayload::BlockNotify { pos: source_pos },
+    });
+    scheduler.run_until_quiet(&world, &mut graph2, &rules, 100);
+
+    // Source must still be water.
+    assert_eq!(world.get_block(source_pos), block::WATER);
+}
+
+#[test]
+fn water_drains_behind_wall() {
+    // Simulates the user's reported scenario: water spreads, then a wall
+    // is built cutting it off from the source.  Flowing water behind the
+    // wall should drain.
+    let world = flat_world(2);
+    let mut graph = CausalGraph::new();
+    let rules = ultimate_server::rules::standard();
+    let scheduler = Scheduler::new();
+
+    let source_pos = BlockPos::new(8, 5, 8);
+
+    // 1. Place water and let it spread.
+    graph.insert_root(Event {
+        payload: EventPayload::BlockSet {
+            pos: source_pos,
+            old: block::AIR,
+            new: block::WATER,
+        },
+    });
+    scheduler.run_until_quiet(&world, &mut graph, &rules, 500);
+
+    // 2. Build a wall of stone around the source, replacing the level-1
+    //    flowing water in the 4 horizontal neighbors with stone.
+    let wall_positions = [
+        BlockPos::new(9, 5, 8),
+        BlockPos::new(7, 5, 8),
+        BlockPos::new(8, 5, 9),
+        BlockPos::new(8, 5, 7),
+    ];
+
+    let mut wall_graph = CausalGraph::new();
+    for wall_pos in wall_positions {
+        let old = world.get_block(wall_pos);
+        let root = wall_graph.insert_root(Event {
+            payload: EventPayload::BlockSet {
+                pos: wall_pos,
+                old,
+                new: block::STONE,
+            },
+        });
+        // Notify the wall block's own neighbors.
+        for neighbor in wall_pos.neighbors() {
+            wall_graph.insert(
+                Event {
+                    payload: EventPayload::BlockNotify { pos: neighbor },
+                },
+                vec![root],
+            );
+        }
+    }
+    scheduler.run_until_quiet(&world, &mut wall_graph, &rules, 2000);
+
+    // 3. Source should still exist.
+    assert_eq!(world.get_block(source_pos), block::WATER);
+
+    // 4. Blocks outside the wall should have drained.
+    //    Check several positions that were beyond the wall.
+    for dx in -8i64..=8 {
+        for dz in -8i64..=8 {
+            let pos = BlockPos::new(8 + dx, 5, 8 + dz);
+            let b = world.get_block(pos);
+            if pos == source_pos || wall_positions.contains(&pos) {
+                continue; // skip source and wall
+            }
+            assert!(
+                !block::is_fluid(b) || b == block::AIR || b == block::STONE,
+                "water should have drained at ({}, 5, {}) but found {:?}",
+                8 + dx,
+                8 + dz,
+                b,
             );
         }
     }

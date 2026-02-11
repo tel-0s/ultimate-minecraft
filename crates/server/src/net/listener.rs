@@ -2,8 +2,14 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use ultimate_engine::world::World;
 
+use crate::dashboard::DashboardState;
+
 /// Start the TCP listener and accept Minecraft client connections.
-pub async fn run(world: Arc<World>, bind_addr: &str) -> anyhow::Result<()> {
+pub async fn run(
+    world: Arc<World>,
+    dashboard: Arc<DashboardState>,
+    bind_addr: &str,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
     tracing::info!("Listening on {}", bind_addr);
 
@@ -12,8 +18,9 @@ pub async fn run(world: Arc<World>, bind_addr: &str) -> anyhow::Result<()> {
         tracing::info!("Connection from {}", addr);
 
         let world = Arc::clone(&world);
+        let dashboard = Arc::clone(&dashboard);
         tokio::spawn(async move {
-            if let Err(e) = super::connection::handle(stream, world).await {
+            if let Err(e) = super::connection::handle(stream, world, dashboard).await {
                 tracing::warn!("Connection from {} closed: {}", addr, e);
             }
         });

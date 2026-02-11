@@ -23,6 +23,9 @@ azalea-entity = "0.15"
 azalea-crypto = "0.15"
 azalea-world = "0.15"
 
+# Web dashboard
+axum = { version = "0.7", features = ["ws"] }
+
 # Supporting
 anyhow = "1"
 uuid = "1"

@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ultimate Minecraft Dashboard</title>
+<style>
+  :root {
+    --bg:        #0d1117;
+    --surface:   #161b22;
+    --border:    #30363d;
+    --text:      #e6edf3;
+    --text-dim:  #8b949e;
+    --green:     #3fb950;
+    --green-dim: #238636;
+    --amber:     #d29922;
+    --amber-dim: #9a6700;
+    --blue:      #58a6ff;
+    --red:       #f85149;
+    --mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg); color: var(--text);
+    min-height: 100vh; display: flex; flex-direction: column;
+  }
+
+  /* ── Header ───────────────────────────────────────────── */
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 24px; border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 18px; font-weight: 600; letter-spacing: -0.02em; }
+  header h1 span { color: var(--blue); }
+  .status {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 13px; color: var(--text-dim); font-family: var(--mono);
+  }
+  .status-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--red); transition: background 0.3s;
+  }
+  .status-dot.connected { background: var(--green); }
+
+  /* ── Stats grid ───────────────────────────────────────── */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 12px; padding: 16px 24px;
+  }
+  .stat-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px 16px;
+  }
+  .stat-label {
+    font-size: 11px; font-weight: 500; text-transform: uppercase;
+    letter-spacing: 0.05em; color: var(--text-dim); margin-bottom: 6px;
+  }
+  .stat-value {
+    font-family: var(--mono); font-size: 24px; font-weight: 700;
+    line-height: 1.1;
+  }
+  .stat-sub {
+    font-family: var(--mono); font-size: 11px; color: var(--text-dim);
+    margin-top: 4px;
+  }
+  .sparkline { margin-top: 8px; height: 24px; }
+
+  /* ── Histogram ────────────────────────────────────────── */
+  .section { padding: 0 24px 16px; }
+  .section-title {
+    font-size: 13px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.05em; color: var(--text-dim); margin-bottom: 10px;
+  }
+  .hist-row {
+    display: flex; align-items: center; gap: 8px; margin-bottom: 4px;
+  }
+  .hist-label {
+    font-family: var(--mono); font-size: 12px; color: var(--text-dim);
+    width: 80px; text-align: right; flex-shrink: 0;
+  }
+  .hist-bar-bg {
+    flex: 1; height: 18px; background: var(--surface);
+    border-radius: 3px; overflow: hidden; border: 1px solid var(--border);
+  }
+  .hist-bar {
+    height: 100%; border-radius: 3px; transition: width 0.4s ease;
+    min-width: 0;
+  }
+  .hist-pct {
+    font-family: var(--mono); font-size: 12px; color: var(--text-dim);
+    width: 50px; flex-shrink: 0;
+  }
+
+  /* ── Causal graph ─────────────────────────────────────── */
+  .graph-container {
+    flex: 1; margin: 0 24px 24px; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 8px;
+    position: relative; min-height: 300px; overflow: hidden;
+  }
+  .graph-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+  }
+  .graph-header h2 {
+    font-size: 13px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.05em; color: var(--text-dim);
+  }
+  .legend { display: flex; gap: 16px; }
+  .legend-item {
+    display: flex; align-items: center; gap: 5px;
+    font-size: 11px; color: var(--text-dim);
+  }
+  .legend-dot {
+    width: 10px; height: 10px; border-radius: 3px;
+  }
+  canvas#graph {
+    width: 100%; display: block;
+  }
+  .graph-empty {
+    position: absolute; inset: 0; display: flex;
+    align-items: center; justify-content: center;
+    color: var(--text-dim); font-size: 14px; pointer-events: none;
+  }
+
+  /* ── Tooltip ──────────────────────────────────────────── */
+  #tooltip {
+    position: fixed; background: #1c2129; border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 12px; font-family: var(--mono);
+    font-size: 12px; color: var(--text); pointer-events: none;
+    display: none; z-index: 100; white-space: pre;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1><span>&#x2B21;</span> Ultimate Minecraft Dashboard</h1>
+  <div class="status">
+    <div class="status-dot" id="statusDot"></div>
+    <span id="statusText">Connecting...</span>
+  </div>
+</header>
+
+<div class="stats">
+  <div class="stat-card">
+    <div class="stat-label">Events / sec</div>
+    <div class="stat-value" id="evtSec">-</div>
+    <canvas class="sparkline" id="sparkEvtSec"></canvas>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Total Events</div>
+    <div class="stat-value" id="evtTotal">-</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Cascades / sec</div>
+    <div class="stat-value" id="cascSec">-</div>
+    <canvas class="sparkline" id="sparkCascSec"></canvas>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Avg Latency</div>
+    <div class="stat-value" id="avgLat">-</div>
+    <div class="stat-sub" id="avgEvtCasc">&nbsp;</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Players</div>
+    <div class="stat-value" id="players">0</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Chunks</div>
+    <div class="stat-value" id="chunks">0</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Uptime</div>
+    <div class="stat-value" id="uptime">00:00</div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-title">Cascade Latency Distribution</div>
+  <div id="histogram"></div>
+</div>
+
+<div class="graph-container">
+  <div class="graph-header">
+    <h2>Causal Graph (recent events)</h2>
+    <div class="legend">
+      <div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div> BlockSet</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--amber)"></div> BlockNotify</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--border)"></div> Pending</div>
+    </div>
+  </div>
+  <canvas id="graph"></canvas>
+  <div class="graph-empty" id="graphEmpty">Waiting for causal events...</div>
+</div>
+
+<div id="tooltip"></div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────
+let prev = null;          // previous metrics snapshot (for rate computation)
+let graphData = null;     // latest graph snapshot
+const sparkEvtSec = [];   // rolling window for sparkline
+const sparkCascSec = [];
+const SPARK_LEN = 60;
+
+// ── WebSocket ──────────────────────────────────────────────────────────
+let ws = null;
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => {
+    document.getElementById('statusDot').classList.add('connected');
+    document.getElementById('statusText').textContent = 'Connected';
+  };
+  ws.onclose = () => {
+    document.getElementById('statusDot').classList.remove('connected');
+    document.getElementById('statusText').textContent = 'Reconnecting...';
+    setTimeout(connect, 2000);
+  };
+  ws.onerror = () => ws.close();
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'metrics') handleMetrics(msg.data);
+      if (msg.type === 'graph')   handleGraph(msg.data);
+    } catch {}
+  };
+}
+connect();
+
+// ── Metrics handler ────────────────────────────────────────────────────
+function handleMetrics(snap) {
+  const $ = id => document.getElementById(id);
+
+  // Compute rates from deltas
+  if (prev) {
+    const dt = snap.uptime_secs - prev.uptime_secs;
+    if (dt > 0) {
+      const evtRate = (snap.events_total - prev.events_total) / dt;
+      const cascRate = (snap.cascades_total - prev.cascades_total) / dt;
+      const dCasc = snap.cascades_total - prev.cascades_total;
+      const dNs = snap.cascade_ns_sum - prev.cascade_ns_sum;
+      const dEvt = snap.cascade_events_sum - prev.cascade_events_sum;
+
+      $('evtSec').textContent = fmtNum(evtRate);
+      $('cascSec').textContent = fmtNum(cascRate);
+
+      if (dCasc > 0) {
+        const avgUs = (dNs / dCasc) / 1000;
+        $('avgLat').textContent = fmtLatency(avgUs);
+        $('avgEvtCasc').textContent = `${(dEvt / dCasc).toFixed(1)} events/cascade`;
+      }
+
+      sparkEvtSec.push(evtRate);
+      if (sparkEvtSec.length > SPARK_LEN) sparkEvtSec.shift();
+      sparkCascSec.push(cascRate);
+      if (sparkCascSec.length > SPARK_LEN) sparkCascSec.shift();
+
+      drawSparkline('sparkEvtSec', sparkEvtSec, '#58a6ff');
+      drawSparkline('sparkCascSec', sparkCascSec, '#3fb950');
+    }
+  }
+
+  $('evtTotal').textContent = fmtNum(snap.events_total);
+  $('players').textContent = snap.players;
+  $('chunks').textContent = snap.chunks_loaded;
+  $('uptime').textContent = fmtUptime(snap.uptime_secs);
+
+  renderHistogram(snap.hist);
+  prev = snap;
+}
+
+// ── Graph handler ──────────────────────────────────────────────────────
+function handleGraph(data) {
+  graphData = data;
+  document.getElementById('graphEmpty').style.display =
+    data.nodes.length === 0 ? 'flex' : 'none';
+  drawGraph();
+}
+
+// ── Histogram ──────────────────────────────────────────────────────────
+const HIST_LABELS = ['<1\u00B5s', '1-10\u00B5s', '10-100\u00B5s', '100\u00B5s-1ms', '>1ms'];
+const HIST_COLORS = ['#3fb950', '#58a6ff', '#d29922', '#f0883e', '#f85149'];
+function renderHistogram(hist) {
+  const total = hist.reduce((a, b) => a + b, 0) || 1;
+  const el = document.getElementById('histogram');
+  if (!el.children.length) {
+    el.innerHTML = hist.map((_, i) => `
+      <div class="hist-row">
+        <div class="hist-label">${HIST_LABELS[i]}</div>
+        <div class="hist-bar-bg"><div class="hist-bar" id="hbar${i}"
+          style="background:${HIST_COLORS[i]};width:0%"></div></div>
+        <div class="hist-pct" id="hpct${i}">0%</div>
+      </div>`).join('');
+  }
+  hist.forEach((v, i) => {
+    const pct = (v / total) * 100;
+    document.getElementById(`hbar${i}`).style.width = pct + '%';
+    document.getElementById(`hpct${i}`).textContent = pct.toFixed(1) + '%';
+  });
+}
+
+// ── Sparkline ──────────────────────────────────────────────────────────
+function drawSparkline(canvasId, data, color) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+  if (data.length < 2) return;
+  const max = Math.max(...data, 1);
+  ctx.beginPath();
+  ctx.strokeStyle = color; ctx.lineWidth = 1.5;
+  data.forEach((v, i) => {
+    const x = (i / (SPARK_LEN - 1)) * w;
+    const y = h - (v / max) * (h - 2) - 1;
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+}
+
+// ── Causal graph canvas ────────────────────────────────────────────────
+const graphCanvas = document.getElementById('graph');
+const graphCtx = graphCanvas.getContext('2d');
+let hoveredNode = null;
+
+function drawGraph() {
+  if (!graphData || !graphData.nodes.length) return;
+  const dpr = window.devicePixelRatio || 1;
+  const container = graphCanvas.parentElement;
+  const w = container.clientWidth;
+  const headerH = container.querySelector('.graph-header').offsetHeight;
+  const h = Math.max(320, Math.min(500, graphData.nodes.length * 4 + 200));
+  graphCanvas.width = w * dpr; graphCanvas.height = h * dpr;
+  graphCanvas.style.height = h + 'px';
+  graphCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  graphCtx.clearRect(0, 0, w, h);
+
+  const nodes = graphData.nodes;
+  const edges = graphData.edges;
+
+  // Group by depth
+  const layers = {};
+  let maxDepth = 0;
+  nodes.forEach(n => {
+    if (!layers[n.depth]) layers[n.depth] = [];
+    layers[n.depth].push(n);
+    if (n.depth > maxDepth) maxDepth = n.depth;
+  });
+
+  // Layout: depth on Y-axis (top-down), spread on X-axis
+  const padX = 60, padY = 50;
+  const layerH = maxDepth > 0 ? (h - padY * 2) / maxDepth : 0;
+  const positions = {};
+
+  for (let d = 0; d <= maxDepth; d++) {
+    const layer = layers[d] || [];
+    const layerW = w - padX * 2;
+    const gap = layer.length > 1 ? layerW / (layer.length - 1) : 0;
+    layer.forEach((n, i) => {
+      positions[n.id] = {
+        x: layer.length === 1 ? w / 2 : padX + i * gap,
+        y: padY + d * layerH,
+      };
+    });
+  }
+
+  // Draw edges
+  graphCtx.lineWidth = 1;
+  edges.forEach(([pi, ci]) => {
+    const p = positions[pi], c = positions[ci];
+    if (!p || !c) return;
+    graphCtx.strokeStyle = 'rgba(139,148,158,0.25)';
+    graphCtx.beginPath();
+    const my = (p.y + c.y) / 2;
+    graphCtx.moveTo(p.x, p.y);
+    graphCtx.bezierCurveTo(p.x, my, c.x, my, c.x, c.y);
+    graphCtx.stroke();
+  });
+
+  // Draw nodes
+  const R = 12;
+  nodes.forEach(n => {
+    const pos = positions[n.id];
+    if (!pos) return;
+    const isSet = n.kind === 'block_set';
+    const exec = n.executed;
+    let fill, stroke;
+    if (isSet) {
+      fill = exec ? '#238636' : '#1a1f25';
+      stroke = exec ? '#3fb950' : '#30363d';
+    } else {
+      fill = exec ? '#6d4c00' : '#1a1f25';
+      stroke = exec ? '#d29922' : '#30363d';
+    }
+
+    graphCtx.beginPath();
+    if (isSet) {
+      roundRect(graphCtx, pos.x - R, pos.y - R * 0.7, R * 2, R * 1.4, 4);
+    } else {
+      graphCtx.arc(pos.x, pos.y, R * 0.7, 0, Math.PI * 2);
+    }
+    graphCtx.fillStyle = fill;
+    graphCtx.fill();
+    graphCtx.strokeStyle = stroke;
+    graphCtx.lineWidth = 1.5;
+    graphCtx.stroke();
+
+    // Label (abbreviated)
+    graphCtx.fillStyle = exec ? '#e6edf3' : '#484f58';
+    graphCtx.font = '9px system-ui';
+    graphCtx.textAlign = 'center';
+    graphCtx.textBaseline = 'top';
+    const short = isSet ? 'S' : 'N';
+    graphCtx.fillText(short, pos.x, pos.y + R + 3);
+  });
+
+  // Store positions for hover
+  graphData._positions = positions;
+}
+
+// Hover tooltip
+graphCanvas.addEventListener('mousemove', (e) => {
+  if (!graphData || !graphData._positions) return;
+  const rect = graphCanvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+  const tooltip = document.getElementById('tooltip');
+  let found = null;
+  for (const n of graphData.nodes) {
+    const p = graphData._positions[n.id];
+    if (!p) continue;
+    if (Math.abs(mx - p.x) < 14 && Math.abs(my - p.y) < 14) {
+      found = n; break;
+    }
+  }
+  if (found) {
+    tooltip.textContent = found.label + (found.executed ? '' : '  (pending)');
+    tooltip.style.display = 'block';
+    tooltip.style.left = (e.clientX + 12) + 'px';
+    tooltip.style.top = (e.clientY - 8) + 'px';
+  } else {
+    tooltip.style.display = 'none';
+  }
+});
+graphCanvas.addEventListener('mouseleave', () => {
+  document.getElementById('tooltip').style.display = 'none';
+});
+
+// ── Helpers ────────────────────────────────────────────────────────────
+function fmtNum(n) {
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return Math.round(n).toString();
+}
+function fmtLatency(us) {
+  if (us < 1) return '<1\u00B5s';
+  if (us < 1000) return us.toFixed(1) + '\u00B5s';
+  return (us / 1000).toFixed(2) + 'ms';
+}
+function fmtUptime(s) {
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = Math.floor(s % 60);
+  return h > 0
+    ? `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`
+    : `${m}:${String(sec).padStart(2,'0')}`;
+}
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+// Resize handler
+window.addEventListener('resize', () => { drawGraph(); });
+</script>
+</body>
+</html>

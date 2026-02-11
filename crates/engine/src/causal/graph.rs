@@ -1,5 +1,9 @@
 use super::event::{Event, EventId, EventPayload};
 use slotmap::SlotMap;
+use std::collections::VecDeque;
+
+/// Maximum number of recent event IDs retained for dashboard snapshots.
+const MAX_RECENT: usize = 200;
 
 /// A node in the causal DAG.
 #[derive(Debug)]
@@ -17,12 +21,15 @@ pub struct EventNode {
 /// **spacelike-separated** and may execute in any order (or in parallel).
 pub struct CausalGraph {
     nodes: SlotMap<EventId, EventNode>,
+    /// Ring buffer of the most recently inserted event IDs (for dashboard snapshots).
+    recent_ids: VecDeque<EventId>,
 }
 
 impl CausalGraph {
     pub fn new() -> Self {
         Self {
             nodes: SlotMap::with_key(),
+            recent_ids: VecDeque::with_capacity(MAX_RECENT),
         }
     }
 
@@ -38,6 +45,12 @@ impl CausalGraph {
             if let Some(parent) = self.nodes.get_mut(parent_id) {
                 parent.children.push(id);
             }
+        }
+
+        // Track for dashboard snapshots.
+        self.recent_ids.push_back(id);
+        if self.recent_ids.len() > MAX_RECENT {
+            self.recent_ids.pop_front();
         }
 
         id
@@ -87,6 +100,11 @@ impl CausalGraph {
 
     pub fn all_ids(&self) -> Vec<EventId> {
         self.nodes.keys().collect()
+    }
+
+    /// Iterator over the most recently inserted event IDs (for dashboard snapshots).
+    pub fn recent_node_ids(&self) -> impl Iterator<Item = EventId> + '_ {
+        self.recent_ids.iter().copied()
     }
 
     /// Export the graph in Graphviz DOT format.

@@ -50,8 +50,10 @@ use tokio::net::TcpStream;
 use ultimate_engine::world::World;
 use uuid::Uuid;
 
+use crate::dashboard::{self, DashboardState};
+
 /// Handle a single client connection through all protocol phases.
-pub async fn handle(stream: TcpStream, world: Arc<World>) -> Result<()> {
+pub async fn handle(stream: TcpStream, world: Arc<World>, dashboard: Arc<DashboardState>) -> Result<()> {
     let (read, write) = stream.into_split();
     let mut read = read;
     let mut write = write;
@@ -86,7 +88,10 @@ pub async fn handle(stream: TcpStream, world: Arc<World>) -> Result<()> {
         ClientIntention::Login => {
             let name = handle_login(&mut read, &mut write, &mut buf, compression, &mut cipher_enc, &mut cipher_dec).await?;
             handle_configuration(&mut read, &mut write, &mut buf, compression, &mut cipher_enc, &mut cipher_dec).await?;
-            handle_play(&mut read, &mut write, &mut buf, compression, &mut cipher_enc, &mut cipher_dec, &world, &name).await?;
+            dashboard.metrics.player_joined();
+            let result = handle_play(&mut read, &mut write, &mut buf, compression, &mut cipher_enc, &mut cipher_dec, &world, &name, &dashboard).await;
+            dashboard.metrics.player_left();
+            result?;
         }
         _ => {
             tracing::warn!("Unsupported intention: {:?}", intention.intention);
@@ -484,6 +489,7 @@ async fn handle_play<R, W>(
     cipher_dec: &mut Option<azalea_crypto::Aes128CfbDec>,
     world: &World,
     player_name: &str,
+    dashboard: &DashboardState,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + Sync,
@@ -638,8 +644,18 @@ where
 
                                     // Run causal engine -- gravity, fluid spread cascade
                                     let events_before = graph.len();
+                                    let cascade_start = std::time::Instant::now();
                                     scheduler.run_until_quiet(world, &mut graph, &rules, 100);
+                                    let cascade_dur = cascade_start.elapsed();
                                     let total_events = graph.len();
+                                    let cascade_events = total_events - events_before;
+
+                                    // Record metrics + publish graph snapshot (non-blocking).
+                                    dashboard.metrics.record_cascade(
+                                        (cascade_events + 7) as u64, // root + 6 notifies + cascade
+                                        cascade_dur,
+                                    );
+                                    dashboard.publish_graph(dashboard::snapshot_graph(&graph));
 
                                     // Broadcast ONLY the new BlockSet events to the client
                                     let all_ids = graph.all_ids();
@@ -667,11 +683,10 @@ where
                                     }.into_variant();
                                     write_packet(&ack, write, compression, cipher_enc).await?;
 
-                                    let cascade_events = total_events - events_before;
                                     if cascade_events > 0 {
                                         tracing::info!(
-                                            "Block break at ({},{},{}) -> {} causal cascade events",
-                                            pos.x, pos.y, pos.z, cascade_events
+                                            "Block break at ({},{},{}) -> {} causal cascade events in {:?}",
+                                            pos.x, pos.y, pos.z, cascade_events, cascade_dur
                                         );
                                     }
                                 }
@@ -694,32 +709,73 @@ where
                                     target.x as i64, target.y as i64, target.z as i64,
                                 );
 
-                                // Place the held block
+                                // Place the held block via the causal engine so that
+                                // gravity, fluid spread, etc. trigger on placement.
                                 let held = hotbar[selected_slot];
                                 if held == BlockState::AIR { continue; } // nothing to place
                                 let old = world.get_block(epos);
                                 let new_id = BlockId::new(u32::from(held) as u16);
-                                graph.insert_root(Event {
+                                let root = graph.insert_root(Event {
                                     payload: EventPayload::BlockSet {
                                         pos: epos,
                                         old,
                                         new: new_id,
                                     },
                                 });
+                                // Notify all 6 neighbors (gravity, fluid rules react).
+                                for neighbor in epos.neighbors() {
+                                    graph.insert(Event {
+                                        payload: EventPayload::BlockNotify { pos: neighbor },
+                                    }, vec![root]);
+                                }
 
-                                world.set_block(epos, new_id);
+                                // Run causal engine to quiescence.
+                                let events_before = graph.len();
+                                let cascade_start = std::time::Instant::now();
+                                scheduler.run_until_quiet(world, &mut graph, &rules, 100);
+                                let cascade_dur = cascade_start.elapsed();
+                                let total_events = graph.len();
+                                let cascade_events = total_events - events_before;
 
-                                let update: ClientboundGamePacket = ClientboundBlockUpdate {
-                                    pos: target,
-                                    block_state: held,
-                                }.into_variant();
-                                write_packet(&update, write, compression, cipher_enc).await?;
+                                // Record metrics + publish graph snapshot.
+                                dashboard.metrics.record_cascade(
+                                    (cascade_events + 7) as u64,
+                                    cascade_dur,
+                                );
+                                dashboard.publish_graph(dashboard::snapshot_graph(&graph));
+
+                                // Broadcast all executed BlockSet events to the client.
+                                let all_ids = graph.all_ids();
+                                for id in &all_ids {
+                                    if let Some(node) = graph.get(*id) {
+                                        if node.executed {
+                                            if let EventPayload::BlockSet { pos: ep, new, .. } = &node.event.payload {
+                                                let mc_pos = azalea_core::position::BlockPos::new(
+                                                    ep.x as i32, ep.y as i32, ep.z as i32,
+                                                );
+                                                let mc_state = engine_block_to_mc(*new);
+                                                let update: ClientboundGamePacket = ClientboundBlockUpdate {
+                                                    pos: mc_pos,
+                                                    block_state: mc_state,
+                                                }.into_variant();
+                                                write_packet(&update, write, compression, cipher_enc).await?;
+                                            }
+                                        }
+                                    }
+                                }
 
                                 // Acknowledge
                                 let ack: ClientboundGamePacket = ClientboundBlockChangedAck {
                                     seq: place.seq,
                                 }.into_variant();
                                 write_packet(&ack, write, compression, cipher_enc).await?;
+
+                                if cascade_events > 0 {
+                                    tracing::info!(
+                                        "Block place at ({},{},{}) -> {} causal cascade events in {:?}",
+                                        target.x, target.y, target.z, cascade_events, cascade_dur
+                                    );
+                                }
                             }
 
                             // ── Creative inventory slot update ───────────
@@ -772,11 +828,21 @@ where
 /// Try to convert an ItemKind to its corresponding BlockKind.
 /// Uses string name matching: ItemKind::OakPlanks displays as "minecraft:oak_planks",
 /// and BlockKind::from_str("oak_planks") parses it back.
+/// Special-cases items whose name doesn't match a block (e.g. water_bucket → water).
 fn item_to_block_kind(item: azalea_registry::builtin::ItemKind) -> Option<azalea_registry::builtin::BlockKind> {
+    use azalea_registry::builtin::{BlockKind, ItemKind};
+
+    // Items whose name doesn't map to a block name directly.
+    match item {
+        ItemKind::WaterBucket => return Some(BlockKind::Water),
+        ItemKind::LavaBucket => return Some(BlockKind::Lava),
+        _ => {}
+    }
+
     // Display gives "minecraft:oak_planks", strip prefix for FromStr which expects "oak_planks"
     let full = format!("{}", item);
     let name = full.strip_prefix("minecraft:").unwrap_or(&full);
-    name.parse::<azalea_registry::builtin::BlockKind>().ok()
+    name.parse::<BlockKind>().ok()
 }
 
 /// Map engine BlockId to MC BlockState for protocol.
