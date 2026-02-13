@@ -589,7 +589,6 @@ where
     use ultimate_engine::causal::scheduler::Scheduler;
     use ultimate_engine::world::block::BlockId;
 
-    let mut graph = CausalGraph::new();
     let rules = crate::rules::standard();
     let scheduler = Scheduler::new();
 
@@ -624,9 +623,9 @@ where
                                         pos.x as i64, pos.y as i64, pos.z as i64,
                                     );
 
-                                    // Inject block break + neighbor notifications
-                                    // into the causal engine. Neighbors are notified
-                                    // so gravity/fluid rules can react (e.g. sand above falls).
+                                    // Fresh causal graph per action -- the world state is the
+                                    // persistent data; the graph is scratch space for the cascade.
+                                    let mut graph = CausalGraph::new();
                                     let old = world.get_block(epos);
                                     let root = graph.insert_root(Event {
                                         payload: EventPayload::BlockSet {
@@ -643,23 +642,19 @@ where
                                     }
 
                                     // Run causal engine -- gravity, fluid spread cascade
-                                    let events_before = graph.len();
                                     let cascade_start = std::time::Instant::now();
-                                    scheduler.run_until_quiet(world, &mut graph, &rules, 100);
+                                    let cascade_events = scheduler.run_until_quiet(world, &mut graph, &rules, 1000);
                                     let cascade_dur = cascade_start.elapsed();
-                                    let total_events = graph.len();
-                                    let cascade_events = total_events - events_before;
 
                                     // Record metrics + publish graph snapshot (non-blocking).
                                     dashboard.metrics.record_cascade(
-                                        (cascade_events + 7) as u64, // root + 6 notifies + cascade
+                                        graph.len() as u64,
                                         cascade_dur,
                                     );
                                     dashboard.publish_graph(dashboard::snapshot_graph(&graph));
 
-                                    // Broadcast ONLY the new BlockSet events to the client
-                                    let all_ids = graph.all_ids();
-                                    for id in &all_ids {
+                                    // Broadcast all BlockSet events from this cascade to the client.
+                                    for id in &graph.all_ids() {
                                         if let Some(node) = graph.get(*id) {
                                             if node.executed {
                                                 if let EventPayload::BlockSet { pos: ep, new, .. } = &node.event.payload {
@@ -685,7 +680,7 @@ where
 
                                     if cascade_events > 0 {
                                         tracing::info!(
-                                            "Block break at ({},{},{}) -> {} causal cascade events in {:?}",
+                                            "Block break at ({},{},{}) -> {} causal events in {:?}",
                                             pos.x, pos.y, pos.z, cascade_events, cascade_dur
                                         );
                                     }
@@ -715,6 +710,9 @@ where
                                 if held == BlockState::AIR { continue; } // nothing to place
                                 let old = world.get_block(epos);
                                 let new_id = BlockId::new(u32::from(held) as u16);
+
+                                // Fresh causal graph per action.
+                                let mut graph = CausalGraph::new();
                                 let root = graph.insert_root(Event {
                                     payload: EventPayload::BlockSet {
                                         pos: epos,
@@ -730,23 +728,19 @@ where
                                 }
 
                                 // Run causal engine to quiescence.
-                                let events_before = graph.len();
                                 let cascade_start = std::time::Instant::now();
-                                scheduler.run_until_quiet(world, &mut graph, &rules, 100);
+                                let cascade_events = scheduler.run_until_quiet(world, &mut graph, &rules, 1000);
                                 let cascade_dur = cascade_start.elapsed();
-                                let total_events = graph.len();
-                                let cascade_events = total_events - events_before;
 
                                 // Record metrics + publish graph snapshot.
                                 dashboard.metrics.record_cascade(
-                                    (cascade_events + 7) as u64,
+                                    graph.len() as u64,
                                     cascade_dur,
                                 );
                                 dashboard.publish_graph(dashboard::snapshot_graph(&graph));
 
-                                // Broadcast all executed BlockSet events to the client.
-                                let all_ids = graph.all_ids();
-                                for id in &all_ids {
+                                // Broadcast all BlockSet events from this cascade to the client.
+                                for id in &graph.all_ids() {
                                     if let Some(node) = graph.get(*id) {
                                         if node.executed {
                                             if let EventPayload::BlockSet { pos: ep, new, .. } = &node.event.payload {
@@ -772,7 +766,7 @@ where
 
                                 if cascade_events > 0 {
                                     tracing::info!(
-                                        "Block place at ({},{},{}) -> {} causal cascade events in {:?}",
+                                        "Block place at ({},{},{}) -> {} causal events in {:?}",
                                         target.x, target.y, target.z, cascade_events, cascade_dur
                                     );
                                 }

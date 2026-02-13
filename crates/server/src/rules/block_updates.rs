@@ -4,7 +4,7 @@
 //! so it can be registered directly as a `RuleFn`.
 
 use crate::block::{self, FluidKind};
-use super::helpers::{block_set, notify_horizontal, notify_vertical, horizontal_neighbors};
+use super::helpers::{block_set, notify_horizontal, notify_vertical, notify_neighbors, horizontal_neighbors};
 use ultimate_engine::causal::event::{Event, EventPayload};
 use ultimate_engine::world::position::BlockPos;
 use ultimate_engine::world::World;
@@ -68,12 +68,21 @@ fn has_fluid_support(world: &World, pos: BlockPos, level: u8, kind: FluidKind) -
 
 /// Core fluid rule, parameterized by `FluidKind`.
 ///
-/// Handles both **spread** and **drainage**:
+/// Handles **spread**, **drainage**, and **removal notification**:
+///   - Removal: when a `BlockSet` replaces this fluid with a non-fluid block,
+///     notify all 6 neighbors so drainage can cascade through the rules alone.
 ///   - Spread: source (level 0) spreads to level 1; flowing (level N) to N+1,
 ///     up to `kind.max_spread()`. Fluid above air falls down as level 1.
 ///   - Drain: on `BlockNotify`, flowing fluid (level > 0) without support
 ///     drains to air and notifies horizontal neighbors.
 fn generic_fluid(world: &World, payload: &EventPayload, kind: FluidKind) -> Vec<Event> {
+    // ── Removal: fluid replaced by non-fluid → notify neighbors for drainage ─
+    if let EventPayload::BlockSet { pos, old, new } = payload {
+        if kind.is_match(*old) && !kind.is_match(*new) {
+            return notify_neighbors(*pos);
+        }
+    }
+
     let is_notify = matches!(payload, EventPayload::BlockNotify { .. });
 
     let pos = match payload {
