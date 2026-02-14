@@ -200,19 +200,30 @@ fn bits_per_entry(palette_len: usize) -> usize {
 
 // ── Save ─────────────────────────────────────────────────────────────────────
 
-/// Save the entire world to Anvil region files under `<dir>/region/`.
+/// Save only dirty (modified) chunks to Anvil region files under `<dir>/region/`.
+///
+/// Existing region files are opened and updated in-place; new region files are
+/// created as needed. Returns the number of chunks written.
 pub fn save_world(world: &World, dir: &Path) -> Result<usize> {
+    let dirty = world.take_dirty_chunks();
+    if dirty.is_empty() {
+        tracing::info!("World save: nothing to save (no dirty chunks)");
+        return Ok(0);
+    }
+
     let start = Instant::now();
     let region_dir = dir.join("region");
     fs::create_dir_all(&region_dir)?;
 
-    // Snapshot all chunks: collect (ChunkPos, serialized NBT bytes).
-    // We snapshot first so we release DashMap refs quickly.
+    // Serialize dirty chunks and group by region.
     let mut region_chunks: HashMap<(i32, i32), Vec<(ChunkPos, Vec<u8>)>> = HashMap::new();
 
-    for entry in world.iter_chunks() {
-        let pos = *entry.key();
-        let nbt = chunk_to_nbt(pos, &*entry);
+    for pos in &dirty {
+        let Some(chunk_ref) = world.get_chunk(pos) else {
+            continue; // Chunk was removed between dirty-mark and save.
+        };
+        let nbt = chunk_to_nbt(*pos, &*chunk_ref);
+        drop(chunk_ref); // Release DashMap ref before serialization.
         let nbt_bytes = fastnbt::to_bytes(&nbt)
             .with_context(|| format!("serializing chunk ({}, {})", pos.x, pos.z))?;
 
@@ -221,7 +232,7 @@ pub fn save_world(world: &World, dir: &Path) -> Result<usize> {
         region_chunks
             .entry((rx, rz))
             .or_default()
-            .push((pos, nbt_bytes));
+            .push((*pos, nbt_bytes));
     }
 
     let mut total_chunks = 0usize;
@@ -229,10 +240,16 @@ pub fn save_world(world: &World, dir: &Path) -> Result<usize> {
     for ((rx, rz), chunks) in &region_chunks {
         let path = region_dir.join(format!("r.{}.{}.mca", rx, rz));
 
-        // Create a new in-memory region, write chunks, then flush to disk.
-        let buf: Cursor<Vec<u8>> = Cursor::new(Vec::new());
-        let mut region = fastanvil::Region::new(buf)
-            .with_context(|| format!("creating region r.{}.{}", rx, rz))?;
+        // Open existing region file or create a new one.
+        let mut region = if path.exists() {
+            let file_bytes = fs::read(&path)
+                .with_context(|| format!("reading region r.{}.{}", rx, rz))?;
+            fastanvil::Region::from_stream(Cursor::new(file_bytes))
+                .with_context(|| format!("parsing region r.{}.{}", rx, rz))?
+        } else {
+            fastanvil::Region::new(Cursor::new(Vec::new()))
+                .with_context(|| format!("creating region r.{}.{}", rx, rz))?
+        };
 
         for (pos, nbt_bytes) in chunks {
             let local_x = pos.x.rem_euclid(32) as usize;
@@ -252,7 +269,7 @@ pub fn save_world(world: &World, dir: &Path) -> Result<usize> {
 
     let elapsed = start.elapsed();
     tracing::info!(
-        "World saved: {} chunks in {} regions ({:.2?})",
+        "World saved: {} dirty chunks across {} regions ({:.2?})",
         total_chunks,
         region_chunks.len(),
         elapsed,
@@ -528,27 +545,27 @@ mod tests {
 
     #[test]
     fn test_save_load_roundtrip() {
+        use ultimate_engine::world::position::BlockPos;
+
         let world = World::new();
 
-        // Create a small test world.
-        use ultimate_engine::world::chunk::Chunk;
-        let mut chunk = Chunk::new();
-        // Place bedrock at y=60, stone at y=61-63, dirt at y=64.
-        for x in 0..16u8 {
-            for z in 0..16u8 {
-                chunk.set_block(LocalBlockPos { x, y: 60, z }, BlockId(crate::block::BEDROCK.0));
+        // Build a small test chunk via set_block (which marks dirty).
+        for x in 0..16i64 {
+            for z in 0..16i64 {
+                world.set_block(BlockPos::new(x, 60, z), crate::block::BEDROCK);
                 for y in 61..=63i64 {
-                    chunk.set_block(LocalBlockPos { x, y, z }, BlockId(crate::block::STONE.0));
+                    world.set_block(BlockPos::new(x, y, z), crate::block::STONE);
                 }
-                chunk.set_block(LocalBlockPos { x, y: 64, z }, BlockId(crate::block::DIRT.0));
+                world.set_block(BlockPos::new(x, 64, z), crate::block::DIRT);
             }
         }
-        world.insert_chunk(ChunkPos::new(0, 0), chunk);
+        assert_eq!(world.dirty_count(), 1); // one chunk dirty
 
         // Save to a temp directory.
         let tmp = std::env::temp_dir().join("ultimate_mc_test_persistence");
         let _ = fs::remove_dir_all(&tmp);
-        save_world(&world, &tmp).unwrap();
+        let saved = save_world(&world, &tmp).unwrap();
+        assert_eq!(saved, 1); // only the one dirty chunk
 
         // Verify region file exists.
         assert!(tmp.join("region/r.0.0.mca").exists());
@@ -558,7 +575,6 @@ mod tests {
         assert_eq!(loaded.chunk_count(), 1);
 
         // Verify blocks match.
-        use ultimate_engine::world::position::BlockPos;
         for x in 0..16i64 {
             for z in 0..16i64 {
                 assert_eq!(
@@ -589,7 +605,51 @@ mod tests {
             }
         }
 
+        // After loading, dirty set should be empty (load doesn't dirty).
+        assert_eq!(loaded.dirty_count(), 0);
+
+        // Saving again should write 0 chunks (nothing dirty).
+        let saved_again = save_world(&loaded, &tmp).unwrap();
+        assert_eq!(saved_again, 0);
+
         // Cleanup.
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_incremental_save() {
+        use ultimate_engine::world::position::BlockPos;
+
+        let world = World::new();
+
+        // Two chunks: (0,0) and (1,0).
+        world.set_block(BlockPos::new(0, 60, 0), crate::block::STONE);
+        world.set_block(BlockPos::new(16, 60, 0), crate::block::DIRT);
+        assert_eq!(world.dirty_count(), 2);
+
+        let tmp = std::env::temp_dir().join("ultimate_mc_test_incremental");
+        let _ = fs::remove_dir_all(&tmp);
+
+        // First save: both chunks written.
+        let saved = save_world(&world, &tmp).unwrap();
+        assert_eq!(saved, 2);
+        assert_eq!(world.dirty_count(), 0);
+
+        // Modify only chunk (0,0).
+        world.set_block(BlockPos::new(1, 60, 0), crate::block::BEDROCK);
+        assert_eq!(world.dirty_count(), 1);
+
+        // Second save: only 1 chunk.
+        let saved = save_world(&world, &tmp).unwrap();
+        assert_eq!(saved, 1);
+
+        // Load and verify both chunks are present (the untouched one persisted from first save).
+        let loaded = load_world(&tmp).unwrap().expect("should load");
+        assert_eq!(loaded.chunk_count(), 2);
+        assert_eq!(loaded.get_block(BlockPos::new(0, 60, 0)), crate::block::STONE);
+        assert_eq!(loaded.get_block(BlockPos::new(1, 60, 0)), crate::block::BEDROCK);
+        assert_eq!(loaded.get_block(BlockPos::new(16, 60, 0)), crate::block::DIRT);
+
         let _ = fs::remove_dir_all(&tmp);
     }
 }
