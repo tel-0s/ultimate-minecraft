@@ -2,6 +2,7 @@
 //!
 //! Handshake -> Status | Login -> Configuration -> Play
 
+use std::collections::{HashSet, VecDeque};
 use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +25,8 @@ use azalea_protocol::packets::game::{
     ClientboundPlayerInfoUpdate, ClientboundPlayerInfoRemove,
     ClientboundAddEntity, ClientboundRemoveEntities,
     ClientboundTeleportEntity, ClientboundRotateHead,
+    ClientboundForgetLevelChunk,
+    ClientboundSystemChat,
     ServerboundGamePacket,
 };
 use azalea_protocol::packets::game::c_game_event::EventType;
@@ -603,11 +606,18 @@ where
 
     // Send chunk data for a small area around the player
     let view_distance = 4i32;
+    let mut loaded_chunks: HashSet<(i32, i32)> = HashSet::new();
     for cx in (chunk_x - view_distance)..=(chunk_x + view_distance) {
         for cz in (chunk_z - view_distance)..=(chunk_z + view_distance) {
             send_chunk_from_world(write, compression, cipher_enc, world, cx, cz).await?;
+            loaded_chunks.insert((cx, cz));
         }
     }
+    let mut current_chunk_x = chunk_x;
+    let mut current_chunk_z = chunk_z;
+    // Queue for deferred chunk loading -- chunks are sent progressively to
+    // avoid blocking the event loop when the player moves fast.
+    let mut chunk_send_queue: VecDeque<(i32, i32)> = VecDeque::new();
 
     tracing::info!("{} joined the game at ({}, {}, {})", player_name, spawn_x, spawn_y, spawn_z);
 
@@ -743,8 +753,29 @@ where
     let mut keepalive_timer = tokio::time::interval(Duration::from_secs(15));
     let mut keepalive_id: u64 = 0;
 
+    // Max chunks to send per loop iteration. Keeps the loop responsive while
+    // still making rapid progress on the queue.
+    const CHUNKS_PER_ITER: usize = 5;
+
     loop {
+        // ── Eagerly drain chunk queue before waiting for events ──────────
+        {
+            let mut sent = 0;
+            while sent < CHUNKS_PER_ITER {
+                let Some((cx, cz)) = chunk_send_queue.pop_front() else { break };
+                if !loaded_chunks.contains(&(cx, cz)) {
+                    continue; // Player moved away before this chunk was sent.
+                }
+                send_chunk_from_world(write, compression, cipher_enc, world, cx, cz).await?;
+                sent += 1;
+            }
+        }
+
         tokio::select! {
+            // When chunks are still queued, yield immediately so we cycle back
+            // to the drain at the top of the loop. This keeps chunk loading
+            // progressing rapidly without starving event processing.
+            _ = std::future::ready(()), if !chunk_send_queue.is_empty() => {}
             _ = keepalive_timer.tick() => {
                 keepalive_id += 1;
                 let ka: ClientboundGamePacket = azalea_protocol::packets::game::ClientboundKeepAlive {
@@ -955,6 +986,12 @@ where
                                     conn_id, player_x, player_y, player_z,
                                     player_y_rot, player_x_rot, player_on_ground,
                                 );
+                                update_loaded_chunks(
+                                    write, compression, cipher_enc, world,
+                                    player_x, player_z, view_distance,
+                                    &mut current_chunk_x, &mut current_chunk_z,
+                                    &mut loaded_chunks, &mut chunk_send_queue,
+                                ).await?;
                             }
                             ServerboundGamePacket::MovePlayerPosRot(pkt) => {
                                 player_x = pkt.pos.x;
@@ -967,6 +1004,12 @@ where
                                     conn_id, player_x, player_y, player_z,
                                     player_y_rot, player_x_rot, player_on_ground,
                                 );
+                                update_loaded_chunks(
+                                    write, compression, cipher_enc, world,
+                                    player_x, player_z, view_distance,
+                                    &mut current_chunk_x, &mut current_chunk_z,
+                                    &mut loaded_chunks, &mut chunk_send_queue,
+                                ).await?;
                             }
                             ServerboundGamePacket::MovePlayerRot(pkt) => {
                                 player_y_rot = pkt.look_direction.y_rot();
@@ -976,6 +1019,16 @@ where
                                     conn_id, player_x, player_y, player_z,
                                     player_y_rot, player_x_rot, player_on_ground,
                                 );
+                            }
+
+                            // ── Chat ────────────────────────────────────
+                            ServerboundGamePacket::Chat(chat) => {
+                                tracing::info!("<{}> {}", player_name, chat.message);
+                                registry.broadcast_chat(conn_id, &player_name, &chat.message);
+                            }
+                            ServerboundGamePacket::ChatCommand(cmd) => {
+                                // Ignore slash-commands for now; just swallow the packet.
+                                tracing::debug!("{} sent command: /{}", player_name, cmd.command);
                             }
 
                             // ── Ignored packets ─────────────────────────
@@ -1121,6 +1174,15 @@ where
                                 }.into_variant();
                                 write_packet(&info_remove, write, compression, cipher_enc).await?;
                             }
+                            PlayerEvent::Chat { name, message, .. } => {
+                                // Send as system chat to all clients (including sender).
+                                let text = format!("<{}> {}", name, message);
+                                let chat_pkt: ClientboundGamePacket = ClientboundSystemChat {
+                                    content: FormattedText::from(text),
+                                    overlay: false,
+                                }.into_variant();
+                                write_packet(&chat_pkt, write, compression, cipher_enc).await?;
+                            }
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -1171,6 +1233,115 @@ fn engine_block_to_mc(id: ultimate_engine::world::block::BlockId) -> azalea_bloc
     // For now, treat BlockId as a direct MC block state ID.
     // BlockId(0) = air, others map through azalea.
     azalea_block::BlockState::try_from(id.0 as u32).unwrap_or(azalea_block::BlockState::AIR)
+}
+
+// ── Dynamic chunk loading ────────────────────────────────────────────────
+
+/// Check if the player has crossed a chunk boundary, and if so, queue new
+/// chunks for deferred loading and immediately unload old ones.
+///
+/// New chunks are sorted by Chebyshev distance from the player (nearest first)
+/// and added to `chunk_send_queue`. The main loop drains this queue
+/// progressively so the event loop stays responsive during fast movement.
+async fn update_loaded_chunks<W: AsyncWrite + Unpin + Send>(
+    write: &mut W,
+    compression: Option<u32>,
+    cipher: &mut Option<azalea_crypto::Aes128CfbEnc>,
+    world: &World,
+    player_x: f64,
+    player_z: f64,
+    view_distance: i32,
+    current_chunk_x: &mut i32,
+    current_chunk_z: &mut i32,
+    loaded_chunks: &mut HashSet<(i32, i32)>,
+    chunk_send_queue: &mut VecDeque<(i32, i32)>,
+) -> Result<()> {
+    let new_cx = (player_x.floor() as i32) >> 4;
+    let new_cz = (player_z.floor() as i32) >> 4;
+
+    // No chunk boundary crossed -- nothing to do.
+    if new_cx == *current_chunk_x && new_cz == *current_chunk_z {
+        return Ok(());
+    }
+
+    *current_chunk_x = new_cx;
+    *current_chunk_z = new_cz;
+
+    // Compute the desired set of loaded chunks.
+    let desired: HashSet<(i32, i32)> = {
+        let mut s = HashSet::with_capacity(((2 * view_distance + 1) * (2 * view_distance + 1)) as usize);
+        for cx in (new_cx - view_distance)..=(new_cx + view_distance) {
+            for cz in (new_cz - view_distance)..=(new_cz + view_distance) {
+                s.insert((cx, cz));
+            }
+        }
+        s
+    };
+
+    // Unload chunks that are no longer in range.
+    let to_unload: Vec<(i32, i32)> = loaded_chunks.difference(&desired).copied().collect();
+    for (cx, cz) in &to_unload {
+        let forget: ClientboundGamePacket = ClientboundForgetLevelChunk {
+            pos: azalea_core::position::ChunkPos::new(*cx, *cz),
+        }.into_variant();
+        write_packet(&forget, write, compression, cipher).await?;
+        loaded_chunks.remove(&(*cx, *cz));
+    }
+
+    // Remove stale entries from the queue.
+    chunk_send_queue.retain(|pos| desired.contains(pos));
+
+    // Collect new chunks to load, sorted by distance (nearest first).
+    let mut to_load: Vec<(i32, i32)> = desired
+        .difference(loaded_chunks)
+        .copied()
+        .collect();
+    to_load.sort_by_key(|(cx, cz)| {
+        let dx = (*cx - new_cx).abs();
+        let dz = (*cz - new_cz).abs();
+        dx.max(dz) // Chebyshev distance
+    });
+
+    // ── Key fix: send inner-ring chunks SYNCHRONOUSLY before updating the
+    //    center, so the client always has nearby chunks when the center moves.
+    //    Outer-ring chunks are queued for deferred loading.
+    const IMMEDIATE_RADIUS: i32 = 2;
+    let (immediate, deferred): (Vec<_>, Vec<_>) = to_load
+        .into_iter()
+        .partition(|(cx, cz)| {
+            let dx = (*cx - new_cx).abs();
+            let dz = (*cz - new_cz).abs();
+            dx.max(dz) <= IMMEDIATE_RADIUS
+        });
+
+    // Send inner chunks NOW (before center update).
+    for (cx, cz) in &immediate {
+        send_chunk_from_world(write, compression, cipher, world, *cx, *cz).await?;
+        loaded_chunks.insert((*cx, *cz));
+    }
+
+    // NOW update the chunk cache center -- client already has nearby chunks.
+    let center: ClientboundGamePacket = ClientboundSetChunkCacheCenter {
+        x: new_cx,
+        z: new_cz,
+    }.into_variant();
+    write_packet(&center, write, compression, cipher).await?;
+
+    // Mark deferred chunks as "claimed" and enqueue.
+    for pos in &deferred {
+        loaded_chunks.insert(*pos);
+    }
+    chunk_send_queue.extend(deferred.iter());
+
+    if !immediate.is_empty() || !deferred.is_empty() || !to_unload.is_empty() {
+        tracing::debug!(
+            "Chunk update: {} immediate + {} deferred, unloaded {}, queue {}, (center {}, {})",
+            immediate.len(), deferred.len(), to_unload.len(),
+            chunk_send_queue.len(), new_cx, new_cz,
+        );
+    }
+
+    Ok(())
 }
 
 // ── Chunk data ──────────────────────────────────────────────────────────

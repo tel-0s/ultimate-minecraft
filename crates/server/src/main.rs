@@ -34,7 +34,7 @@ async fn main() {
     tracing::info!("Generating flat world...");
 
     let world = Arc::new(World::new());
-    generate_flat_world_mc(&world, 8);
+    generate_flat_world_mc(&world, 32);
     tracing::info!("World ready: {} chunks loaded", world.chunk_count());
 
     // Start live dashboard (non-blocking — runs on its own tasks).

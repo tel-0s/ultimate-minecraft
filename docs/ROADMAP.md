@@ -98,9 +98,17 @@ causality is the only ordering.
 - [x] Persistent world: pre-populate World at startup, serve chunks from World state
 - [x] Use MC block state IDs as BlockId values (unify engine + protocol ID space)
 - [x] Creative inventory: place the block the player is holding, not always stone
-- [ ] Multiple simultaneous players (each sees the other's changes)
-- [ ] Chunk loading based on player position (send new chunks as player moves)
-- [ ] Chat messages
+- [x] Event bus: `tokio::broadcast` for cross-player block change sync
+- [x] Web dashboard: real-time stats (players, chunks, events) on HTTP endpoint
+- [x] Multiple simultaneous players:
+  - [x] Unique entity IDs (atomic counter in shared `PlayerRegistry`)
+  - [x] Tab list sync (`ClientboundPlayerInfoUpdate` / `Remove` on join/leave)
+  - [x] Entity spawning (`ClientboundAddEntity` / `RemoveEntities`)
+  - [x] Player movement relay (`ClientboundTeleportEntity` + `RotateHead`)
+  - [x] Dynamic server list (player count + sample from registry)
+- [x] Fluid event explosion fix: drain cascade 360K → 15K events (24x improvement)
+- [x] Chunk loading based on player position (send new chunks as player moves)
+- [x] Chat messages (`ClientboundSystemChat` relay via `PlayerEvent::Chat`)
 
 ## Phase 4 -- World Generation
 
@@ -317,3 +325,5 @@ shared-nothing spatial ownership model.
 |------------|--------------------------------------------------------------|
 | 2026-02-07 | Phase 0-2: Engine, tests, parallel scheduler, workspace split|
 | 2026-02-07 | Phase 3: **First real MC 1.21.11 client connection**         |
+| 2026-02-07 | Phase 3: Multiplayer -- players see each other move & build  |
+| 2026-02-07 | Phase 3: Fluid drain optimization (360K → 15K events)        |

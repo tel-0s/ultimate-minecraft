@@ -55,6 +55,12 @@ pub enum PlayerEvent {
         x_rot: f32,
         on_ground: bool,
     },
+    /// A player sent a chat message.
+    Chat {
+        conn_id: u64,
+        name: String,
+        message: String,
+    },
 }
 
 /// Thread-safe registry of all connected players.
@@ -143,6 +149,15 @@ impl PlayerRegistry {
             y_rot,
             x_rot,
             on_ground,
+        });
+    }
+
+    /// Broadcast a chat message from a player.
+    pub fn broadcast_chat(&self, conn_id: u64, name: &str, message: &str) {
+        let _ = self.event_tx.send(PlayerEvent::Chat {
+            conn_id,
+            name: name.to_owned(),
+            message: message.to_owned(),
         });
     }
 
