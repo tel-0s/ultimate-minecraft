@@ -109,6 +109,12 @@ causality is the only ordering.
 - [x] Fluid event explosion fix: drain cascade 360K → 15K events (24x improvement)
 - [x] Chunk loading based on player position (send new chunks as player moves)
 - [x] Chat messages (`ClientboundSystemChat` relay via `PlayerEvent::Chat`)
+- [x] World persistence (Anvil region files):
+  - [x] Save/load via `fastnbt` + `fastanvil` (standard `.mca` format)
+  - [x] Reverse block lookup table (`BlockState` ID ↔ name + properties)
+  - [x] Periodic autosave (5 min interval)
+  - [x] Graceful shutdown save (Ctrl+C handler)
+  - [x] `--world <dir>` CLI flag for save location
 
 ## Phase 4 -- World Generation
 

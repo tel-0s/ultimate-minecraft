@@ -26,6 +26,11 @@ azalea-world = "0.15"
 # Web dashboard
 axum = { version = "0.7", features = ["ws"] }
 
+# World persistence (Anvil region files)
+fastnbt = "2"
+fastanvil = "0.31"
+flate2 = "1"
+
 # Supporting
 anyhow = "1"
 uuid = "1"

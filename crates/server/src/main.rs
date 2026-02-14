@@ -1,9 +1,15 @@
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
 use ultimate_engine::world::World;
 use ultimate_server::dashboard::{self, DashboardState};
 use ultimate_server::event_bus::{self, WorldChangeBatch};
+use ultimate_server::persistence;
 use ultimate_server::player_registry::PlayerRegistry;
+
+/// Default autosave interval (5 minutes).
+const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(300);
 
 #[tokio::main]
 async fn main() {
@@ -17,6 +23,11 @@ async fn main() {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(8000);
+    let world_dir: PathBuf = std::env::args()
+        .skip_while(|a| a != "--world")
+        .nth(1)
+        .unwrap_or_else(|| "world".into())
+        .into();
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -31,11 +42,29 @@ async fn main() {
     }
 
     tracing::info!("Ultimate Minecraft -- causal voxel engine server");
-    tracing::info!("Generating flat world...");
 
-    let world = Arc::new(World::new());
-    generate_flat_world_mc(&world, 32);
-    tracing::info!("World ready: {} chunks loaded", world.chunk_count());
+    // ── Load or generate world ───────────────────────────────────────────
+    let world = match persistence::load_world(&world_dir) {
+        Ok(Some(w)) => {
+            tracing::info!("Loaded world from {}: {} chunks", world_dir.display(), w.chunk_count());
+            Arc::new(w)
+        }
+        Ok(None) => {
+            tracing::info!("No save found at {}, generating flat world...", world_dir.display());
+            let w = Arc::new(World::new());
+            generate_flat_world_mc(&w, 32);
+            tracing::info!("World ready: {} chunks generated", w.chunk_count());
+            w
+        }
+        Err(e) => {
+            tracing::error!("Failed to load world from {}: {:#}", world_dir.display(), e);
+            tracing::info!("Generating fresh flat world instead...");
+            let w = Arc::new(World::new());
+            generate_flat_world_mc(&w, 32);
+            tracing::info!("World ready: {} chunks generated", w.chunk_count());
+            w
+        }
+    };
 
     // Start live dashboard (non-blocking — runs on its own tasks).
     let dashboard = Arc::new(DashboardState::new(Arc::clone(&world)));
@@ -55,9 +84,43 @@ async fn main() {
     // Shared player registry for multiplayer visibility.
     let registry = Arc::new(PlayerRegistry::new());
 
+    // ── Periodic autosave ────────────────────────────────────────────────
+    let save_world_ref = Arc::clone(&world);
+    let save_dir = world_dir.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(AUTOSAVE_INTERVAL);
+        interval.tick().await; // first tick is immediate, skip it
+        loop {
+            interval.tick().await;
+            tracing::info!("Autosaving...");
+            match persistence::save_world(&save_world_ref, &save_dir) {
+                Ok(n) => tracing::info!("Autosave complete: {} chunks", n),
+                Err(e) => tracing::error!("Autosave failed: {:#}", e),
+            }
+        }
+    });
+
+    // ── Start listener with graceful shutdown ────────────────────────────
     tracing::info!("Starting Minecraft 1.21.11 server on {}", bind_addr);
-    if let Err(e) = ultimate_server::net::listener::run(world, dashboard, bus_tx, registry, &bind_addr).await {
-        tracing::error!("Server error: {}", e);
+
+    tokio::select! {
+        result = ultimate_server::net::listener::run(
+            Arc::clone(&world), dashboard, bus_tx, registry, &bind_addr,
+        ) => {
+            if let Err(e) = result {
+                tracing::error!("Server error: {}", e);
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Ctrl+C received, shutting down...");
+        }
+    }
+
+    // ── Save on shutdown ─────────────────────────────────────────────────
+    tracing::info!("Saving world before exit...");
+    match persistence::save_world(&world, &world_dir) {
+        Ok(n) => tracing::info!("Shutdown save complete: {} chunks written", n),
+        Err(e) => tracing::error!("Shutdown save failed: {:#}", e),
     }
 }
 

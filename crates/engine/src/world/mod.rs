@@ -52,6 +52,12 @@ impl World {
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
     }
+
+    /// Iterate over all chunks. Each entry is a DashMap ref that derefs to
+    /// `(ChunkPos, Chunk)`. Use `*entry.key()` and `&*entry` (value).
+    pub fn iter_chunks(&self) -> dashmap::iter::Iter<'_, ChunkPos, Chunk> {
+        self.chunks.iter()
+    }
 }
 
 impl Default for World {

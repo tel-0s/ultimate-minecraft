@@ -46,6 +46,11 @@ impl ChunkSection {
     pub fn is_empty(&self) -> bool {
         self.blocks.iter().all(|b| *b == BlockId::AIR)
     }
+
+    /// Direct access to the underlying block array (4096 entries, XZY order).
+    pub fn blocks(&self) -> &[BlockId; SECTION_VOLUME] {
+        &self.blocks
+    }
 }
 
 /// A column of chunk sections, keyed by section index (y >> 4).
@@ -91,6 +96,11 @@ impl Chunk {
 
     pub fn section_count(&self) -> usize {
         self.sections.len()
+    }
+
+    /// Iterate over all non-empty sections as (section_index, section).
+    pub fn sections(&self) -> impl Iterator<Item = (&i32, &ChunkSection)> {
+        self.sections.iter()
     }
 }
 
