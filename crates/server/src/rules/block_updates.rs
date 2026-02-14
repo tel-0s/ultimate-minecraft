@@ -4,7 +4,7 @@
 //! so it can be registered directly as a `RuleFn`.
 
 use crate::block::{self, FluidKind};
-use super::helpers::{block_set, notify_horizontal, notify_vertical, notify_neighbors, horizontal_neighbors};
+use super::helpers::{block_set, notify_vertical, notify_neighbors, horizontal_neighbors};
 use ultimate_engine::causal::event::{Event, EventPayload};
 use ultimate_engine::world::position::BlockPos;
 use ultimate_engine::world::World;
@@ -99,12 +99,23 @@ fn generic_fluid(world: &World, payload: &EventPayload, kind: FluidKind) -> Vec<
 
     // ── Drainage (flowing only, on BlockNotify) ──────────────────────
     if level > 0 && is_notify && !has_fluid_support(world, pos, level, kind) {
-        let mut events = vec![block_set(pos, block_id, block::AIR)];
-        events.extend(notify_horizontal(pos));
-        return events;
+        // Emit only the drain BlockSet. The removal trigger (lines 80-83)
+        // will fire on this BlockSet and emit notify_neighbors, propagating
+        // the drain cascade to all 6 directions. No extra notifications needed.
+        return vec![block_set(pos, block_id, block::AIR)];
     }
 
-    // ── Spread ───────────────────────────────────────────────────────
+    // Flowing blocks on BlockNotify: the drain check above was the only action.
+    // Do NOT fall through to spread -- that causes a feedback loop where
+    // surviving neighbors re-spread into freshly drained spaces, generating
+    // hundreds of thousands of redundant events.
+    // Only source blocks (level 0) may re-spread on notify, allowing them to
+    // fill newly opened spaces; the spread then cascades via BlockSet events.
+    if level > 0 && is_notify {
+        return Vec::new();
+    }
+
+    // ── Spread (BlockSet, or source on BlockNotify) ──────────────────
 
     // Falls down first (gravity-like). Falling fluid becomes level 1.
     let below = BlockPos::new(pos.x, pos.y - 1, pos.z);

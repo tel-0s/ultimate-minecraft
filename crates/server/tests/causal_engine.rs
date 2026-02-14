@@ -1070,3 +1070,118 @@ fn lava_source_does_not_drain() {
     // Source must still be lava.
     assert_eq!(world.get_block(source_pos), block::LAVA);
 }
+
+// ---------------------------------------------------------------------------
+// Elevated water source drainage test
+// ---------------------------------------------------------------------------
+
+#[test]
+fn elevated_water_source_drains_when_removed() {
+    // Scenario: realistic MC world -- dirt at y=4, pillar from y=5 to y=20,
+    // water source at y=21. 16-block fall to ground level.
+    // Removing the source should drain ALL water.
+    let world = flat_world(4);
+    let rules = ultimate_server::rules::standard();
+    let scheduler = Scheduler::new();
+
+    // Build a tall pillar (like placing blocks in creative mode).
+    for y in 5..=20 {
+        world.set_block(BlockPos::new(8, y, 8), block::STONE);
+    }
+    let source_pos = BlockPos::new(8, 21, 8); // on top of the pillar
+
+    // 1. Place water source on top.
+    let mut graph = CausalGraph::new();
+    graph.insert_root(Event {
+        payload: EventPayload::BlockSet {
+            pos: source_pos,
+            old: block::AIR,
+            new: block::WATER,
+        },
+    });
+    let spread_events = scheduler.run_until_quiet(&world, &mut graph, &rules, 5000);
+    eprintln!("Spread cascade: {} events, {} in graph", spread_events, graph.len());
+
+    // Sanity: source should still be water.
+    assert_eq!(world.get_block(source_pos), block::WATER);
+
+    // Water should have spread to horizontal neighbors at source height.
+    assert!(
+        block::is_fluid(world.get_block(BlockPos::new(9, 21, 8))),
+        "water should spread horizontally from source"
+    );
+
+    // Water should have fallen to ground level (y=5).
+    assert!(
+        block::is_fluid(world.get_block(BlockPos::new(9, 5, 8))),
+        "water should have fallen to ground level"
+    );
+
+    // Count total water blocks before draining.
+    let mut water_count = 0;
+    for y in 5..=21 {
+        for dx in -8i64..=8 {
+            for dz in -8i64..=8 {
+                if block::is_fluid(world.get_block(BlockPos::new(8 + dx, y, 8 + dz))) {
+                    water_count += 1;
+                }
+            }
+        }
+    }
+    eprintln!("Water blocks before drain: {}", water_count);
+
+    // 2. Remove the source (simulate player placing stone over it).
+    let mut graph2 = CausalGraph::new();
+    let root = graph2.insert_root(Event {
+        payload: EventPayload::BlockSet {
+            pos: source_pos,
+            old: block::WATER,
+            new: block::AIR,
+        },
+    });
+    for neighbor in source_pos.neighbors() {
+        graph2.insert(
+            Event {
+                payload: EventPayload::BlockNotify { pos: neighbor },
+            },
+            vec![root],
+        );
+    }
+    let drain_events = scheduler.run_until_quiet(&world, &mut graph2, &rules, 1000);
+    eprintln!("Drain cascade: {} events, {} in graph", drain_events, graph2.len());
+
+    // The drain should complete efficiently -- no spread-drain feedback loop.
+    // With ~300-600 water blocks and ~7 events per drain plus redundant neighbor
+    // notifications, the total should stay well under 20,000.
+    assert!(
+        drain_events < 20_000,
+        "drain cascade should be efficient (< 20,000 events), got {}",
+        drain_events,
+    );
+    // And the cascade should have fully completed (empty frontier).
+    assert!(
+        graph2.frontier().is_empty(),
+        "drain cascade should reach quiescence within 1000 steps",
+    );
+
+    // 3. All water should have drained. Check a generous area.
+    let mut remaining_water = Vec::new();
+    for y in 5..=21 {
+        for dx in -8i64..=8 {
+            for dz in -8i64..=8 {
+                let pos = BlockPos::new(8 + dx, y, 8 + dz);
+                let b = world.get_block(pos);
+                if block::is_fluid(b) {
+                    remaining_water.push((pos, b));
+                }
+            }
+        }
+    }
+
+    assert!(
+        remaining_water.is_empty(),
+        "water should have fully drained, but {} blocks remain: {:?}",
+        remaining_water.len(),
+        &remaining_water[..remaining_water.len().min(10)],
+    );
+}

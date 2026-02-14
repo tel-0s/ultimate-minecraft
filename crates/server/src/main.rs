@@ -1,6 +1,9 @@
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use ultimate_engine::world::World;
 use ultimate_server::dashboard::{self, DashboardState};
+use ultimate_server::event_bus::{self, WorldChangeBatch};
+use ultimate_server::player_registry::PlayerRegistry;
 
 #[tokio::main]
 async fn main() {
@@ -41,8 +44,19 @@ async fn main() {
         dashboard::server::start(dash, dashboard_port).await;
     });
 
+    // World-change event bus: player actions and simulation layers publish here,
+    // all connections subscribe to receive cross-player updates.
+    let (bus_tx, _) = broadcast::channel::<WorldChangeBatch>(event_bus::BUS_CAPACITY);
+
+    // Start ambient simulation layers (empty for now -- add layers here).
+    let sim_layers: Vec<Box<dyn ultimate_server::simulation::SimulationLayer>> = vec![];
+    ultimate_server::simulation::start(Arc::clone(&world), sim_layers, bus_tx.clone());
+
+    // Shared player registry for multiplayer visibility.
+    let registry = Arc::new(PlayerRegistry::new());
+
     tracing::info!("Starting Minecraft 1.21.11 server on {}", bind_addr);
-    if let Err(e) = ultimate_server::net::listener::run(world, dashboard, &bind_addr).await {
+    if let Err(e) = ultimate_server::net::listener::run(world, dashboard, bus_tx, registry, &bind_addr).await {
         tracing::error!("Server error: {}", e);
     }
 }

@@ -21,9 +21,16 @@ use azalea_protocol::common::tags::{TagMap, Tags};
 use azalea_protocol::packets::game::{
     ClientboundGamePacket, ClientboundGameEvent, ClientboundLogin,
     ClientboundPlayerPosition, ClientboundSetChunkCacheCenter,
+    ClientboundPlayerInfoUpdate, ClientboundPlayerInfoRemove,
+    ClientboundAddEntity, ClientboundRemoveEntities,
+    ClientboundTeleportEntity, ClientboundRotateHead,
     ServerboundGamePacket,
 };
 use azalea_protocol::packets::game::c_game_event::EventType;
+use azalea_protocol::packets::game::c_player_info_update::{ActionEnumSet, PlayerInfoEntry};
+use azalea_core::delta::LpVec3;
+use azalea_protocol::packets::status::c_status_response::SamplePlayer;
+use azalea_registry::builtin::EntityKind;
 use azalea_protocol::packets::handshake::ServerboundHandshakePacket;
 use azalea_protocol::packets::login::{
     ClientboundLoginFinished, ClientboundLoginPacket, ServerboundLoginPacket,
@@ -51,9 +58,20 @@ use ultimate_engine::world::World;
 use uuid::Uuid;
 
 use crate::dashboard::{self, DashboardState};
+use crate::event_bus::{self, ChangeSource, WorldChangeBatch};
+use crate::player_registry::{PlayerEvent, PlayerInfo, PlayerRegistry};
+
+/// Monotonic connection ID counter for identifying change sources.
+static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Handle a single client connection through all protocol phases.
-pub async fn handle(stream: TcpStream, world: Arc<World>, dashboard: Arc<DashboardState>) -> Result<()> {
+pub async fn handle(
+    stream: TcpStream,
+    world: Arc<World>,
+    dashboard: Arc<DashboardState>,
+    bus_tx: tokio::sync::broadcast::Sender<WorldChangeBatch>,
+    registry: Arc<PlayerRegistry>,
+) -> Result<()> {
     let (read, write) = stream.into_split();
     let mut read = read;
     let mut write = write;
@@ -83,13 +101,14 @@ pub async fn handle(stream: TcpStream, world: Arc<World>, dashboard: Arc<Dashboa
 
     match intention.intention {
         ClientIntention::Status => {
-            handle_status(&mut read, &mut write, &mut buf, compression, &mut cipher_enc, &mut cipher_dec).await?;
+            handle_status(&mut read, &mut write, &mut buf, compression, &mut cipher_enc, &mut cipher_dec, &registry).await?;
         }
         ClientIntention::Login => {
-            let name = handle_login(&mut read, &mut write, &mut buf, compression, &mut cipher_enc, &mut cipher_dec).await?;
+            let (name, uuid) = handle_login(&mut read, &mut write, &mut buf, compression, &mut cipher_enc, &mut cipher_dec).await?;
             handle_configuration(&mut read, &mut write, &mut buf, compression, &mut cipher_enc, &mut cipher_dec).await?;
             dashboard.metrics.player_joined();
-            let result = handle_play(&mut read, &mut write, &mut buf, compression, &mut cipher_enc, &mut cipher_dec, &world, &name, &dashboard).await;
+            // handle_play registers/deregisters with the player registry internally.
+            let result = handle_play(&mut read, &mut write, &mut buf, compression, &mut cipher_enc, &mut cipher_dec, &world, &name, uuid, &dashboard, &bus_tx, &registry).await;
             dashboard.metrics.player_left();
             result?;
         }
@@ -108,6 +127,7 @@ async fn handle_status<R, W>(
     compression: Option<u32>,
     cipher_enc: &mut Option<azalea_crypto::Aes128CfbEnc>,
     cipher_dec: &mut Option<azalea_crypto::Aes128CfbDec>,
+    registry: &PlayerRegistry,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + Sync,
@@ -117,14 +137,25 @@ where
     let packet = read_packet::<ServerboundStatusPacket, _>(read, buf, compression, cipher_dec).await?;
     tracing::debug!("Status request: {:?}", packet);
 
+    // Build player sample from registry.
+    let online_players = registry.snapshot();
+    let sample: Vec<SamplePlayer> = online_players
+        .iter()
+        .take(12) // MC shows at most ~12 in the hover tooltip
+        .map(|p| SamplePlayer {
+            id: p.uuid.to_string(),
+            name: p.name.clone(),
+        })
+        .collect();
+
     // Respond with server status
     let response: ClientboundStatusPacket = ClientboundStatusResponse {
         description: FormattedText::from("Ultimate Minecraft - Causal Graph Engine"),
         favicon: None,
         players: Players {
             max: 20,
-            online: 0,
-            sample: vec![],
+            online: online_players.len() as i32,
+            sample,
         },
         version: Version {
             name: azalea_protocol::packets::VERSION_NAME.to_string(),
@@ -153,7 +184,7 @@ async fn handle_login<R, W>(
     compression: Option<u32>,
     cipher_enc: &mut Option<azalea_crypto::Aes128CfbEnc>,
     cipher_dec: &mut Option<azalea_crypto::Aes128CfbDec>,
-) -> Result<String>
+) -> Result<(String, Uuid)>
 where
     R: AsyncRead + Unpin + Send + Sync,
     W: AsyncWrite + Unpin + Send,
@@ -186,7 +217,7 @@ where
     let ack = read_packet::<ServerboundLoginPacket, _>(read, buf, compression, cipher_dec).await?;
     tracing::debug!("Login ack: {:?}", ack);
 
-    Ok(name)
+    Ok((name, uuid))
 }
 
 // ── Configuration ───────────────────────────────────────────────────────
@@ -489,13 +520,16 @@ async fn handle_play<R, W>(
     cipher_dec: &mut Option<azalea_crypto::Aes128CfbDec>,
     world: &World,
     player_name: &str,
+    player_uuid: Uuid,
     dashboard: &DashboardState,
+    bus_tx: &tokio::sync::broadcast::Sender<WorldChangeBatch>,
+    registry: &PlayerRegistry,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + Sync,
     W: AsyncWrite + Unpin + Send,
 {
-    let entity_id = 1;
+    let entity_id = registry.allocate_entity_id();
     let spawn_x = 8.0_f64;
     let spawn_y = 80.0_f64; // above the dirt layer (section 8 = y 64-79)
     let spawn_z = 8.0_f64;
@@ -592,13 +626,120 @@ where
     let rules = crate::rules::standard();
     let scheduler = Scheduler::new();
 
+    // Unique ID for this connection (used to filter self-originated bus messages).
+    let conn_id = NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Subscribe to the world-change event bus for cross-player sync.
+    let mut bus_rx = bus_tx.subscribe();
+    // Subscribe to player lifecycle events (join/leave).
+    let mut player_rx = registry.subscribe();
+
+    // ── Multiplayer: send existing players to newcomer, then register ───
+    // Step 1: Tell this client about every player already online.
+    let existing_players = registry.snapshot();
+    for p in &existing_players {
+        // Add to tab list
+        let info_packet: ClientboundGamePacket = ClientboundPlayerInfoUpdate {
+            actions: ActionEnumSet {
+                add_player: true,
+                initialize_chat: false,
+                update_game_mode: true,
+                update_listed: true,
+                update_latency: true,
+                update_display_name: false,
+                update_hat: false,
+                update_list_order: false,
+            },
+            entries: vec![PlayerInfoEntry {
+                profile: GameProfile {
+                    uuid: p.uuid,
+                    name: p.name.clone(),
+                    properties: Default::default(),
+                },
+                listed: true,
+                latency: 0,
+                game_mode: GameMode::Creative,
+                display_name: None,
+                list_order: 0,
+                update_hat: false,
+                chat_session: None,
+            }],
+        }.into_variant();
+        write_packet(&info_packet, write, compression, cipher_enc).await?;
+
+        // Spawn their entity at their current position.
+        let spawn_packet: ClientboundGamePacket = ClientboundAddEntity {
+            id: MinecraftEntityId(p.entity_id),
+            uuid: p.uuid,
+            entity_type: EntityKind::Player,
+            position: Vec3 { x: p.x, y: p.y, z: p.z },
+            movement: LpVec3::Zero,
+            x_rot: degrees_to_byte_angle(p.x_rot),
+            y_rot: degrees_to_byte_angle(p.y_rot),
+            y_head_rot: degrees_to_byte_angle(p.y_rot),
+            data: 0,
+        }.into_variant();
+        write_packet(&spawn_packet, write, compression, cipher_enc).await?;
+    }
+
+    // Step 2: Also add ourselves to our own tab list.
+    let self_info_packet: ClientboundGamePacket = ClientboundPlayerInfoUpdate {
+        actions: ActionEnumSet {
+            add_player: true,
+            initialize_chat: false,
+            update_game_mode: true,
+            update_listed: true,
+            update_latency: true,
+            update_display_name: false,
+            update_hat: false,
+            update_list_order: false,
+        },
+        entries: vec![PlayerInfoEntry {
+            profile: GameProfile {
+                uuid: player_uuid,
+                name: player_name.to_owned(),
+                properties: Default::default(),
+            },
+            listed: true,
+            latency: 0,
+            game_mode: GameMode::Creative,
+            display_name: None,
+            list_order: 0,
+            update_hat: false,
+            chat_session: None,
+        }],
+    }.into_variant();
+    write_packet(&self_info_packet, write, compression, cipher_enc).await?;
+
+    // Step 3: Register in the shared registry -- this broadcasts PlayerEvent::Joined
+    // to all other connections so they can send the tab-list + entity spawn packets.
+    registry.register(PlayerInfo {
+        conn_id,
+        entity_id,
+        uuid: player_uuid,
+        name: player_name.to_owned(),
+        x: spawn_x,
+        y: spawn_y,
+        z: spawn_z,
+        y_rot: 0.0,
+        x_rot: 0.0,
+        on_ground: false,
+    });
+
+    // Track player position and rotation for movement relaying.
+    let mut player_x = spawn_x;
+    let mut player_y = spawn_y;
+    let mut player_z = spawn_z;
+    let mut player_y_rot: f32 = 0.0;
+    let mut player_x_rot: f32 = 0.0;
+    let mut player_on_ground = false;
+
     // Track hotbar contents and selected slot for creative placement.
     use azalea_inventory::ItemStack;
     use azalea_registry::builtin::{BlockKind, ItemKind};
     let mut hotbar: [BlockState; 9] = [BlockState::AIR; 9];
     let mut selected_slot: usize = 0;
 
-    // ── Main loop: keep-alive + handle incoming packets ─────────────────
+    // ── Main loop: keep-alive + handle incoming packets + bus ────────────
     let mut keepalive_timer = tokio::time::interval(Duration::from_secs(15));
     let mut keepalive_id: u64 = 0;
 
@@ -653,23 +794,28 @@ where
                                     );
                                     dashboard.publish_graph(dashboard::snapshot_graph(&graph));
 
-                                    // Broadcast all BlockSet events from this cascade to the client.
-                                    for id in &graph.all_ids() {
-                                        if let Some(node) = graph.get(*id) {
-                                            if node.executed {
-                                                if let EventPayload::BlockSet { pos: ep, new, .. } = &node.event.payload {
-                                                    let mc_pos = azalea_core::position::BlockPos::new(
-                                                        ep.x as i32, ep.y as i32, ep.z as i32,
-                                                    );
-                                                    let mc_state = engine_block_to_mc(*new);
-                                                    let update: ClientboundGamePacket = ClientboundBlockUpdate {
-                                                        pos: mc_pos,
-                                                        block_state: mc_state,
-                                                    }.into_variant();
-                                                    write_packet(&update, write, compression, cipher_enc).await?;
-                                                }
-                                            }
-                                        }
+                                    // Collect changes and publish to event bus (other players pick these up).
+                                    let changes = event_bus::collect_block_changes(&graph);
+
+                                    // Send BlockSet events to THIS client directly.
+                                    for &(ep, new) in &changes {
+                                        let mc_pos = azalea_core::position::BlockPos::new(
+                                            ep.x as i32, ep.y as i32, ep.z as i32,
+                                        );
+                                        let mc_state = engine_block_to_mc(new);
+                                        let update: ClientboundGamePacket = ClientboundBlockUpdate {
+                                            pos: mc_pos,
+                                            block_state: mc_state,
+                                        }.into_variant();
+                                        write_packet(&update, write, compression, cipher_enc).await?;
+                                    }
+
+                                    // Publish to bus for other players.
+                                    if !changes.is_empty() {
+                                        let _ = bus_tx.send(WorldChangeBatch {
+                                            source: ChangeSource::Player(conn_id),
+                                            changes: changes.into(),
+                                        });
                                     }
 
                                     // Acknowledge the sequence
@@ -739,23 +885,28 @@ where
                                 );
                                 dashboard.publish_graph(dashboard::snapshot_graph(&graph));
 
-                                // Broadcast all BlockSet events from this cascade to the client.
-                                for id in &graph.all_ids() {
-                                    if let Some(node) = graph.get(*id) {
-                                        if node.executed {
-                                            if let EventPayload::BlockSet { pos: ep, new, .. } = &node.event.payload {
-                                                let mc_pos = azalea_core::position::BlockPos::new(
-                                                    ep.x as i32, ep.y as i32, ep.z as i32,
-                                                );
-                                                let mc_state = engine_block_to_mc(*new);
-                                                let update: ClientboundGamePacket = ClientboundBlockUpdate {
-                                                    pos: mc_pos,
-                                                    block_state: mc_state,
-                                                }.into_variant();
-                                                write_packet(&update, write, compression, cipher_enc).await?;
-                                            }
-                                        }
-                                    }
+                                // Collect changes and publish to event bus.
+                                let changes = event_bus::collect_block_changes(&graph);
+
+                                // Send BlockSet events to THIS client directly.
+                                for &(ep, new) in &changes {
+                                    let mc_pos = azalea_core::position::BlockPos::new(
+                                        ep.x as i32, ep.y as i32, ep.z as i32,
+                                    );
+                                    let mc_state = engine_block_to_mc(new);
+                                    let update: ClientboundGamePacket = ClientboundBlockUpdate {
+                                        pos: mc_pos,
+                                        block_state: mc_state,
+                                    }.into_variant();
+                                    write_packet(&update, write, compression, cipher_enc).await?;
+                                }
+
+                                // Publish to bus for other players.
+                                if !changes.is_empty() {
+                                    let _ = bus_tx.send(WorldChangeBatch {
+                                        source: ChangeSource::Player(conn_id),
+                                        changes: changes.into(),
+                                    });
                                 }
 
                                 // Acknowledge
@@ -794,11 +945,41 @@ where
                                 selected_slot = (carried.slot as usize).min(8);
                             }
 
+                            // ── Player movement ───────────────────────
+                            ServerboundGamePacket::MovePlayerPos(pkt) => {
+                                player_x = pkt.pos.x;
+                                player_y = pkt.pos.y;
+                                player_z = pkt.pos.z;
+                                player_on_ground = pkt.flags.on_ground;
+                                registry.update_position(
+                                    conn_id, player_x, player_y, player_z,
+                                    player_y_rot, player_x_rot, player_on_ground,
+                                );
+                            }
+                            ServerboundGamePacket::MovePlayerPosRot(pkt) => {
+                                player_x = pkt.pos.x;
+                                player_y = pkt.pos.y;
+                                player_z = pkt.pos.z;
+                                player_y_rot = pkt.look_direction.y_rot();
+                                player_x_rot = pkt.look_direction.x_rot();
+                                player_on_ground = pkt.flags.on_ground;
+                                registry.update_position(
+                                    conn_id, player_x, player_y, player_z,
+                                    player_y_rot, player_x_rot, player_on_ground,
+                                );
+                            }
+                            ServerboundGamePacket::MovePlayerRot(pkt) => {
+                                player_y_rot = pkt.look_direction.y_rot();
+                                player_x_rot = pkt.look_direction.x_rot();
+                                player_on_ground = pkt.flags.on_ground;
+                                registry.update_position(
+                                    conn_id, player_x, player_y, player_z,
+                                    player_y_rot, player_x_rot, player_on_ground,
+                                );
+                            }
+
                             // ── Ignored packets ─────────────────────────
                             ServerboundGamePacket::KeepAlive(_) => {}
-                            ServerboundGamePacket::MovePlayerPos(_) => {}
-                            ServerboundGamePacket::MovePlayerPosRot(_) => {}
-                            ServerboundGamePacket::MovePlayerRot(_) => {}
                             _ => {}
                         }
                     }
@@ -810,13 +991,159 @@ where
                             tracing::debug!("Ignoring packet parse error: {}", msg);
                         } else {
                             tracing::info!("{} disconnected: {}", player_name, e);
-                            return Ok(());
+                            break;
                         }
+                    }
+                }
+            }
+
+            // ── Event bus: receive world changes from other players / simulation ──
+            result = bus_rx.recv() => {
+                match result {
+                    Ok(batch) => {
+                        // Skip changes we originated ourselves.
+                        if batch.source == ChangeSource::Player(conn_id) {
+                            continue;
+                        }
+                        // Forward all block changes to this client.
+                        for &(pos, new_block) in batch.changes.iter() {
+                            let mc_pos = azalea_core::position::BlockPos::new(
+                                pos.x as i32, pos.y as i32, pos.z as i32,
+                            );
+                            let mc_state = engine_block_to_mc(new_block);
+                            let update: ClientboundGamePacket = ClientboundBlockUpdate {
+                                pos: mc_pos,
+                                block_state: mc_state,
+                            }.into_variant();
+                            write_packet(&update, write, compression, cipher_enc).await?;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // We fell behind -- some batches were dropped. The client
+                        // will self-correct on the next chunk load. Log and continue.
+                        tracing::warn!("{} event bus lagged, skipped {} batches", player_name, n);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Bus shut down (server stopping).
+                        tracing::info!("{}: event bus closed", player_name);
+                        break;
+                    }
+                }
+            }
+
+            // ── Player events: join/leave notifications from other connections ──
+            result = player_rx.recv() => {
+                match result {
+                    Ok(event) => {
+                        match event {
+                            PlayerEvent::Joined { conn_id: joined_id, entity_id: eid, uuid, name, x, y, z, y_rot, x_rot } => {
+                                // Skip our own join event.
+                                if joined_id == conn_id { continue; }
+
+                                // Add to this client's tab list.
+                                let info_pkt: ClientboundGamePacket = ClientboundPlayerInfoUpdate {
+                                    actions: ActionEnumSet {
+                                        add_player: true,
+                                        initialize_chat: false,
+                                        update_game_mode: true,
+                                        update_listed: true,
+                                        update_latency: true,
+                                        update_display_name: false,
+                                        update_hat: false,
+                                        update_list_order: false,
+                                    },
+                                    entries: vec![PlayerInfoEntry {
+                                        profile: GameProfile {
+                                            uuid,
+                                            name,
+                                            properties: Default::default(),
+                                        },
+                                        listed: true,
+                                        latency: 0,
+                                        game_mode: GameMode::Creative,
+                                        display_name: None,
+                                        list_order: 0,
+                                        update_hat: false,
+                                        chat_session: None,
+                                    }],
+                                }.into_variant();
+                                write_packet(&info_pkt, write, compression, cipher_enc).await?;
+
+                                // Spawn the new player's entity at their position.
+                                let spawn_pkt: ClientboundGamePacket = ClientboundAddEntity {
+                                    id: MinecraftEntityId(eid),
+                                    uuid,
+                                    entity_type: EntityKind::Player,
+                                    position: Vec3 { x, y, z },
+                                    movement: LpVec3::Zero,
+                                    x_rot: degrees_to_byte_angle(x_rot),
+                                    y_rot: degrees_to_byte_angle(y_rot),
+                                    y_head_rot: degrees_to_byte_angle(y_rot),
+                                    data: 0,
+                                }.into_variant();
+                                write_packet(&spawn_pkt, write, compression, cipher_enc).await?;
+                            }
+                            PlayerEvent::Moved { conn_id: moved_id, entity_id: eid, x, y, z, y_rot, x_rot, on_ground } => {
+                                if moved_id == conn_id { continue; }
+
+                                // Teleport the entity to the new absolute position.
+                                let tp: ClientboundGamePacket = ClientboundTeleportEntity {
+                                    id: MinecraftEntityId(eid),
+                                    change: PositionMoveRotation {
+                                        pos: Vec3 { x, y, z },
+                                        delta: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+                                        look_direction: LookDirection::new(y_rot, x_rot),
+                                    },
+                                    relative: RelativeMovements::default(), // all absolute
+                                    on_ground,
+                                }.into_variant();
+                                write_packet(&tp, write, compression, cipher_enc).await?;
+
+                                // Update head rotation (MC renders head separately).
+                                let head: ClientboundGamePacket = ClientboundRotateHead {
+                                    entity_id: MinecraftEntityId(eid),
+                                    y_head_rot: degrees_to_byte_angle(y_rot),
+                                }.into_variant();
+                                write_packet(&head, write, compression, cipher_enc).await?;
+                            }
+                            PlayerEvent::Left { conn_id: left_id, entity_id: eid, uuid } => {
+                                if left_id == conn_id { continue; }
+
+                                // Remove entity.
+                                let remove_pkt: ClientboundGamePacket = ClientboundRemoveEntities {
+                                    entity_ids: vec![MinecraftEntityId(eid)],
+                                }.into_variant();
+                                write_packet(&remove_pkt, write, compression, cipher_enc).await?;
+
+                                // Remove from tab list.
+                                let info_remove: ClientboundGamePacket = ClientboundPlayerInfoRemove {
+                                    profile_ids: vec![uuid],
+                                }.into_variant();
+                                write_packet(&info_remove, write, compression, cipher_enc).await?;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("{} player event bus lagged, skipped {} events", player_name, n);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
                     }
                 }
             }
         }
     }
+
+    // ── Cleanup: deregister from player registry on any exit ─────────────
+    registry.deregister(conn_id);
+    tracing::info!("{} removed from player registry", player_name);
+    Ok(())
+}
+
+/// Convert degrees (f32) to a Minecraft protocol byte angle (i8).
+/// MC encodes angles as 256 = 360 degrees.
+fn degrees_to_byte_angle(degrees: f32) -> i8 {
+    (degrees / 360.0 * 256.0) as i8
 }
 
 /// Try to convert an ItemKind to its corresponding BlockKind.
