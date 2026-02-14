@@ -43,28 +43,18 @@ async fn main() {
 
     tracing::info!("Ultimate Minecraft -- causal voxel engine server");
 
-    // ── Load or generate world ───────────────────────────────────────────
-    let world = match persistence::load_world(&world_dir) {
-        Ok(Some(w)) => {
-            tracing::info!("Loaded world from {}: {} chunks", world_dir.display(), w.chunk_count());
-            Arc::new(w)
-        }
-        Ok(None) => {
-            tracing::info!("No save found at {}, generating flat world...", world_dir.display());
-            let w = Arc::new(World::new());
-            generate_flat_world_mc(&w, 32);
-            tracing::info!("World ready: {} chunks generated", w.chunk_count());
-            w
-        }
-        Err(e) => {
-            tracing::error!("Failed to load world from {}: {:#}", world_dir.display(), e);
-            tracing::info!("Generating fresh flat world instead...");
-            let w = Arc::new(World::new());
-            generate_flat_world_mc(&w, 32);
-            tracing::info!("World ready: {} chunks generated", w.chunk_count());
-            w
-        }
-    };
+    // ── Generate base world, then overlay saved modifications ──────────
+    let world = Arc::new(World::new());
+    tracing::info!("Generating flat world...");
+    generate_flat_world_mc(&world, 32);
+    tracing::info!("Base world ready: {} chunks", world.chunk_count());
+
+    // Load saved (player-modified) chunks on top of the generated base.
+    match persistence::load_into(&world, &world_dir) {
+        Ok(0) => tracing::info!("No saved modifications found"),
+        Ok(n) => tracing::info!("Loaded {} modified chunks from {}", n, world_dir.display()),
+        Err(e) => tracing::error!("Failed to load saved chunks: {:#}", e),
+    }
 
     // Start live dashboard (non-blocking — runs on its own tasks).
     let dashboard = Arc::new(DashboardState::new(Arc::clone(&world)));

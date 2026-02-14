@@ -348,13 +348,18 @@ fn section_to_nbt(section_idx: i32, section: &ChunkSection) -> SectionNbt {
 
 // ── Load ─────────────────────────────────────────────────────────────────────
 
-/// Load a world from Anvil region files under `<dir>/region/`.
+/// Load saved chunks from Anvil region files and insert them into an existing
+/// world, overwriting any generated chunks with the saved versions.
 ///
-/// Returns `None` if the region directory does not exist or contains no `.mca` files.
-pub fn load_world(dir: &Path) -> Result<Option<World>> {
+/// This is the primary entry point: generate the base world first, then call
+/// this to overlay player modifications on top. Chunks loaded this way are
+/// **not** marked dirty, so they won't be re-saved unless modified again.
+///
+/// Returns the number of chunks loaded (0 if no save directory exists).
+pub fn load_into(world: &World, dir: &Path) -> Result<usize> {
     let region_dir = dir.join("region");
     if !region_dir.is_dir() {
-        return Ok(None);
+        return Ok(0);
     }
 
     let start = Instant::now();
@@ -362,7 +367,6 @@ pub fn load_world(dir: &Path) -> Result<Option<World>> {
     // Force the reverse lookup table to initialize before we start loading.
     let _ = &*BLOCK_LOOKUP;
 
-    let world = World::new();
     let mut total_chunks = 0usize;
     let mut region_count = 0usize;
 
@@ -416,18 +420,16 @@ pub fn load_world(dir: &Path) -> Result<Option<World>> {
         region_count += 1;
     }
 
-    if total_chunks == 0 {
-        return Ok(None);
+    if total_chunks > 0 {
+        let elapsed = start.elapsed();
+        tracing::info!(
+            "Loaded {} saved chunks from {} regions ({:.2?})",
+            total_chunks,
+            region_count,
+            elapsed,
+        );
     }
-
-    let elapsed = start.elapsed();
-    tracing::info!(
-        "World loaded: {} chunks from {} regions ({:.2?})",
-        total_chunks,
-        region_count,
-        elapsed,
-    );
-    Ok(Some(world))
+    Ok(total_chunks)
 }
 
 /// Convert Anvil NBT chunk data back into an engine `Chunk`.
@@ -570,8 +572,10 @@ mod tests {
         // Verify region file exists.
         assert!(tmp.join("region/r.0.0.mca").exists());
 
-        // Load back.
-        let loaded = load_world(&tmp).unwrap().expect("should load world");
+        // Load back into a fresh world (simulating: generate base, then overlay).
+        let loaded = World::new();
+        let n = load_into(&loaded, &tmp).unwrap();
+        assert_eq!(n, 1);
         assert_eq!(loaded.chunk_count(), 1);
 
         // Verify blocks match.
@@ -579,21 +583,21 @@ mod tests {
             for z in 0..16i64 {
                 assert_eq!(
                     loaded.get_block(BlockPos::new(x, 60, z)),
-                    BlockId(crate::block::BEDROCK.0),
+                    crate::block::BEDROCK,
                     "bedrock mismatch at ({}, 60, {})",
                     x, z,
                 );
                 for y in 61..=63i64 {
                     assert_eq!(
                         loaded.get_block(BlockPos::new(x, y, z)),
-                        BlockId(crate::block::STONE.0),
+                        crate::block::STONE,
                         "stone mismatch at ({}, {}, {})",
                         x, y, z,
                     );
                 }
                 assert_eq!(
                     loaded.get_block(BlockPos::new(x, 64, z)),
-                    BlockId(crate::block::DIRT.0),
+                    crate::block::DIRT,
                     "dirt mismatch at ({}, 64, {})",
                     x, z,
                 );
@@ -643,12 +647,64 @@ mod tests {
         let saved = save_world(&world, &tmp).unwrap();
         assert_eq!(saved, 1);
 
-        // Load and verify both chunks are present (the untouched one persisted from first save).
-        let loaded = load_world(&tmp).unwrap().expect("should load");
+        // Load into a fresh world and verify both chunks persisted.
+        let loaded = World::new();
+        let n = load_into(&loaded, &tmp).unwrap();
+        assert_eq!(n, 2);
         assert_eq!(loaded.chunk_count(), 2);
         assert_eq!(loaded.get_block(BlockPos::new(0, 60, 0)), crate::block::STONE);
         assert_eq!(loaded.get_block(BlockPos::new(1, 60, 0)), crate::block::BEDROCK);
         assert_eq!(loaded.get_block(BlockPos::new(16, 60, 0)), crate::block::DIRT);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_overlay_on_generated_world() {
+        use ultimate_engine::world::position::BlockPos;
+
+        // Simulate the real startup flow: generate base, modify, save, restart.
+        let world = World::new();
+
+        // "Generate" a base: fill chunk (0,0) with stone at y=60.
+        for x in 0..16i64 {
+            for z in 0..16i64 {
+                // Use insert_chunk path (not dirty).
+                world.set_block(BlockPos::new(x, 60, z), crate::block::STONE);
+            }
+        }
+        // Clear dirty flags to simulate insert_chunk-based generation.
+        world.take_dirty_chunks();
+
+        // Player places a diamond block at (5, 61, 5).
+        let diamond = BlockId(azalea_block::BlockState::from(
+            azalea_registry::builtin::BlockKind::DiamondBlock,
+        ).id());
+        world.set_block(BlockPos::new(5, 61, 5), diamond);
+        assert_eq!(world.dirty_count(), 1);
+
+        let tmp = std::env::temp_dir().join("ultimate_mc_test_overlay");
+        let _ = fs::remove_dir_all(&tmp);
+        save_world(&world, &tmp).unwrap();
+
+        // "Restart": generate base world again, then overlay saved chunks.
+        let world2 = World::new();
+        for x in 0..16i64 {
+            for z in 0..16i64 {
+                world2.set_block(BlockPos::new(x, 60, z), crate::block::STONE);
+            }
+        }
+        world2.take_dirty_chunks(); // clear generation dirt
+
+        load_into(&world2, &tmp).unwrap();
+
+        // The saved chunk overwrites the generated one -- diamond block is there.
+        assert_eq!(world2.get_block(BlockPos::new(5, 61, 5)), diamond);
+        // The base stone at y=60 is also present (from the saved chunk, which
+        // had stone + diamond).
+        assert_eq!(world2.get_block(BlockPos::new(0, 60, 0)), crate::block::STONE);
+        // Nothing dirty after load.
+        assert_eq!(world2.dirty_count(), 0);
 
         let _ = fs::remove_dir_all(&tmp);
     }

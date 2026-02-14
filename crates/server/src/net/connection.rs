@@ -757,6 +757,11 @@ where
     // still making rapid progress on the queue.
     const CHUNKS_PER_ITER: usize = 5;
 
+    // Track chunks physically sent to the client. Deferred chunks are added to
+    // `loaded_chunks` optimistically before being sent, so this set lets us
+    // detect and re-queue any that slip through the cracks.
+    let mut sent_to_client: HashSet<(i32, i32)> = loaded_chunks.clone();
+
     loop {
         // ── Eagerly drain chunk queue before waiting for events ──────────
         {
@@ -764,10 +769,22 @@ where
             while sent < CHUNKS_PER_ITER {
                 let Some((cx, cz)) = chunk_send_queue.pop_front() else { break };
                 if !loaded_chunks.contains(&(cx, cz)) {
+                    sent_to_client.remove(&(cx, cz));
                     continue; // Player moved away before this chunk was sent.
                 }
                 send_chunk_from_world(write, compression, cipher_enc, world, cx, cz).await?;
+                sent_to_client.insert((cx, cz));
                 sent += 1;
+            }
+        }
+
+        // ── Self-heal: when queue is empty, re-queue any claimed-but-unsent chunks ──
+        if chunk_send_queue.is_empty() {
+            sent_to_client.retain(|pos| loaded_chunks.contains(pos));
+            for pos in loaded_chunks.iter() {
+                if !sent_to_client.contains(pos) {
+                    chunk_send_queue.push_back(*pos);
+                }
             }
         }
 
@@ -990,7 +1007,8 @@ where
                                     write, compression, cipher_enc, world,
                                     player_x, player_z, view_distance,
                                     &mut current_chunk_x, &mut current_chunk_z,
-                                    &mut loaded_chunks, &mut chunk_send_queue,
+                                    &mut loaded_chunks, &mut sent_to_client,
+                                    &mut chunk_send_queue,
                                 ).await?;
                             }
                             ServerboundGamePacket::MovePlayerPosRot(pkt) => {
@@ -1008,7 +1026,8 @@ where
                                     write, compression, cipher_enc, world,
                                     player_x, player_z, view_distance,
                                     &mut current_chunk_x, &mut current_chunk_z,
-                                    &mut loaded_chunks, &mut chunk_send_queue,
+                                    &mut loaded_chunks, &mut sent_to_client,
+                                    &mut chunk_send_queue,
                                 ).await?;
                             }
                             ServerboundGamePacket::MovePlayerRot(pkt) => {
@@ -1254,6 +1273,7 @@ async fn update_loaded_chunks<W: AsyncWrite + Unpin + Send>(
     current_chunk_x: &mut i32,
     current_chunk_z: &mut i32,
     loaded_chunks: &mut HashSet<(i32, i32)>,
+    sent_to_client: &mut HashSet<(i32, i32)>,
     chunk_send_queue: &mut VecDeque<(i32, i32)>,
 ) -> Result<()> {
     let new_cx = (player_x.floor() as i32) >> 4;
@@ -1286,6 +1306,7 @@ async fn update_loaded_chunks<W: AsyncWrite + Unpin + Send>(
         }.into_variant();
         write_packet(&forget, write, compression, cipher).await?;
         loaded_chunks.remove(&(*cx, *cz));
+        sent_to_client.remove(&(*cx, *cz));
     }
 
     // Remove stale entries from the queue.
@@ -1318,6 +1339,7 @@ async fn update_loaded_chunks<W: AsyncWrite + Unpin + Send>(
     for (cx, cz) in &immediate {
         send_chunk_from_world(write, compression, cipher, world, *cx, *cz).await?;
         loaded_chunks.insert((*cx, *cz));
+        sent_to_client.insert((*cx, *cz));
     }
 
     // NOW update the chunk cache center -- client already has nearby chunks.
