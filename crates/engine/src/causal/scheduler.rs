@@ -23,26 +23,24 @@ impl Scheduler {
     // ── Sequential execution ────────────────────────────────────────────
 
     pub fn step(&self, world: &World, graph: &mut CausalGraph, rules: &RuleSet) -> usize {
-        let frontier = graph.frontier();
+        let batch = graph.drain_ready(self.max_events_per_step);
         let mut executed = 0;
 
-        for id in frontier {
-            if executed >= self.max_events_per_step {
-                break;
-            }
-
+        for id in batch {
             let event = match graph.get(id) {
                 Some(node) => node.event.clone(),
                 None => continue,
             };
 
-            apply_event(world, &event.payload);
+            let effective = apply_event(world, &event.payload);
             graph.mark_executed(id);
             executed += 1;
 
-            let consequents = rules.evaluate(world, &event.payload);
-            for new_event in consequents {
-                graph.insert(new_event, vec![id]);
+            if effective {
+                let consequents = rules.evaluate(world, &event.payload);
+                for new_event in consequents {
+                    graph.insert(new_event, vec![id]);
+                }
             }
         }
 
@@ -70,15 +68,14 @@ impl Scheduler {
     // ── Parallel execution (snapshot-scatter-gather) ────────────────────
 
     pub fn step_parallel(&self, world: &World, graph: &mut CausalGraph, rules: &RuleSet) -> usize {
-        let frontier = graph.frontier();
-        if frontier.is_empty() {
+        let batch = graph.drain_ready(self.max_events_per_step);
+        if batch.is_empty() {
             return 0;
         }
 
-        let events: Vec<(EventId, Event)> = frontier
+        let events: Vec<(EventId, Event)> = batch
             .iter()
             .filter_map(|&id| graph.get(id).map(|node| (id, node.event.clone())))
-            .take(self.max_events_per_step)
             .collect();
 
         let mut chunk_groups: HashMap<_, Vec<(EventId, Event)>> = HashMap::new();
@@ -96,8 +93,12 @@ impl Scheduler {
                 group
                     .into_iter()
                     .map(|(id, event)| {
-                        apply_event(world, &event.payload);
-                        let consequents = rules.evaluate(world, &event.payload);
+                        let effective = apply_event(world, &event.payload);
+                        let consequents = if effective {
+                            rules.evaluate(world, &event.payload)
+                        } else {
+                            Vec::new()
+                        };
                         (id, consequents)
                     })
                     .collect()
@@ -143,11 +144,35 @@ impl Default for Scheduler {
     }
 }
 
-fn apply_event(world: &World, payload: &EventPayload) {
+/// Apply the event's write to the world.  Returns `true` when the write was
+/// effective (the value actually changed) so that the scheduler can skip rule
+/// evaluation for redundant / duplicate writes.
+fn apply_event(world: &World, payload: &EventPayload) -> bool {
     match payload {
         EventPayload::BlockSet { pos, new, .. } => {
             world.set_block(*pos, *new);
+            true
         }
-        EventPayload::BlockNotify { .. } => {}
+        EventPayload::BlockNotify { .. } => true,
+        EventPayload::LightSet {
+            pos,
+            light_type,
+            new,
+            ..
+        } => {
+            let current = match light_type {
+                super::event::LightType::Sky => world.get_sky_light(*pos),
+                super::event::LightType::Block => world.get_block_light(*pos),
+            };
+            if *new == current {
+                return false;
+            }
+            match light_type {
+                super::event::LightType::Sky => world.set_sky_light(*pos, *new),
+                super::event::LightType::Block => world.set_block_light(*pos, *new),
+            }
+            true
+        }
+        EventPayload::LightNotify { .. } => true,
     }
 }

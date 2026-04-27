@@ -147,6 +147,210 @@ pub fn is_solid(id: BlockId) -> bool {
     !is_replaceable(id)
 }
 
+// ── Light property queries ──────────────────────────────────────────────
+
+/// How much light this block emits (0-15).
+pub fn light_emission(id: BlockId) -> u8 {
+    use azalea_block::{BlockState, BlockTrait};
+
+    // Fast path: air and common solid blocks never emit light.
+    if id == AIR || id == STONE || id == DIRT || id == BEDROCK || id == GRASS_BLOCK {
+        return 0;
+    }
+
+    let state = match BlockState::try_from(id.0 as u32) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let block: Box<dyn BlockTrait> = Box::<dyn BlockTrait>::from(state);
+    let name = block.id();
+
+    // azalea's BlockTrait::id() returns the bare name (e.g. "torch"),
+    // NOT the namespaced form ("minecraft:torch").
+    match name {
+        "glowstone"
+        | "jack_o_lantern"
+        | "lantern"
+        | "sea_lantern"
+        | "shroomlight"
+        | "beacon"
+        | "conduit"
+        | "end_gateway"
+        | "end_portal"
+        | "fire"
+        | "soul_fire"
+        | "redstone_lamp" => 15,
+
+        "lava" => 15,
+
+        "torch" | "wall_torch" => 14,
+        "soul_torch" | "soul_wall_torch" => 10,
+        "soul_lantern" => 10,
+
+        "crying_obsidian" | "end_rod" => 14,
+
+        "blast_furnace" | "furnace" | "smoker" => {
+            let props = block.property_map();
+            let lit = props
+                .iter()
+                .find(|(k, _)| **k == "lit")
+                .map(|(_, v)| *v == "true")
+                .unwrap_or(false);
+            if lit { 13 } else { 0 }
+        }
+
+        "campfire" => {
+            let props = block.property_map();
+            let lit = props
+                .iter()
+                .find(|(k, _)| **k == "lit")
+                .map(|(_, v)| *v == "true")
+                .unwrap_or(false);
+            if lit { 15 } else { 0 }
+        }
+        "soul_campfire" => {
+            let props = block.property_map();
+            let lit = props
+                .iter()
+                .find(|(k, _)| **k == "lit")
+                .map(|(_, v)| *v == "true")
+                .unwrap_or(false);
+            if lit { 10 } else { 0 }
+        }
+
+        "redstone_torch" | "redstone_wall_torch" => 7,
+
+        "enchanting_table" | "ender_chest" => 7,
+        "magma_block" => 3,
+        "brewing_stand" => 1,
+        "brown_mushroom" => 1,
+        "dragon_egg" => 1,
+
+        _ => 0,
+    }
+}
+
+/// How much light this block absorbs when light passes through (0-15).
+/// 0 = fully transparent (air, glass, flowers, etc.)
+/// 15 = fully opaque (stone, dirt, etc.)
+/// 1 = slightly attenuating (water, ice, leaves)
+pub fn light_opacity(id: BlockId) -> u8 {
+    use azalea_block::{BlockState, BlockTrait};
+
+    // Fast path: the vast majority of blocks hit during light propagation
+    // are air (transparent) or common solid blocks (fully opaque).
+    if id == AIR { return 0; }
+    if id == STONE || id == DIRT || id == BEDROCK || id == GRASS_BLOCK {
+        return 15;
+    }
+
+    let state = match BlockState::try_from(id.0 as u32) {
+        Ok(s) => s,
+        Err(_) => return 15,
+    };
+    let block: Box<dyn BlockTrait> = Box::<dyn BlockTrait>::from(state);
+    let name = block.id();
+
+    // azalea's BlockTrait::id() returns the bare name (e.g. "torch"),
+    // NOT the namespaced form ("minecraft:torch").
+    match name {
+        "air" | "cave_air" | "void_air" => 0,
+
+        n if n.ends_with("_stained_glass")
+            || n.ends_with("_stained_glass_pane")
+            || n == "glass"
+            || n == "glass_pane"
+            || n == "tinted_glass" => 0,
+
+        // Torches
+        "torch" | "wall_torch"
+        | "soul_torch" | "soul_wall_torch"
+        | "redstone_torch" | "redstone_wall_torch"
+        | "end_rod" => 0,
+
+        // Water / lava
+        "water" | "lava" => 1,
+
+        // Leaves
+        n if n.ends_with("_leaves") => 1,
+
+        // Ice
+        "ice" | "frosted_ice"
+        | "packed_ice" | "blue_ice" => 1,
+
+        "slime_block" | "honey_block" => 1,
+
+        // Non-solid / partial blocks: use name-based heuristics
+        n if n.ends_with("_sapling")
+            || n.ends_with("_button")
+            || n.ends_with("_pressure_plate")
+            || n.ends_with("_sign")
+            || n.ends_with("_wall_sign")
+            || n.ends_with("_hanging_sign")
+            || n.ends_with("_wall_hanging_sign")
+            || n.ends_with("_fence")
+            || n.ends_with("_fence_gate")
+            || n.ends_with("_slab")
+            || n.ends_with("_stairs")
+            || n.ends_with("_wall")
+            || n.ends_with("_carpet")
+            || n.ends_with("_trapdoor")
+            || n.ends_with("_door")
+            || n.ends_with("_bed")
+            || n.ends_with("_candle")
+            || n.ends_with("_banner")
+            || n.ends_with("_wall_banner") => 0,
+
+        // Flowers / grass / plants
+        "dandelion" | "poppy" | "blue_orchid"
+        | "allium" | "azure_bluet"
+        | "red_tulip" | "orange_tulip"
+        | "white_tulip" | "pink_tulip"
+        | "oxeye_daisy" | "cornflower"
+        | "lily_of_the_valley" | "wither_rose"
+        | "sunflower" | "lilac"
+        | "rose_bush" | "peony"
+        | "short_grass" | "tall_grass"
+        | "fern" | "large_fern"
+        | "dead_bush" | "sugar_cane"
+        | "vine" | "kelp" | "kelp_plant"
+        | "bamboo" | "bamboo_sapling"
+        | "sweet_berry_bush" => 0,
+
+        // Rails
+        "rail" | "powered_rail"
+        | "detector_rail" | "activator_rail" => 0,
+
+        // Redstone
+        "redstone_wire" | "lever"
+        | "repeater" | "comparator" => 0,
+
+        // Misc transparent / partial
+        "ladder" | "snow" | "cobweb"
+        | "barrier" | "chest" | "trapped_chest"
+        | "ender_chest" | "enchanting_table"
+        | "brewing_stand" | "anvil"
+        | "chipped_anvil" | "damaged_anvil"
+        | "hopper" | "cauldron"
+        | "grindstone" | "lectern"
+        | "bell" | "lantern" | "soul_lantern"
+        | "chain" | "conduit" | "beacon" => 0,
+
+        // Crops
+        "wheat" | "carrots" | "potatoes"
+        | "beetroots" | "melon_stem"
+        | "pumpkin_stem" => 0,
+
+        // Fire
+        "fire" | "soul_fire"
+        | "campfire" | "soul_campfire" => 0,
+
+        _ => {
+            if is_replaceable(id) { 0 } else { 15 }
+        }
+    }
+}
+
 /// Human-readable name for dashboard display.
 pub fn name(id: BlockId) -> String {
     match id {

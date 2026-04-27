@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use ultimate_engine::causal::event::EventPayload;
+use ultimate_engine::causal::event::{EventPayload, LightType};
 use ultimate_engine::causal::graph::CausalGraph;
 use ultimate_engine::world::block::BlockId;
 use ultimate_engine::world::position::BlockPos;
@@ -25,6 +25,14 @@ pub enum ChangeSource {
     Simulation(&'static str),
 }
 
+/// A single light change: position, light type, new value.
+#[derive(Clone, Debug)]
+pub struct LightChange {
+    pub pos: BlockPos,
+    pub light_type: LightType,
+    pub new: u8,
+}
+
 /// A batch of block changes from a single cascade.
 ///
 /// Uses `Arc<[...]>` so cloning per broadcast subscriber is just a refcount bump.
@@ -32,6 +40,7 @@ pub enum ChangeSource {
 pub struct WorldChangeBatch {
     pub source: ChangeSource,
     pub changes: Arc<[(BlockPos, BlockId)]>,
+    pub light_changes: Arc<[LightChange]>,
 }
 
 /// Extract all executed `BlockSet` events from a causal graph into a list of
@@ -43,6 +52,31 @@ pub fn collect_block_changes(graph: &CausalGraph) -> Vec<(BlockPos, BlockId)> {
             if node.executed {
                 if let EventPayload::BlockSet { pos, new, .. } = &node.event.payload {
                     changes.push((*pos, *new));
+                }
+            }
+        }
+    }
+    changes
+}
+
+/// Extract all executed `LightSet` events from a causal graph.
+pub fn collect_light_changes(graph: &CausalGraph) -> Vec<LightChange> {
+    let mut changes = Vec::new();
+    for id in graph.all_ids() {
+        if let Some(node) = graph.get(id) {
+            if node.executed {
+                if let EventPayload::LightSet {
+                    pos,
+                    light_type,
+                    new,
+                    ..
+                } = &node.event.payload
+                {
+                    changes.push(LightChange {
+                        pos: *pos,
+                        light_type: *light_type,
+                        new: *new,
+                    });
                 }
             }
         }

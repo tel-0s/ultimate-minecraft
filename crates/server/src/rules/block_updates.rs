@@ -16,6 +16,7 @@ use ultimate_engine::world::World;
 pub fn gravity(world: &World, payload: &EventPayload) -> Vec<Event> {
     let pos = match payload {
         EventPayload::BlockSet { pos, .. } | EventPayload::BlockNotify { pos } => *pos,
+        _ => return Vec::new(),
     };
 
     let block_id = world.get_block(pos);

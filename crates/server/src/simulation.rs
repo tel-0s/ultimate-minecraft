@@ -78,13 +78,14 @@ pub fn start(
                 let executed = scheduler.run_until_quiet(&world, &mut graph, &rules, 1000);
 
                 let changes = event_bus::collect_block_changes(&graph);
-                if !changes.is_empty() {
+                let light_changes = event_bus::collect_light_changes(&graph);
+                if !changes.is_empty() || !light_changes.is_empty() {
                     let num_changes = changes.len();
                     let batch = WorldChangeBatch {
                         source: ChangeSource::Simulation(name),
                         changes: changes.into(),
+                        light_changes: light_changes.into(),
                     };
-                    // Ignore send errors (no subscribers = no problem).
                     let _ = bus.send(batch);
 
                     tracing::debug!(

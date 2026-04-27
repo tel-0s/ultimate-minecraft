@@ -98,9 +98,18 @@ causality is the only ordering.
 - [x] Persistent world: pre-populate World at startup, serve chunks from World state
 - [x] Use MC block state IDs as BlockId values (unify engine + protocol ID space)
 - [x] Creative inventory: place the block the player is holding, not always stone
-- [ ] Multiple simultaneous players (each sees the other's changes)
-- [ ] Chunk loading based on player position (send new chunks as player moves)
-- [ ] Chat messages
+- [x] Multiple simultaneous players (each sees the other's changes)
+      -- `event_bus` broadcast + `player_registry` cross-player join/move/leave/chat
+- [x] Chunk loading based on player position (send new chunks as player moves)
+      -- distance-sorted view_distance=4, reloads on chunk boundary cross
+- [x] Chat messages
+      -- `ClientboundSystemChat` out, `PlayerEvent::Chat` through registry
+
+### Phase 3 addenda (landed beyond the original list)
+- [x] Pluggable ambient simulation framework (`simulation.rs`), one tokio task per layer
+- [x] Vanilla-accurate block placement orientation (`placement.rs`: facing/axis/half/rotation/stair shape)
+- [x] Light engine with emission + opacity + sky-light column propagation
+- [x] Dashboard (graph snapshots + metrics)
 
 ## Phase 4 -- World Generation
 
@@ -136,13 +145,10 @@ causality is the only ordering.
 
 These are O(N)-to-O(1) improvements that prevent performance from degrading over time.
 
-- [ ] **Incremental frontier tracking**
-      Replace the O(N) full-graph scan in `CausalGraph::frontier()` with a maintained
-      `HashSet<EventId>` (or `VecDeque`). Update on insert (if all parents executed,
-      add to frontier) and on `mark_executed` (check each child -- if all its parents
-      are now executed, promote it to the frontier). Amortized O(1) per event.
-      *Current cost: O(N) per step where N = total events ever inserted. After 1 hour
-      of play (~300K nodes), frontier scan alone costs ~3ms/step. After 10 hours, ~30ms.*
+- [x] **Incremental frontier tracking**
+      `CausalGraph` maintains a `ready: VecDeque<EventId>` updated on insert and
+      `mark_executed`. `drain_ready()` is amortized O(1) per event. The old
+      `frontier()` full-scan is kept for tests/debugging.
 
 - [ ] **Causal graph pruning / garbage collection**
       Once an event is executed and all its children are also executed, the node can be
@@ -152,14 +158,24 @@ These are O(N)-to-O(1) improvements that prevent performance from degrading over
       active wavefront rather than growing without limit.
       *Current cost: unbounded memory growth, proportional to total lifetime event count.*
 
-- [ ] **Event deduplication / coalescing**
-      Multiple `BlockNotify` events for the same position should be coalesced into one.
-      Maintain a pending-notify set: on insertion, if a `BlockNotify` for that position
-      is already pending (in the frontier or not yet executed), skip the duplicate.
-      Similarly, consecutive `BlockSet` events to the same position can be collapsed
-      (only the final state matters). This eliminates the exponential blowup the
-      benchmark already documents (~2^N events for an N-block sand column).
-      *Current cost: 5-block sand fall generates ~100-200 events; should be ~25-30.*
+- [x] **Event deduplication / coalescing**
+      `CausalGraph::insert` transparently coalesces idempotent events
+      (`BlockNotify`, `LightNotify`) against any pending event sharing the
+      same `EventPayload::dedup_key()`. Parents are merged into the existing
+      event; no new node is created. `drain_ready` re-checks parents at pop
+      time so merges that add unfinished parents correctly delay firing.
+      Non-idempotent events (`BlockSet`, `LightSet`) whose identity depends
+      on their value fields are never coalesced.
+
+- [x] **Light engine: BFS-inside-rule** *(not originally listed — added after torch
+      cascades halted the server)*
+      `rules/light.rs` was rewritten from an event-cascading model to a synchronous
+      BFS flood-fill inside a single rule invocation. Two-phase classic algorithm
+      (removal then re-propagation) for both block-light and sky-light, honoring
+      the vanilla sky-column special case. `LightSet` events are emitted per
+      changed cell for reporting via `event_bus::collect_light_changes`, but
+      never produce consequent events. Collapses ~100K events per torch to ~11K
+      events of pure bookkeeping cost.
 
 - [ ] **Idempotent rule guards**
       Rules currently re-evaluate blocks that have already been handled. Add a check

@@ -26,6 +26,7 @@ use azalea_protocol::packets::game::{
     ClientboundAddEntity, ClientboundRemoveEntities,
     ClientboundTeleportEntity, ClientboundRotateHead,
     ClientboundForgetLevelChunk,
+    ClientboundChunkBatchStart, ClientboundChunkBatchFinished,
     ClientboundSystemChat,
     ServerboundGamePacket,
 };
@@ -604,15 +605,29 @@ where
     }.into_variant();
     write_packet(&center, write, compression, cipher_enc).await?;
 
-    // Send chunk data for a small area around the player
+    // Send chunk data for a small area around the player.
+    // MC 1.20+ requires chunks to be wrapped in ChunkBatchStart/Finished
+    // markers — without these, the client receives the data but won't
+    // render the chunks (blocks remain interactable but invisible).
     let view_distance = 4i32;
     let mut loaded_chunks: HashSet<(i32, i32)> = HashSet::new();
+
+    let batch_start: ClientboundGamePacket = ClientboundChunkBatchStart.into_variant();
+    write_packet(&batch_start, write, compression, cipher_enc).await?;
+
+    let mut batch_count: u32 = 0;
     for cx in (chunk_x - view_distance)..=(chunk_x + view_distance) {
         for cz in (chunk_z - view_distance)..=(chunk_z + view_distance) {
             send_chunk_from_world(write, compression, cipher_enc, world, cx, cz).await?;
             loaded_chunks.insert((cx, cz));
+            batch_count += 1;
         }
     }
+
+    let batch_end: ClientboundGamePacket = ClientboundChunkBatchFinished {
+        batch_size: batch_count,
+    }.into_variant();
+    write_packet(&batch_end, write, compression, cipher_enc).await?;
     let mut current_chunk_x = chunk_x;
     let mut current_chunk_z = chunk_z;
     // Queue for deferred chunk loading -- chunks are sent progressively to
@@ -764,17 +779,32 @@ where
 
     loop {
         // ── Eagerly drain chunk queue before waiting for events ──────────
+        // Wrap each drain pass in a ChunkBatchStart/Finished pair so the
+        // client renders the chunks (1.20+ requirement).
         {
-            let mut sent = 0;
-            while sent < CHUNKS_PER_ITER {
+            let mut to_send: Vec<(i32, i32)> = Vec::new();
+            while to_send.len() < CHUNKS_PER_ITER {
                 let Some((cx, cz)) = chunk_send_queue.pop_front() else { break };
                 if !loaded_chunks.contains(&(cx, cz)) {
                     sent_to_client.remove(&(cx, cz));
                     continue; // Player moved away before this chunk was sent.
                 }
-                send_chunk_from_world(write, compression, cipher_enc, world, cx, cz).await?;
-                sent_to_client.insert((cx, cz));
-                sent += 1;
+                to_send.push((cx, cz));
+            }
+
+            if !to_send.is_empty() {
+                let batch_start: ClientboundGamePacket = ClientboundChunkBatchStart.into_variant();
+                write_packet(&batch_start, write, compression, cipher_enc).await?;
+
+                for &(cx, cz) in &to_send {
+                    send_chunk_from_world(write, compression, cipher_enc, world, cx, cz).await?;
+                    sent_to_client.insert((cx, cz));
+                }
+
+                let batch_end: ClientboundGamePacket = ClientboundChunkBatchFinished {
+                    batch_size: to_send.len() as u32,
+                }.into_variant();
+                write_packet(&batch_end, write, compression, cipher_enc).await?;
             }
         }
 
@@ -843,9 +873,24 @@ where
                                     dashboard.publish_graph(dashboard::snapshot_graph(&graph));
 
                                     // Collect changes and publish to event bus (other players pick these up).
-                                    let changes = event_bus::collect_block_changes(&graph);
+                                    let mut changes = event_bus::collect_block_changes(&graph);
+                                    let light_changes = event_bus::collect_light_changes(&graph);
 
-                                    // Send BlockSet events to THIS client directly.
+                                    // Update adjacent stair shapes (the broken
+                                    // block is now air, so neighbors revert).
+                                    let stair_updates =
+                                        crate::placement::update_adjacent_stair_shapes(world, epos);
+                                    for &(npos, new_id) in &stair_updates {
+                                        world.set_block(npos, new_id);
+                                        changes.push((npos, new_id));
+                                    }
+
+                                    // Send light updates BEFORE block updates so
+                                    // that when the client re-renders the chunk
+                                    // (triggered by the block update), the light
+                                    // data is already up to date.
+                                    send_light_updates(write, compression, cipher_enc, world, &light_changes).await?;
+
                                     for &(ep, new) in &changes {
                                         let mc_pos = azalea_core::position::BlockPos::new(
                                             ep.x as i32, ep.y as i32, ep.z as i32,
@@ -859,10 +904,11 @@ where
                                     }
 
                                     // Publish to bus for other players.
-                                    if !changes.is_empty() {
+                                    if !changes.is_empty() || !light_changes.is_empty() {
                                         let _ = bus_tx.send(WorldChangeBatch {
                                             source: ChangeSource::Player(conn_id),
                                             changes: changes.into(),
+                                            light_changes: light_changes.into(),
                                         });
                                     }
 
@@ -902,6 +948,22 @@ where
                                 // gravity, fluid spread, etc. trigger on placement.
                                 let held = hotbar[selected_slot];
                                 if held == BlockState::AIR { continue; } // nothing to place
+
+                                // Orient the block based on player rotation & clicked face.
+                                let cursor_y = (hit.location.y - hit.block_pos.y as f64) as f32;
+                                let held = crate::placement::orient_block(
+                                    held,
+                                    player_y_rot,
+                                    player_x_rot,
+                                    hit.direction,
+                                    cursor_y,
+                                );
+                                // Compute stair corner shape based on neighbors
+                                // (before the block is in the world).
+                                let held = crate::placement::compute_stair_shape_for_placement(
+                                    held, world, epos,
+                                );
+
                                 let old = world.get_block(epos);
                                 let new_id = BlockId::new(u32::from(held) as u16);
 
@@ -934,9 +996,24 @@ where
                                 dashboard.publish_graph(dashboard::snapshot_graph(&graph));
 
                                 // Collect changes and publish to event bus.
-                                let changes = event_bus::collect_block_changes(&graph);
+                                let mut changes = event_bus::collect_block_changes(&graph);
+                                let light_changes = event_bus::collect_light_changes(&graph);
 
-                                // Send BlockSet events to THIS client directly.
+                                // Update adjacent stair shapes (the placed block
+                                // is now in the world so neighbors can see it).
+                                let stair_updates =
+                                    crate::placement::update_adjacent_stair_shapes(world, epos);
+                                for &(npos, new_id) in &stair_updates {
+                                    world.set_block(npos, new_id);
+                                    changes.push((npos, new_id));
+                                }
+
+                                // Send light updates BEFORE block updates so
+                                // that when the client re-renders the chunk
+                                // (triggered by the block update), the light
+                                // data is already up to date.
+                                send_light_updates(write, compression, cipher_enc, world, &light_changes).await?;
+
                                 for &(ep, new) in &changes {
                                     let mc_pos = azalea_core::position::BlockPos::new(
                                         ep.x as i32, ep.y as i32, ep.z as i32,
@@ -950,10 +1027,11 @@ where
                                 }
 
                                 // Publish to bus for other players.
-                                if !changes.is_empty() {
+                                if !changes.is_empty() || !light_changes.is_empty() {
                                     let _ = bus_tx.send(WorldChangeBatch {
                                         source: ChangeSource::Player(conn_id),
                                         changes: changes.into(),
+                                        light_changes: light_changes.into(),
                                     });
                                 }
 
@@ -1077,7 +1155,11 @@ where
                         if batch.source == ChangeSource::Player(conn_id) {
                             continue;
                         }
-                        // Forward all block changes to this client.
+                        // Send light updates before block updates so the
+                        // client re-renders with up-to-date light data.
+                        if !batch.light_changes.is_empty() {
+                            send_light_updates(write, compression, cipher_enc, world, &batch.light_changes).await?;
+                        }
                         for &(pos, new_block) in batch.changes.iter() {
                             let mc_pos = azalea_core::position::BlockPos::new(
                                 pos.x as i32, pos.y as i32, pos.z as i32,
@@ -1299,12 +1381,18 @@ async fn update_loaded_chunks<W: AsyncWrite + Unpin + Send>(
     };
 
     // Unload chunks that are no longer in range.
+    //
+    // azalea-core 0.15's `ChunkPos` serialization is buggy for negative X:
+    //   (pos.x as u64) | ((pos.z as u64) << 32)
+    // sign-extends a negative i32 across all 64 bits, which then OR's with
+    // z and loses z entirely. Concretely: ForgetLevelChunk for (-4, 5)
+    // serializes the same as (-4, -1), so eight of every nine forgets at
+    // cx=-4 reach the client as (-4, -1), and the other chunks stay in the
+    // client's cache outside the view distance — interactable but not
+    // rendered. Build the packet manually with correct bit handling.
     let to_unload: Vec<(i32, i32)> = loaded_chunks.difference(&desired).copied().collect();
     for (cx, cz) in &to_unload {
-        let forget: ClientboundGamePacket = ClientboundForgetLevelChunk {
-            pos: azalea_core::position::ChunkPos::new(*cx, *cz),
-        }.into_variant();
-        write_packet(&forget, write, compression, cipher).await?;
+        send_forget_level_chunk(write, compression, cipher, *cx, *cz).await?;
         loaded_chunks.remove(&(*cx, *cz));
         sent_to_client.remove(&(*cx, *cz));
     }
@@ -1326,20 +1414,35 @@ async fn update_loaded_chunks<W: AsyncWrite + Unpin + Send>(
     // ── Key fix: send inner-ring chunks SYNCHRONOUSLY before updating the
     //    center, so the client always has nearby chunks when the center moves.
     //    Outer-ring chunks are queued for deferred loading.
-    const IMMEDIATE_RADIUS: i32 = 2;
+    // Send ALL new chunks synchronously before updating the center.
+    // Previously IMMEDIATE_RADIUS=2 deferred outer-ring chunks, but
+    // those were arriving after SetChunkCacheCenter, causing the client
+    // to reject them (or show holes while they were in-flight).
+    let immediate_radius: i32 = view_distance;
     let (immediate, deferred): (Vec<_>, Vec<_>) = to_load
         .into_iter()
         .partition(|(cx, cz)| {
             let dx = (*cx - new_cx).abs();
             let dz = (*cz - new_cz).abs();
-            dx.max(dz) <= IMMEDIATE_RADIUS
+            dx.max(dz) <= immediate_radius
         });
 
-    // Send inner chunks NOW (before center update).
-    for (cx, cz) in &immediate {
-        send_chunk_from_world(write, compression, cipher, world, *cx, *cz).await?;
-        loaded_chunks.insert((*cx, *cz));
-        sent_to_client.insert((*cx, *cz));
+    // Send inner chunks NOW (before center update), wrapped in a chunk batch
+    // so the client actually renders them.
+    if !immediate.is_empty() {
+        let batch_start: ClientboundGamePacket = ClientboundChunkBatchStart.into_variant();
+        write_packet(&batch_start, write, compression, cipher).await?;
+
+        for (cx, cz) in &immediate {
+            send_chunk_from_world(write, compression, cipher, world, *cx, *cz).await?;
+            loaded_chunks.insert((*cx, *cz));
+            sent_to_client.insert((*cx, *cz));
+        }
+
+        let batch_end: ClientboundGamePacket = ClientboundChunkBatchFinished {
+            batch_size: immediate.len() as u32,
+        }.into_variant();
+        write_packet(&batch_end, write, compression, cipher).await?;
     }
 
     // NOW update the chunk cache center -- client already has nearby chunks.
@@ -1357,9 +1460,10 @@ async fn update_loaded_chunks<W: AsyncWrite + Unpin + Send>(
 
     if !immediate.is_empty() || !deferred.is_empty() || !to_unload.is_empty() {
         tracing::debug!(
-            "Chunk update: {} immediate + {} deferred, unloaded {}, queue {}, (center {}, {})",
-            immediate.len(), deferred.len(), to_unload.len(),
-            chunk_send_queue.len(), new_cx, new_cz,
+            "Chunk update: center ({},{}), {} unloaded, {} immediate, {} deferred, queue={}",
+            new_cx, new_cz,
+            to_unload.len(), immediate.len(), deferred.len(),
+            chunk_send_queue.len(),
         );
     }
 
@@ -1367,6 +1471,82 @@ async fn update_loaded_chunks<W: AsyncWrite + Unpin + Send>(
 }
 
 // ── Chunk data ──────────────────────────────────────────────────────────
+
+/// Send a `ForgetLevelChunk` packet with correct bit handling, working around
+/// the `azalea-core` `ChunkPos` serialization bug for negative coordinates.
+///
+/// The wire format is (Z, X) each as a big-endian i32, packed into a u64.
+/// We build the u64 manually using `u32` casts so a negative i32 zero-extends
+/// to its lower 32 bits without polluting the upper 32 bits.
+async fn send_forget_level_chunk<W: AsyncWrite + Unpin + Send>(
+    write: &mut W,
+    compression: Option<u32>,
+    cipher: &mut Option<azalea_crypto::Aes128CfbEnc>,
+    cx: i32,
+    cz: i32,
+) -> Result<()> {
+    use azalea_buf::AzaleaWriteVar;
+    use azalea_protocol::packets::ProtocolPacket;
+
+    let mut raw = Vec::new();
+
+    // Packet ID
+    let dummy = ClientboundForgetLevelChunk {
+        pos: azalea_core::position::ChunkPos::new(0, 0),
+    };
+    let packet_id = ClientboundGamePacket::ForgetLevelChunk(dummy).id();
+    (packet_id as u32).azalea_write_var(&mut raw)?;
+
+    // ChunkPos as u64: (cx as u32 as u64) | ((cz as u32 as u64) << 32).
+    // The double-cast is critical: `cx as u64` directly would sign-extend.
+    let packed: u64 = ((cx as u32) as u64) | (((cz as u32) as u64) << 32);
+    packed.azalea_write(&mut raw)?;
+
+    azalea_protocol::write::write_raw_packet(&raw, write, compression, cipher).await?;
+    Ok(())
+}
+
+/// Lazily compute sky light for a chunk the first time it is sent.
+///
+/// Scans each column top-down: sky=15 for air/transparent blocks, dropping
+/// to 0 at the first fully opaque block. Only non-zero values are written
+/// since `LightSection` defaults to all zeros. Idempotent via `World::sky_lit`.
+fn ensure_sky_light(world: &World, cx: i32, cz: i32) {
+    use ultimate_engine::world::position::{BlockPos, ChunkPos};
+
+    let cp = ChunkPos::new(cx, cz);
+    if world.is_sky_lit(&cp) {
+        return;
+    }
+
+    let max_y = 319i64;
+    let min_y = -64i64;
+    let base_x = cx as i64 * 16;
+    let base_z = cz as i64 * 16;
+
+    for lx in 0..16i64 {
+        for lz in 0..16i64 {
+            let bx = base_x + lx;
+            let bz = base_z + lz;
+            let mut sky_level: u8 = 15;
+
+            for y in (min_y..=max_y).rev() {
+                let pos = BlockPos::new(bx, y, bz);
+                if sky_level > 0 {
+                    world.set_sky_light(pos, sky_level);
+                }
+                let opacity = crate::block::light_opacity(world.get_block(pos));
+                if opacity >= 15 {
+                    break;
+                } else if opacity > 0 {
+                    sky_level = sky_level.saturating_sub(opacity);
+                }
+            }
+        }
+    }
+
+    world.mark_sky_lit(cp);
+}
 
 /// Send a chunk read from the World in MC 1.21.5+ wire format.
 /// Reads actual block state from the engine World, so edits persist.
@@ -1386,6 +1566,10 @@ async fn send_chunk_from_world<W: AsyncWrite + Unpin + Send>(
     let base_z = (cz as i64) * 16;
     let mut section_data = Vec::new();
 
+    // Track the highest non-air Y for each column (for MOTION_BLOCKING heightmap).
+    // Initialised to min_y - 1 meaning "no solid block found yet".
+    let mut highest_y = [min_y - 1i64; 256];
+
     for section_i in 0..total_sections {
         let section_base_y = min_y + (section_i as i64) * 16;
 
@@ -1403,7 +1587,15 @@ async fn send_chunk_from_world<W: AsyncWrite + Unpin + Send>(
                         base_x + lx, section_base_y + ly, base_z + lz,
                     ));
                     if b != first { all_same = false; }
-                    if b != BlockId::AIR { non_air = non_air.saturating_add(1); }
+                    if b != BlockId::AIR {
+                        non_air = non_air.saturating_add(1);
+                        // Update heightmap: track highest non-air block per column.
+                        let col = (lz * 16 + lx) as usize;
+                        let y = section_base_y + ly;
+                        if y > highest_y[col] {
+                            highest_y[col] = y;
+                        }
+                    }
                 }
             }
         }
@@ -1423,12 +1615,14 @@ async fn send_chunk_from_world<W: AsyncWrite + Unpin + Send>(
         }
     }
 
+    // Encode MOTION_BLOCKING heightmap (bit-packed u64 array).
+    let heightmap_data = encode_heightmap(&highest_y, min_y);
+
     // Build the chunk packet manually because azalea's AzBuf derive
     // serializes heightmaps as a VarInt-prefixed Vec, but the MC protocol
     // expects them as an NBT compound. azalea is a client lib (reads only).
     use azalea_buf::AzaleaWriteVar;
     use azalea_protocol::packets::ProtocolPacket;
-    use azalea_protocol::simdnbt;
 
     let mut raw_packet = Vec::new();
 
@@ -1453,8 +1647,25 @@ async fn send_chunk_from_world<W: AsyncWrite + Unpin + Send>(
 
     // Heightmaps as Prefixed Array (1.21.5+ format, NOT NBT).
     // Format: VarInt(count) + for each: VarInt(type_enum) + VarInt(long_count) + i64[]
-    // Empty = just VarInt(0).
-    0u32.azalea_write_var(&mut raw_packet)?;
+    //
+    // We send MOTION_BLOCKING (enum 4) + WORLD_SURFACE (enum 1).
+    // Both use the same data (highest non-air block) which is sufficient for
+    // the client's renderer and sky-light calculations.
+    2u32.azalea_write_var(&mut raw_packet)?; // count = 2
+
+    // MOTION_BLOCKING (ordinal 4)
+    4u32.azalea_write_var(&mut raw_packet)?;
+    (heightmap_data.len() as u32).azalea_write_var(&mut raw_packet)?;
+    for &val in heightmap_data.iter() {
+        (val as i64).azalea_write(&mut raw_packet)?;
+    }
+
+    // WORLD_SURFACE (ordinal 1) — same data
+    1u32.azalea_write_var(&mut raw_packet)?;
+    (heightmap_data.len() as u32).azalea_write_var(&mut raw_packet)?;
+    for &val in heightmap_data.iter() {
+        (val as i64).azalea_write(&mut raw_packet)?;
+    }
 
     // Data: VarInt(length) + raw section bytes
     (section_data.len() as u32).azalea_write_var(&mut raw_packet)?;
@@ -1463,20 +1674,104 @@ async fn send_chunk_from_world<W: AsyncWrite + Unpin + Send>(
     // Block entities: VarInt(0)
     0u32.azalea_write_var(&mut raw_packet)?;
 
-    // Light data
-    // sky_y_mask, block_y_mask, empty_sky_y_mask, empty_block_y_mask (BitSets)
-    BitSet::new(0).azalea_write(&mut raw_packet)?;
-    BitSet::new(0).azalea_write(&mut raw_packet)?;
-    BitSet::new(0).azalea_write(&mut raw_packet)?;
-    BitSet::new(0).azalea_write(&mut raw_packet)?;
-    // sky_updates, block_updates (empty arrays)
-    0u32.azalea_write_var(&mut raw_packet)?;
-    0u32.azalea_write_var(&mut raw_packet)?;
+    // Ensure sky light is computed for this chunk (lazy, on first send).
+    ensure_sky_light(world, cx, cz);
+
+    // Light data — read real light from the world's LightSections.
+    // BitSet indices: 0 = extra section below world, 1..24 = actual sections, 25 = extra above.
+    let num_light_sections = total_sections + 2; // 26
+    let mut sky_y_mask = BitSet::new(num_light_sections);
+    let mut block_y_mask = BitSet::new(num_light_sections);
+    let mut empty_sky_y_mask = BitSet::new(num_light_sections);
+    let mut empty_block_y_mask = BitSet::new(num_light_sections);
+    let mut sky_updates: Vec<Vec<u8>> = Vec::new();
+    let mut block_updates: Vec<Vec<u8>> = Vec::new();
+
+    let chunk_pos = ultimate_engine::world::position::ChunkPos::new(cx, cz);
+    let chunk_ref = world.get_chunk(&chunk_pos);
+
+    // Extra section below (bit 0): empty
+    empty_sky_y_mask.set(0);
+    empty_block_y_mask.set(0);
+
+    for section_i in 0..total_sections {
+        let bit_idx = section_i + 1;
+        let engine_section_idx = section_i as i32 + (min_y as i32 >> 4); // e.g. section_i=0 → -4
+
+        let light_sec = chunk_ref.as_ref().and_then(|c| c.light_section(engine_section_idx));
+
+        match light_sec {
+            Some(ls) => {
+                if ls.is_sky_empty() {
+                    empty_sky_y_mask.set(bit_idx);
+                } else {
+                    sky_y_mask.set(bit_idx);
+                    sky_updates.push(ls.sky.to_vec());
+                }
+                if ls.is_block_empty() {
+                    empty_block_y_mask.set(bit_idx);
+                } else {
+                    block_y_mask.set(bit_idx);
+                    block_updates.push(ls.block.to_vec());
+                }
+            }
+            None => {
+                empty_sky_y_mask.set(bit_idx);
+                empty_block_y_mask.set(bit_idx);
+            }
+        }
+    }
+
+    // Extra section above (bit 25): empty
+    empty_sky_y_mask.set(num_light_sections - 1);
+    empty_block_y_mask.set(num_light_sections - 1);
+
+    sky_y_mask.azalea_write(&mut raw_packet)?;
+    block_y_mask.azalea_write(&mut raw_packet)?;
+    empty_sky_y_mask.azalea_write(&mut raw_packet)?;
+    empty_block_y_mask.azalea_write(&mut raw_packet)?;
+
+    (sky_updates.len() as u32).azalea_write_var(&mut raw_packet)?;
+    for arr in &sky_updates {
+        (arr.len() as u32).azalea_write_var(&mut raw_packet)?;
+        raw_packet.extend_from_slice(arr);
+    }
+
+    (block_updates.len() as u32).azalea_write_var(&mut raw_packet)?;
+    for arr in &block_updates {
+        (arr.len() as u32).azalea_write_var(&mut raw_packet)?;
+        raw_packet.extend_from_slice(arr);
+    }
 
     // Write the raw packet with framing
     azalea_protocol::write::write_raw_packet(&raw_packet, write, compression, cipher).await?;
 
     Ok(())
+}
+
+/// Encode a MOTION_BLOCKING / WORLD_SURFACE heightmap as a bit-packed `u64`
+/// array matching the vanilla Minecraft format.
+///
+/// Each column's entry stores `(highest_non_air_y + 1 - min_y)` using 9 bits
+/// (for a 384-block world height).  Entries are packed LSB-first into u64s,
+/// 7 entries per u64 (63 bits used, 1 bit padding).
+fn encode_heightmap(highest_y: &[i64; 256], min_y: i64) -> Box<[u64]> {
+    const BITS: usize = 9; // ceil(log2(384 + 1))
+    const PER_LONG: usize = 64 / BITS; // 7
+    const NUM_LONGS: usize = (256 + PER_LONG - 1) / PER_LONG; // 37
+
+    let mut data = vec![0u64; NUM_LONGS];
+    for (i, &hy) in highest_y.iter().enumerate() {
+        let value = if hy >= min_y {
+            (hy + 1 - min_y) as u64
+        } else {
+            0 // column is entirely air
+        };
+        let long_idx = i / PER_LONG;
+        let bit_offset = (i % PER_LONG) * BITS;
+        data[long_idx] |= (value & ((1 << BITS) - 1)) << bit_offset;
+    }
+    data.into_boxed_slice()
 }
 
 /// Write a mixed chunk section by reading blocks from the World.
@@ -1672,6 +1967,135 @@ fn write_mixed_section(buf: &mut Vec<u8>, layers: &[(u8, u32, u8)]) -> Result<()
     0u8.azalea_write(buf)?;
     0u32.azalea_write_var(buf)?;
     0u32.azalea_write_var(buf)?;
+
+    Ok(())
+}
+
+/// Send ClientboundLightUpdate packets for a batch of light changes.
+///
+/// Groups changes by chunk so we send at most one packet per affected chunk.
+/// Each packet carries the full nibble array for every section that was touched
+/// in that chunk, read directly from the world (which has already been updated
+/// by the causal engine).
+async fn send_light_updates<W: AsyncWrite + Unpin + Send>(
+    write: &mut W,
+    compression: Option<u32>,
+    cipher: &mut Option<azalea_crypto::Aes128CfbEnc>,
+    world: &World,
+    light_changes: &[event_bus::LightChange],
+) -> Result<()> {
+    use std::collections::{HashMap, HashSet};
+    use ultimate_engine::world::position::ChunkPos;
+
+    if light_changes.is_empty() {
+        return Ok(());
+    }
+
+    // Group changed sections by chunk.
+    // Key: (cx, cz), Value: set of section indices that were touched.
+    let mut chunk_sections: HashMap<(i32, i32), HashSet<i32>> = HashMap::new();
+    for lc in light_changes {
+        let cp = lc.pos.chunk();
+        let section_idx = if lc.pos.y >= 0 {
+            (lc.pos.y >> 4) as i32
+        } else {
+            ((lc.pos.y + 1) >> 4) as i32 - 1
+        };
+        chunk_sections
+            .entry((cp.x, cp.z))
+            .or_default()
+            .insert(section_idx);
+    }
+
+    let min_y: i64 = -64;
+    let total_sections = 24usize;
+    let num_light_sections = total_sections + 2; // 26
+
+    for ((cx, cz), touched_sections) in chunk_sections {
+        let chunk_pos = ChunkPos::new(cx, cz);
+        let chunk_ref = world.get_chunk(&chunk_pos);
+
+        let mut sky_y_mask = BitSet::new(num_light_sections);
+        let mut block_y_mask = BitSet::new(num_light_sections);
+        let mut empty_sky_y_mask = BitSet::new(num_light_sections);
+        let mut empty_block_y_mask = BitSet::new(num_light_sections);
+        let mut sky_updates: Vec<Vec<u8>> = Vec::new();
+        let mut block_updates: Vec<Vec<u8>> = Vec::new();
+
+        for section_i in 0..total_sections {
+            let engine_section_idx = section_i as i32 + (min_y as i32 >> 4);
+            if !touched_sections.contains(&engine_section_idx) {
+                continue;
+            }
+
+            let bit_idx = section_i + 1;
+            let light_sec = chunk_ref.as_ref().and_then(|c| c.light_section(engine_section_idx));
+
+            match light_sec {
+                Some(ls) => {
+                    if ls.is_sky_empty() {
+                        empty_sky_y_mask.set(bit_idx);
+                    } else {
+                        sky_y_mask.set(bit_idx);
+                        sky_updates.push(ls.sky.to_vec());
+                    }
+                    if ls.is_block_empty() {
+                        empty_block_y_mask.set(bit_idx);
+                    } else {
+                        block_y_mask.set(bit_idx);
+                        block_updates.push(ls.block.to_vec());
+                    }
+                }
+                None => {
+                    empty_sky_y_mask.set(bit_idx);
+                    empty_block_y_mask.set(bit_idx);
+                }
+            }
+        }
+
+        // Build the LightUpdate packet manually (azalea's Write impls
+        // don't always match the server-side wire format).
+        use azalea_buf::AzaleaWriteVar;
+        use azalea_protocol::packets::ProtocolPacket;
+
+        let mut raw = Vec::new();
+
+        // Packet ID
+        let dummy = azalea_protocol::packets::game::ClientboundLightUpdate {
+            x: 0, z: 0,
+            light_data: azalea_protocol::packets::game::c_light_update::ClientboundLightUpdatePacketData {
+                sky_y_mask: BitSet::new(0), block_y_mask: BitSet::new(0),
+                empty_sky_y_mask: BitSet::new(0), empty_block_y_mask: BitSet::new(0),
+                sky_updates: vec![], block_updates: vec![],
+            },
+        };
+        let packet_id = ClientboundGamePacket::LightUpdate(dummy).id();
+        (packet_id as u32).azalea_write_var(&mut raw)?;
+
+        // Chunk X, Chunk Z (VarInt)
+        (cx as u32).azalea_write_var(&mut raw)?;
+        (cz as u32).azalea_write_var(&mut raw)?;
+
+        // Light data — same format as the tail of LevelChunkWithLight
+        sky_y_mask.azalea_write(&mut raw)?;
+        block_y_mask.azalea_write(&mut raw)?;
+        empty_sky_y_mask.azalea_write(&mut raw)?;
+        empty_block_y_mask.azalea_write(&mut raw)?;
+
+        (sky_updates.len() as u32).azalea_write_var(&mut raw)?;
+        for arr in &sky_updates {
+            (arr.len() as u32).azalea_write_var(&mut raw)?;
+            raw.extend_from_slice(arr);
+        }
+
+        (block_updates.len() as u32).azalea_write_var(&mut raw)?;
+        for arr in &block_updates {
+            (arr.len() as u32).azalea_write_var(&mut raw)?;
+            raw.extend_from_slice(arr);
+        }
+
+        azalea_protocol::write::write_raw_packet(&raw, write, compression, cipher).await?;
+    }
 
     Ok(())
 }

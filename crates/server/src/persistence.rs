@@ -47,6 +47,15 @@ static BLOCK_LOOKUP: LazyLock<HashMap<BlockLookupKey, u16>> = LazyLock::new(|| {
     map
 });
 
+/// Look up a block state ID by name and sorted property list.
+///
+/// Used by the placement system to resolve oriented block states.
+pub(crate) fn lookup_block_state(name: &str, props: &[(String, String)]) -> Option<u16> {
+    BLOCK_LOOKUP
+        .get(&(name.to_string(), props.to_vec()))
+        .copied()
+}
+
 /// Convert a palette entry (name + optional properties) back to a BlockId.
 fn palette_entry_to_block_id(entry: &PaletteEntry) -> BlockId {
     let name = entry

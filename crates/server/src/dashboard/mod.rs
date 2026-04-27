@@ -117,6 +117,16 @@ pub fn snapshot_graph(graph: &CausalGraph) -> GraphSnapshot {
                 format!("Notify ({},{},{})", pos.x, pos.y, pos.z),
                 [pos.x, pos.y, pos.z],
             ),
+            EventPayload::LightSet { pos, light_type, new, .. } => (
+                "light_set".to_string(),
+                format!("Light{:?} ({},{},{}) → {}", light_type, pos.x, pos.y, pos.z, new),
+                [pos.x, pos.y, pos.z],
+            ),
+            EventPayload::LightNotify { pos } => (
+                "light_notify".to_string(),
+                format!("LightNotify ({},{},{})", pos.x, pos.y, pos.z),
+                [pos.x, pos.y, pos.z],
+            ),
         };
 
         nodes.push(GraphNode {

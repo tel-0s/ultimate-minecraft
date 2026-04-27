@@ -71,6 +71,13 @@ where
                     world.set_block(*pos, *new);
                 }
                 EventPayload::BlockNotify { .. } => {}
+                EventPayload::LightSet { pos, light_type, new, .. } => {
+                    match light_type {
+                        ultimate_engine::causal::event::LightType::Sky => world.set_sky_light(*pos, *new),
+                        ultimate_engine::causal::event::LightType::Block => world.set_block_light(*pos, *new),
+                    }
+                }
+                EventPayload::LightNotify { .. } => {}
             }
             graph.mark_executed(id);
             total += 1;
@@ -277,9 +284,14 @@ fn no_events_on_inert_block() {
 
     let total = scheduler.run_until_quiet(&world, &mut graph, &rules, 100);
 
-    // Only the initial event should execute; no consequents.
-    assert_eq!(total, 1);
+    // Stone is inert: no gravity or fluid cascades. Light propagation events
+    // are expected (opacity change updates sky light), but the block grid
+    // should be unchanged except for the placed stone itself.
+    assert!(total >= 1, "at least the root event should execute");
     assert_eq!(world.get_block(BlockPos::new(4, 10, 4)), block::STONE);
+    // Neighbors should still be air (no block cascades).
+    assert_eq!(world.get_block(BlockPos::new(4, 9, 4)), block::AIR);
+    assert_eq!(world.get_block(BlockPos::new(5, 10, 4)), block::AIR);
 }
 
 // ---------------------------------------------------------------------------
@@ -534,6 +546,96 @@ fn graph_tracks_execution_count() {
     // Every event in the graph should be executed.
     assert_eq!(graph.executed_count(), graph.len());
     assert!(graph.frontier().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Light propagation tests
+// ---------------------------------------------------------------------------
+
+/// Get the MC block state ID for a standing torch via azalea.
+fn torch_block_id() -> BlockId {
+    use azalea_block::{blocks, BlockTrait};
+    let state_id: u32 = blocks::Torch.as_block_state().into();
+    BlockId::new(state_id as u16)
+}
+
+#[test]
+fn torch_lights_surrounding_area() {
+    let world = flat_world(4);
+    let rules = ultimate_server::rules::standard();
+    let scheduler = Scheduler::new();
+    let torch = torch_block_id();
+
+    // Verify azalea gives us light_emission=14 for this ID.
+    assert_eq!(
+        ultimate_server::block::light_emission(torch), 14,
+        "torch block state {} should emit 14", torch.0
+    );
+
+    // Place a torch at y=5 (above the dirt surface at y=4), center of chunk.
+    let pos = BlockPos::new(8, 5, 8);
+    let mut graph = CausalGraph::new();
+    let root = graph.insert_root(Event {
+        payload: EventPayload::BlockSet {
+            pos,
+            old: block::AIR,
+            new: torch,
+        },
+    });
+    // Notify neighbors (same as connection handler does).
+    for nb in pos.neighbors() {
+        graph.insert(
+            Event { payload: EventPayload::BlockNotify { pos: nb } },
+            vec![root],
+        );
+    }
+
+    let total = scheduler.run_until_quiet(&world, &mut graph, &rules, 1000);
+    assert!(total > 0);
+
+    // Torch position should have block light 14.
+    assert_eq!(world.get_block_light(pos), 14, "torch pos should be 14");
+
+    // Adjacent air blocks should have block light 13.
+    for nb in pos.neighbors() {
+        let expected = if nb.y == 4 {
+            // Below is dirt (opacity 15): 14 - 15 = 0 (saturating)
+            0
+        } else {
+            13
+        };
+        assert_eq!(
+            world.get_block_light(nb), expected,
+            "block light at {:?} (neighbor of torch) should be {}",
+            nb, expected
+        );
+    }
+
+    // Check radial falloff in +x direction (all air, opacity 0).
+    for dist in 1..=14i64 {
+        let check = BlockPos::new(pos.x + dist, pos.y, pos.z);
+        let expected = (14 - dist as u8).max(0);
+        assert_eq!(
+            world.get_block_light(check), expected,
+            "block light at distance {} (+x) should be {}", dist, expected
+        );
+    }
+    // At distance 15, should be 0.
+    assert_eq!(
+        world.get_block_light(BlockPos::new(pos.x + 15, pos.y, pos.z)), 0,
+        "block light at distance 15 should be 0"
+    );
+
+    // Also count how many LightSet events were produced (for collect_light_changes).
+    let light_count = graph.all_ids().iter().filter(|id| {
+        graph.get(**id).is_some_and(|n| {
+            n.executed && matches!(n.event.payload, EventPayload::LightSet { .. })
+        })
+    }).count();
+    assert!(
+        light_count > 100,
+        "expected hundreds of LightSet events, got {}", light_count
+    );
 }
 
 // ---------------------------------------------------------------------------

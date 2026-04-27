@@ -15,6 +15,8 @@ pub struct World {
     chunks: DashMap<ChunkPos, Chunk>,
     /// Chunks that have been modified since the last save.
     dirty: DashSet<ChunkPos>,
+    /// Chunks whose sky light has already been initialized.
+    sky_lit: DashSet<ChunkPos>,
 }
 
 impl World {
@@ -22,6 +24,7 @@ impl World {
         Self {
             chunks: DashMap::new(),
             dirty: DashSet::new(),
+            sky_lit: DashSet::new(),
         }
     }
 
@@ -89,6 +92,75 @@ impl World {
     /// Get a reference to a single chunk by position, if present.
     pub fn get_chunk(&self, pos: &ChunkPos) -> Option<dashmap::mapref::one::Ref<'_, ChunkPos, Chunk>> {
         self.chunks.get(pos)
+    }
+
+    /// Get a mutable reference to a single chunk by position, if present.
+    pub fn get_chunk_mut(&self, pos: &ChunkPos) -> Option<dashmap::mapref::one::RefMut<'_, ChunkPos, Chunk>> {
+        self.chunks.get_mut(pos)
+    }
+
+    // ── Light accessors ──────────────────────────────────────────────────
+
+    pub fn get_sky_light(&self, pos: BlockPos) -> u8 {
+        match self.chunks.get(&pos.chunk()) {
+            Some(chunk) => chunk.get_sky_light(pos.local()),
+            None => 15, // unloaded chunks default to full sky light
+        }
+    }
+
+    pub fn set_sky_light(&self, pos: BlockPos, val: u8) {
+        self.chunks
+            .entry(pos.chunk())
+            .or_default()
+            .set_sky_light(pos.local(), val);
+    }
+
+    /// Set sky light only if the chunk already exists. Returns `true` if the
+    /// write was performed. This avoids creating phantom empty chunks when
+    /// light propagation BFS reaches beyond the generated world.
+    pub fn set_sky_light_if_loaded(&self, pos: BlockPos, val: u8) -> bool {
+        if let Some(mut chunk) = self.chunks.get_mut(&pos.chunk()) {
+            chunk.set_sky_light(pos.local(), val);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn get_block_light(&self, pos: BlockPos) -> u8 {
+        match self.chunks.get(&pos.chunk()) {
+            Some(chunk) => chunk.get_block_light(pos.local()),
+            None => 0,
+        }
+    }
+
+    pub fn set_block_light(&self, pos: BlockPos, val: u8) {
+        self.chunks
+            .entry(pos.chunk())
+            .or_default()
+            .set_block_light(pos.local(), val);
+    }
+
+    /// Set block light only if the chunk already exists. Returns `true` if
+    /// the write was performed. This avoids creating phantom empty chunks
+    /// when light propagation BFS reaches beyond the generated world.
+    pub fn set_block_light_if_loaded(&self, pos: BlockPos, val: u8) -> bool {
+        if let Some(mut chunk) = self.chunks.get_mut(&pos.chunk()) {
+            chunk.set_block_light(pos.local(), val);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns `true` if this chunk already has sky light initialized.
+    pub fn is_sky_lit(&self, pos: &ChunkPos) -> bool {
+        self.sky_lit.contains(pos)
+    }
+
+    /// Mark a chunk as having its sky light initialized.
+    pub fn mark_sky_lit(&self, pos: ChunkPos) {
+        self.sky_lit.insert(pos);
     }
 }
 
