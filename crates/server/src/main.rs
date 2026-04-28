@@ -3,30 +3,25 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use ultimate_engine::world::World;
+use ultimate_server::config::{self, ServerConfig};
 use ultimate_server::dashboard::{self, DashboardState};
 use ultimate_server::event_bus::{self, WorldChangeBatch};
 use ultimate_server::persistence;
 use ultimate_server::player_registry::PlayerRegistry;
+use ultimate_server::worldgen::{WorldGen, noise_terrain::NoiseTerrainGen};
 
-/// Default autosave interval (5 minutes).
-const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(300);
+/// Pull a `--key value` flag out of the CLI args.
+fn cli_arg(key: &str) -> Option<String> {
+    std::env::args()
+        .skip_while(|a| a != key)
+        .nth(1)
+}
 
 #[tokio::main]
 async fn main() {
     let demo_mode = std::env::args().any(|a| a == "--demo");
-    let bind_addr = std::env::args()
-        .skip_while(|a| a != "--bind")
-        .nth(1)
-        .unwrap_or_else(|| "0.0.0.0:25565".into());
-    let dashboard_port: u16 = std::env::args()
-        .skip_while(|a| a != "--dashboard-port")
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8000);
-    let world_dir: PathBuf = std::env::args()
-        .skip_while(|a| a != "--world")
-        .nth(1)
-        .unwrap_or_else(|| "world".into())
+    let config_path: PathBuf = cli_arg("--config")
+        .unwrap_or_else(|| "server.yaml".into())
         .into();
 
     tracing_subscriber::fmt()
@@ -43,31 +38,63 @@ async fn main() {
 
     tracing::info!("Ultimate Minecraft -- causal voxel engine server");
 
+    // ── Load config (auto-create on first run) ──────────────────────────
+    let mut cfg: ServerConfig = match config::load_or_create(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Config load failed: {:#}", e);
+            return;
+        }
+    };
+
+    // CLI flags override file values for one-off operator overrides.
+    if let Some(v) = cli_arg("--bind") { cfg.network.bind = v; }
+    if let Some(v) = cli_arg("--dashboard-port").and_then(|s| s.parse().ok()) {
+        cfg.dashboard.port = v;
+    }
+    if let Some(v) = cli_arg("--world") { cfg.world.dir = v.into(); }
+    if let Some(v) = cli_arg("--seed").and_then(|s| s.parse().ok()) {
+        cfg.world.seed = v;
+    }
+
+    let cfg = Arc::new(cfg);
+    tracing::info!(
+        "Config loaded from {}: view_distance={}, max_players={}, seed={:#x}",
+        config_path.display(),
+        cfg.network.view_distance,
+        cfg.network.max_players,
+        cfg.world.seed,
+    );
+
     // ── Generate base world, then overlay saved modifications ──────────
     let world = Arc::new(World::new());
-    tracing::info!("Generating flat world...");
-    generate_flat_world_mc(&world, 32);
-    tracing::info!("Base world ready: {} chunks", world.chunk_count());
+    let worldgen: Arc<dyn WorldGen> = Arc::new(NoiseTerrainGen::new(cfg.world.seed));
+    tracing::info!("Generating noise terrain (seed {:#x})...", cfg.world.seed);
+    worldgen.pregenerate_radius(&world, cfg.world.pregenerate_radius);
+    tracing::info!(
+        "Base world ready: {} chunks pre-generated; further chunks generated on demand",
+        world.chunk_count(),
+    );
 
     // Load saved (player-modified) chunks on top of the generated base.
-    match persistence::load_into(&world, &world_dir) {
+    match persistence::load_into(&world, &cfg.world.dir) {
         Ok(0) => tracing::info!("No saved modifications found"),
-        Ok(n) => tracing::info!("Loaded {} modified chunks from {}", n, world_dir.display()),
+        Ok(n) => tracing::info!("Loaded {} modified chunks from {}", n, cfg.world.dir.display()),
         Err(e) => tracing::error!("Failed to load saved chunks: {:#}", e),
     }
 
     // Start live dashboard (non-blocking — runs on its own tasks).
     let dashboard = Arc::new(DashboardState::new(Arc::clone(&world)));
     let dash = Arc::clone(&dashboard);
+    let dashboard_port = cfg.dashboard.port;
     tokio::spawn(async move {
         dashboard::server::start(dash, dashboard_port).await;
     });
 
-    // World-change event bus: player actions and simulation layers publish here,
-    // all connections subscribe to receive cross-player updates.
+    // World-change event bus.
     let (bus_tx, _) = broadcast::channel::<WorldChangeBatch>(event_bus::BUS_CAPACITY);
 
-    // Start ambient simulation layers (empty for now -- add layers here).
+    // Ambient simulation layers (empty for now).
     let sim_layers: Vec<Box<dyn ultimate_server::simulation::SimulationLayer>> = vec![];
     ultimate_server::simulation::start(Arc::clone(&world), sim_layers, bus_tx.clone());
 
@@ -76,9 +103,10 @@ async fn main() {
 
     // ── Periodic autosave ────────────────────────────────────────────────
     let save_world_ref = Arc::clone(&world);
-    let save_dir = world_dir.clone();
+    let save_dir = cfg.world.dir.clone();
+    let autosave = Duration::from_secs(cfg.world.autosave_interval_secs);
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(AUTOSAVE_INTERVAL);
+        let mut interval = tokio::time::interval(autosave);
         interval.tick().await; // first tick is immediate, skip it
         loop {
             interval.tick().await;
@@ -91,11 +119,13 @@ async fn main() {
     });
 
     // ── Start listener with graceful shutdown ────────────────────────────
-    tracing::info!("Starting Minecraft 1.21.11 server on {}", bind_addr);
+    tracing::info!("Starting Minecraft 1.21.11 server on {}", cfg.network.bind);
 
     tokio::select! {
         result = ultimate_server::net::listener::run(
-            Arc::clone(&world), dashboard, bus_tx, registry, &bind_addr,
+            Arc::clone(&world), dashboard, bus_tx, registry,
+            Arc::clone(&worldgen),
+            Arc::clone(&cfg),
         ) => {
             if let Err(e) = result {
                 tracing::error!("Server error: {}", e);
@@ -108,7 +138,7 @@ async fn main() {
 
     // ── Save on shutdown ─────────────────────────────────────────────────
     tracing::info!("Saving world before exit...");
-    match persistence::save_world(&world, &world_dir) {
+    match persistence::save_world(&world, &cfg.world.dir) {
         Ok(n) => tracing::info!("Shutdown save complete: {} chunks written", n),
         Err(e) => tracing::error!("Shutdown save failed: {:#}", e),
     }
@@ -187,35 +217,3 @@ fn run_demo() {
     }
 }
 
-/// Generate a flat world using MC block state IDs (for the real server).
-/// Bedrock at y=60, stone y=61-63, dirt at y=64-79. Player spawns at y=80.
-fn generate_flat_world_mc(world: &World, chunk_radius: i32) {
-    use ultimate_engine::world::position::{ChunkPos, LocalBlockPos};
-    use ultimate_engine::world::chunk::Chunk;
-    use ultimate_server::block;
-
-    for cx in -chunk_radius..chunk_radius {
-        for cz in -chunk_radius..chunk_radius {
-            let mut chunk = Chunk::new();
-
-            // Section 7 (y=48..63): bedrock at y=60, stone at y=61-63
-            for x in 0..16u8 {
-                for z in 0..16u8 {
-                    chunk.set_block(LocalBlockPos { x, y: 60, z }, block::BEDROCK);
-                    for y in 61..=63i64 {
-                        chunk.set_block(LocalBlockPos { x, y, z }, block::STONE);
-                    }
-                }
-            }
-
-            // Section 8 (y=64..79): dirt at y=64
-            for x in 0..16u8 {
-                for z in 0..16u8 {
-                    chunk.set_block(LocalBlockPos { x, y: 64, z }, block::DIRT);
-                }
-            }
-
-            world.insert_chunk(ChunkPos::new(cx, cz), chunk);
-        }
-    }
-}

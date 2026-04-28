@@ -1,4 +1,5 @@
 pub mod block;
+pub mod config;
 pub mod dashboard;
 pub mod event_bus;
 pub mod net;
@@ -7,3 +8,4 @@ pub mod placement;
 pub mod player_registry;
 pub mod rules;
 pub mod simulation;
+pub mod worldgen;

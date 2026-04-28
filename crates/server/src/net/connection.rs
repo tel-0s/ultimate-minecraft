@@ -61,9 +61,11 @@ use tokio::net::TcpStream;
 use ultimate_engine::world::World;
 use uuid::Uuid;
 
+use crate::config::ServerConfig;
 use crate::dashboard::{self, DashboardState};
 use crate::event_bus::{self, ChangeSource, WorldChangeBatch};
 use crate::player_registry::{PlayerEvent, PlayerInfo, PlayerRegistry};
+use crate::worldgen::WorldGen;
 
 /// Monotonic connection ID counter for identifying change sources.
 static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -75,6 +77,8 @@ pub async fn handle(
     dashboard: Arc<DashboardState>,
     bus_tx: tokio::sync::broadcast::Sender<WorldChangeBatch>,
     registry: Arc<PlayerRegistry>,
+    worldgen: Arc<dyn WorldGen>,
+    config: Arc<ServerConfig>,
 ) -> Result<()> {
     let (read, write) = stream.into_split();
     let mut read = read;
@@ -105,14 +109,14 @@ pub async fn handle(
 
     match intention.intention {
         ClientIntention::Status => {
-            handle_status(&mut read, &mut write, &mut buf, compression, &mut cipher_enc, &mut cipher_dec, &registry).await?;
+            handle_status(&mut read, &mut write, &mut buf, compression, &mut cipher_enc, &mut cipher_dec, &registry, &config.network).await?;
         }
         ClientIntention::Login => {
             let (name, uuid) = handle_login(&mut read, &mut write, &mut buf, compression, &mut cipher_enc, &mut cipher_dec).await?;
             handle_configuration(&mut read, &mut write, &mut buf, compression, &mut cipher_enc, &mut cipher_dec).await?;
             dashboard.metrics.player_joined();
             // handle_play registers/deregisters with the player registry internally.
-            let result = handle_play(&mut read, &mut write, &mut buf, compression, &mut cipher_enc, &mut cipher_dec, &world, &name, uuid, &dashboard, &bus_tx, &registry).await;
+            let result = handle_play(&mut read, &mut write, &mut buf, compression, &mut cipher_enc, &mut cipher_dec, &world, &name, uuid, &dashboard, &bus_tx, &registry, &*worldgen, &config).await;
             dashboard.metrics.player_left();
             result?;
         }
@@ -132,6 +136,7 @@ async fn handle_status<R, W>(
     cipher_enc: &mut Option<azalea_crypto::Aes128CfbEnc>,
     cipher_dec: &mut Option<azalea_crypto::Aes128CfbDec>,
     registry: &PlayerRegistry,
+    network: &crate::config::NetworkConfig,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + Sync,
@@ -157,7 +162,7 @@ where
         description: FormattedText::from("Ultimate Minecraft - Causal Graph Engine"),
         favicon: None,
         players: Players {
-            max: 20,
+            max: network.max_players as i32,
             online: online_players.len() as i32,
             sample,
         },
@@ -528,6 +533,8 @@ async fn handle_play<R, W>(
     dashboard: &DashboardState,
     bus_tx: &tokio::sync::broadcast::Sender<WorldChangeBatch>,
     registry: &PlayerRegistry,
+    worldgen: &dyn WorldGen,
+    config: &ServerConfig,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + Sync,
@@ -535,17 +542,21 @@ where
 {
     let entity_id = registry.allocate_entity_id();
     let spawn_x = 8.0_f64;
-    let spawn_y = 80.0_f64; // above the dirt layer (section 8 = y 64-79)
     let spawn_z = 8.0_f64;
+    // Pre-generate the spawn column so the surface is sampled from the
+    // committed world, not just the noise function — this matters once
+    // persistence layers modifications on top of the generator.
+    worldgen.ensure_generated(&world, (spawn_x as i32) >> 4, (spawn_z as i32) >> 4);
+    let spawn_y = worldgen.spawn_y(spawn_x as i64, spawn_z as i64);
 
     // Send Login (Play) -- this initializes the client's world state
     let login: ClientboundGamePacket = ClientboundLogin {
         player_id: MinecraftEntityId(entity_id),
         hardcore: false,
         levels: vec![Identifier::new("minecraft:overworld")],
-        max_players: 20,
-        chunk_radius: 4,
-        simulation_distance: 4,
+        max_players: config.network.max_players as i32,
+        chunk_radius: config.network.view_distance.max(0) as u32,
+        simulation_distance: config.network.simulation_distance.max(0) as u32,
         reduced_debug_info: false,
         show_death_screen: true,
         do_limited_crafting: false,
@@ -609,7 +620,9 @@ where
     // MC 1.20+ requires chunks to be wrapped in ChunkBatchStart/Finished
     // markers — without these, the client receives the data but won't
     // render the chunks (blocks remain interactable but invisible).
-    let view_distance = 4i32;
+    let view_distance = config.network.view_distance;
+    // null in config → all new chunks immediate (matches view_distance).
+    let immediate_radius = config.network.immediate_radius.unwrap_or(view_distance);
     let mut loaded_chunks: HashSet<(i32, i32)> = HashSet::new();
 
     let batch_start: ClientboundGamePacket = ClientboundChunkBatchStart.into_variant();
@@ -618,6 +631,7 @@ where
     let mut batch_count: u32 = 0;
     for cx in (chunk_x - view_distance)..=(chunk_x + view_distance) {
         for cz in (chunk_z - view_distance)..=(chunk_z + view_distance) {
+            worldgen.ensure_generated(world, cx, cz);
             send_chunk_from_world(write, compression, cipher_enc, world, cx, cz).await?;
             loaded_chunks.insert((cx, cz));
             batch_count += 1;
@@ -653,6 +667,22 @@ where
 
     // Unique ID for this connection (used to filter self-originated bus messages).
     let conn_id = NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // RAII guard so deregister always runs, even if a `?` early-exits the
+    // function (e.g. client TCP drop). Without this the player stays in
+    // `registry.snapshot()` forever, showing as "online" in the multiplayer
+    // ping screen until the server restarts.
+    struct DeregisterGuard<'a> {
+        registry: &'a PlayerRegistry,
+        conn_id: u64,
+    }
+    impl Drop for DeregisterGuard<'_> {
+        fn drop(&mut self) {
+            self.registry.deregister(self.conn_id);
+        }
+    }
+    let _deregister_guard = DeregisterGuard { registry, conn_id };
+
     // Subscribe to the world-change event bus for cross-player sync.
     let mut bus_rx = bus_tx.subscribe();
     // Subscribe to player lifecycle events (join/leave).
@@ -770,7 +800,7 @@ where
 
     // Max chunks to send per loop iteration. Keeps the loop responsive while
     // still making rapid progress on the queue.
-    const CHUNKS_PER_ITER: usize = 5;
+    let chunks_per_iter: usize = config.network.chunks_per_iter;
 
     // Track chunks physically sent to the client. Deferred chunks are added to
     // `loaded_chunks` optimistically before being sent, so this set lets us
@@ -783,7 +813,7 @@ where
         // client renders the chunks (1.20+ requirement).
         {
             let mut to_send: Vec<(i32, i32)> = Vec::new();
-            while to_send.len() < CHUNKS_PER_ITER {
+            while to_send.len() < chunks_per_iter {
                 let Some((cx, cz)) = chunk_send_queue.pop_front() else { break };
                 if !loaded_chunks.contains(&(cx, cz)) {
                     sent_to_client.remove(&(cx, cz));
@@ -797,6 +827,7 @@ where
                 write_packet(&batch_start, write, compression, cipher_enc).await?;
 
                 for &(cx, cz) in &to_send {
+                    worldgen.ensure_generated(world, cx, cz);
                     send_chunk_from_world(write, compression, cipher_enc, world, cx, cz).await?;
                     sent_to_client.insert((cx, cz));
                 }
@@ -1083,7 +1114,8 @@ where
                                 );
                                 update_loaded_chunks(
                                     write, compression, cipher_enc, world,
-                                    player_x, player_z, view_distance,
+                                    &*worldgen,
+                                    player_x, player_z, view_distance, immediate_radius,
                                     &mut current_chunk_x, &mut current_chunk_z,
                                     &mut loaded_chunks, &mut sent_to_client,
                                     &mut chunk_send_queue,
@@ -1102,7 +1134,8 @@ where
                                 );
                                 update_loaded_chunks(
                                     write, compression, cipher_enc, world,
-                                    player_x, player_z, view_distance,
+                                    &*worldgen,
+                                    player_x, player_z, view_distance, immediate_radius,
                                     &mut current_chunk_x, &mut current_chunk_z,
                                     &mut loaded_chunks, &mut sent_to_client,
                                     &mut chunk_send_queue,
@@ -1297,9 +1330,9 @@ where
         }
     }
 
-    // ── Cleanup: deregister from player registry on any exit ─────────────
-    registry.deregister(conn_id);
-    tracing::info!("{} removed from player registry", player_name);
+    // Deregister now happens via DeregisterGuard's Drop impl (so it runs
+    // on every exit path, including `?` early returns from network errors).
+    tracing::info!("{} disconnected cleanly", player_name);
     Ok(())
 }
 
@@ -1349,9 +1382,11 @@ async fn update_loaded_chunks<W: AsyncWrite + Unpin + Send>(
     compression: Option<u32>,
     cipher: &mut Option<azalea_crypto::Aes128CfbEnc>,
     world: &World,
+    worldgen: &dyn WorldGen,
     player_x: f64,
     player_z: f64,
     view_distance: i32,
+    immediate_radius: i32,
     current_chunk_x: &mut i32,
     current_chunk_z: &mut i32,
     loaded_chunks: &mut HashSet<(i32, i32)>,
@@ -1411,14 +1446,11 @@ async fn update_loaded_chunks<W: AsyncWrite + Unpin + Send>(
         dx.max(dz) // Chebyshev distance
     });
 
-    // ── Key fix: send inner-ring chunks SYNCHRONOUSLY before updating the
-    //    center, so the client always has nearby chunks when the center moves.
-    //    Outer-ring chunks are queued for deferred loading.
-    // Send ALL new chunks synchronously before updating the center.
-    // Previously IMMEDIATE_RADIUS=2 deferred outer-ring chunks, but
-    // those were arriving after SetChunkCacheCenter, causing the client
-    // to reject them (or show holes while they were in-flight).
-    let immediate_radius: i32 = view_distance;
+    // Inner-ring chunks (Chebyshev ≤ `immediate_radius`) are sent
+    // SYNCHRONOUSLY before the cache-center update; outer-ring chunks
+    // queue and stream in over the next few main-loop iterations.
+    // The radius is config-driven (`network.immediate_radius` in
+    // server.yaml; null = view_distance, all immediate).
     let (immediate, deferred): (Vec<_>, Vec<_>) = to_load
         .into_iter()
         .partition(|(cx, cz)| {
@@ -1434,6 +1466,7 @@ async fn update_loaded_chunks<W: AsyncWrite + Unpin + Send>(
         write_packet(&batch_start, write, compression, cipher).await?;
 
         for (cx, cz) in &immediate {
+            worldgen.ensure_generated(world, *cx, *cz);
             send_chunk_from_world(write, compression, cipher, world, *cx, *cz).await?;
             loaded_chunks.insert((*cx, *cz));
             sent_to_client.insert((*cx, *cz));
@@ -1511,8 +1544,12 @@ async fn send_forget_level_chunk<W: AsyncWrite + Unpin + Send>(
 /// Scans each column top-down: sky=15 for air/transparent blocks, dropping
 /// to 0 at the first fully opaque block. Only non-zero values are written
 /// since `LightSection` defaults to all zeros. Idempotent via `World::sky_lit`.
+///
+/// Holds the chunk's `RefMut` for the duration of the scan so we do one
+/// DashMap acquisition instead of ~100K (one per `set_sky_light`/`get_block`
+/// call). This is the difference between ~30 ms and <1 ms per chunk.
 fn ensure_sky_light(world: &World, cx: i32, cz: i32) {
-    use ultimate_engine::world::position::{BlockPos, ChunkPos};
+    use ultimate_engine::world::position::{ChunkPos, LocalBlockPos};
 
     let cp = ChunkPos::new(cx, cz);
     if world.is_sky_lit(&cp) {
@@ -1521,25 +1558,24 @@ fn ensure_sky_light(world: &World, cx: i32, cz: i32) {
 
     let max_y = 319i64;
     let min_y = -64i64;
-    let base_x = cx as i64 * 16;
-    let base_z = cz as i64 * 16;
 
-    for lx in 0..16i64 {
-        for lz in 0..16i64 {
-            let bx = base_x + lx;
-            let bz = base_z + lz;
-            let mut sky_level: u8 = 15;
-
-            for y in (min_y..=max_y).rev() {
-                let pos = BlockPos::new(bx, y, bz);
-                if sky_level > 0 {
-                    world.set_sky_light(pos, sky_level);
-                }
-                let opacity = crate::block::light_opacity(world.get_block(pos));
-                if opacity >= 15 {
-                    break;
-                } else if opacity > 0 {
-                    sky_level = sky_level.saturating_sub(opacity);
+    // Single write-lock acquisition for the whole chunk.
+    if let Some(mut chunk) = world.get_chunk_mut(&cp) {
+        for lx in 0..16u8 {
+            for lz in 0..16u8 {
+                let mut sky_level: u8 = 15;
+                for y in (min_y..=max_y).rev() {
+                    let pos = LocalBlockPos { x: lx, y, z: lz };
+                    let block = chunk.get_block(pos);
+                    let opacity = crate::block::light_opacity(block);
+                    if sky_level > 0 {
+                        chunk.set_sky_light(pos, sky_level);
+                    }
+                    if opacity >= 15 {
+                        break;
+                    } else if opacity > 0 {
+                        sky_level = sky_level.saturating_sub(opacity);
+                    }
                 }
             }
         }
@@ -1559,39 +1595,50 @@ async fn send_chunk_from_world<W: AsyncWrite + Unpin + Send>(
     cz: i32,
 ) -> Result<()> {
     use ultimate_engine::world::block::BlockId;
+    use ultimate_engine::world::position::ChunkPos;
 
     let total_sections = 24;
     let min_y: i64 = -64;
-    let base_x = (cx as i64) * 16;
-    let base_z = (cz as i64) * 16;
     let mut section_data = Vec::new();
 
     // Track the highest non-air Y for each column (for MOTION_BLOCKING heightmap).
     // Initialised to min_y - 1 meaning "no solid block found yet".
     let mut highest_y = [min_y - 1i64; 256];
 
+    // Acquire the DashMap chunk reference ONCE. The previous code did
+    // ~98K `world.get_block` calls per chunk, each going through DashMap;
+    // this collapses that to a single lock acquisition.
+    let chunk_ref = world.get_chunk(&ChunkPos::new(cx, cz));
+
     for section_i in 0..total_sections {
+        let engine_section_idx = section_i as i32 + (min_y as i32 >> 4);
         let section_base_y = min_y + (section_i as i64) * 16;
 
-        // Scan: is the section uniform? Count non-air blocks.
-        let first = world.get_block(ultimate_engine::world::position::BlockPos::new(
-            base_x, section_base_y, base_z,
-        ));
+        // Sparse fast path: a section that doesn't exist in the chunk's
+        // HashMap is by definition all-air and can be sent without scanning.
+        let section_opt = chunk_ref.as_ref().and_then(|c| c.section(engine_section_idx));
+        let Some(section) = section_opt else {
+            write_empty_section(&mut section_data)?;
+            continue;
+        };
+
+        // Scan the section's flat block array directly. Order matches
+        // ChunkSection::index: y * 256 + z * 16 + x.
+        let blocks = section.blocks();
+        let first = blocks[0];
         let mut all_same = true;
         let mut non_air: u16 = 0;
 
-        for ly in 0..16i64 {
-            for lz in 0..16i64 {
-                for lx in 0..16i64 {
-                    let b = world.get_block(ultimate_engine::world::position::BlockPos::new(
-                        base_x + lx, section_base_y + ly, base_z + lz,
-                    ));
+        for ly in 0..16usize {
+            for lz in 0..16usize {
+                for lx in 0..16usize {
+                    let idx = ly * 256 + lz * 16 + lx;
+                    let b = blocks[idx];
                     if b != first { all_same = false; }
                     if b != BlockId::AIR {
                         non_air = non_air.saturating_add(1);
-                        // Update heightmap: track highest non-air block per column.
-                        let col = (lz * 16 + lx) as usize;
-                        let y = section_base_y + ly;
+                        let col = lz * 16 + lx;
+                        let y = section_base_y + ly as i64;
                         if y > highest_y[col] {
                             highest_y[col] = y;
                         }
@@ -1607,13 +1654,10 @@ async fn send_chunk_from_world<W: AsyncWrite + Unpin + Send>(
                 write_single_section(&mut section_data, first.0 as u32)?;
             }
         } else {
-            // Mixed section: build palette + indirect encoding
-            write_section_from_world(
-                &mut section_data, world,
-                base_x, section_base_y, base_z, non_air,
-            )?;
+            write_section_from_blocks(&mut section_data, blocks, non_air)?;
         }
     }
+    drop(chunk_ref);
 
     // Encode MOTION_BLOCKING heightmap (bit-packed u64 array).
     let heightmap_data = encode_heightmap(&highest_y, min_y);
@@ -1774,57 +1818,55 @@ fn encode_heightmap(highest_y: &[i64; 256], min_y: i64) -> Box<[u64]> {
     data.into_boxed_slice()
 }
 
-/// Write a mixed chunk section by reading blocks from the World.
+/// Write a mixed chunk section directly from the section's flat block array.
 /// Uses indirect palette encoding (1.21.5+ format: no VarInt data_length).
-fn write_section_from_world(
+///
+/// Replaces `write_section_from_world` (which did 4096 DashMap lookups per
+/// section). Palette construction uses a 256-bucket linear-probe map keyed
+/// on `(state_id mod 256)` to avoid the previous O(palette_size) scan per
+/// block — typical sections have 1-8 unique blocks so the buckets are
+/// effectively single-entry.
+fn write_section_from_blocks(
     buf: &mut Vec<u8>,
-    world: &World,
-    base_x: i64,
-    base_y: i64,
-    base_z: i64,
+    blocks_in: &[ultimate_engine::world::block::BlockId; 4096],
     non_air_count: u16,
 ) -> Result<()> {
     use azalea_buf::AzaleaWriteVar;
-    use ultimate_engine::world::block::BlockId;
 
-    // Build palette and block index array
+    // Palette: lookup keyed by state_id; cap palette length so we fall
+    // back to direct encoding if a section is unusually heterogeneous.
     let mut palette: Vec<u32> = vec![0]; // air always at index 0
-    let mut blocks = [0u8; 4096];
+    let mut state_to_palette: std::collections::HashMap<u32, u8> =
+        std::collections::HashMap::with_capacity(8);
+    state_to_palette.insert(0, 0);
 
-    for ly in 0..16u64 {
-        for lz in 0..16u64 {
-            for lx in 0..16u64 {
-                let b = world.get_block(ultimate_engine::world::position::BlockPos::new(
-                    base_x + lx as i64, base_y + ly as i64, base_z + lz as i64,
-                ));
-                let state_id = b.0 as u32;
-                let palette_idx = match palette.iter().position(|&v| v == state_id) {
-                    Some(i) => i,
-                    None => {
-                        palette.push(state_id);
-                        palette.len() - 1
-                    }
-                };
-                let idx = (ly as usize) * 256 + (lz as usize) * 16 + (lx as usize);
-                blocks[idx] = palette_idx as u8;
+    let mut indices = [0u8; 4096];
+    for i in 0..4096 {
+        let state_id = blocks_in[i].0 as u32;
+        let palette_idx = match state_to_palette.get(&state_id) {
+            Some(&idx) => idx,
+            None => {
+                let idx = palette.len() as u8;
+                palette.push(state_id);
+                state_to_palette.insert(state_id, idx);
+                idx
             }
-        }
+        };
+        indices[i] = palette_idx;
     }
 
-    // Bits per entry: minimum 4 for blocks
+    // Bits per entry: minimum 4 for blocks (MC indirect-palette rule).
     let bpe = (palette.len() as f64).log2().ceil().max(1.0) as u8;
-    let bpe = bpe.max(4); // MC minimum for indirect block palette
+    let bpe = bpe.max(4);
 
-    // Write block count
     (non_air_count as i16).azalea_write(buf)?;
-    // Bits per entry
     bpe.azalea_write(buf)?;
-    // Palette
     (palette.len() as u32).azalea_write_var(buf)?;
     for &id in &palette {
         id.azalea_write_var(buf)?;
     }
-    // Packed data (1.21.5+: NO VarInt length prefix)
+
+    // Packed data (1.21.5+: NO VarInt length prefix).
     let values_per_long = 64 / bpe as usize;
     let num_longs = (4096 + values_per_long - 1) / values_per_long;
     let mask = (1u64 << bpe) - 1;
@@ -1833,13 +1875,13 @@ fn write_section_from_world(
         for vi in 0..values_per_long {
             let block_i = long_i * values_per_long + vi;
             if block_i < 4096 {
-                long_val |= ((blocks[block_i] as u64) & mask) << (vi * bpe as usize);
+                long_val |= ((indices[block_i] as u64) & mask) << (vi * bpe as usize);
             }
         }
         long_val.azalea_write(buf)?;
     }
 
-    // Biomes: single-valued (plains = 0)
+    // Biomes: single-valued (plains = 0).
     0u8.azalea_write(buf)?;
     0u32.azalea_write_var(buf)?;
 
@@ -1886,90 +1928,6 @@ fn write_empty_section(buf: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-/// Write a chunk section with specific block layers.
-/// `layers` is a slice of (local_y, block_state_id, height_in_blocks).
-fn write_mixed_section(buf: &mut Vec<u8>, layers: &[(u8, u32, u8)]) -> Result<()> {
-    use azalea_buf::AzaleaWriteVar;
-
-    // Count non-air blocks
-    let non_air: u16 = layers.iter().map(|(_, _, h)| 256 * (*h as u16)).sum();
-
-    // Build a palette: collect unique block state IDs (including air)
-    let mut palette_ids: Vec<u32> = vec![0]; // air is always index 0
-    for &(_, block_id, _) in layers {
-        if !palette_ids.contains(&block_id) {
-            palette_ids.push(block_id);
-        }
-    }
-
-    // Build the 16x16x16 block array
-    let mut blocks = [0u8; 4096]; // palette indices, not block state IDs
-    for &(start_y, block_id, height) in layers {
-        let palette_idx = palette_ids.iter().position(|&id| id == block_id).unwrap() as u8;
-        for dy in 0..height {
-            let y = (start_y + dy) as usize;
-            for z in 0..16usize {
-                for x in 0..16usize {
-                    blocks[y * 256 + z * 16 + x] = palette_idx;
-                }
-            }
-        }
-    }
-
-    // Determine bits per entry
-    let bits_per_entry = if palette_ids.len() <= 1 {
-        0
-    } else if palette_ids.len() <= 2 {
-        1 // minimum indirect bits for blocks is 4, but let's use proper calculation
-    } else {
-        (palette_ids.len() as f64).log2().ceil() as u8
-    };
-
-    // For blocks, minimum indirect bits is 4
-    let bits_per_entry = if bits_per_entry == 0 { 0 } else { bits_per_entry.max(4) };
-
-    // Write block count
-    non_air.azalea_write(buf)?;
-
-    if bits_per_entry == 0 {
-        // Single-valued palette
-        0u8.azalea_write(buf)?;
-        palette_ids[0].azalea_write_var(buf)?;
-        0u32.azalea_write_var(buf)?;
-    } else {
-        // Indirect palette
-        (bits_per_entry as u8).azalea_write(buf)?;
-        // Palette length
-        (palette_ids.len() as u32).azalea_write_var(buf)?;
-        for &id in &palette_ids {
-            id.azalea_write_var(buf)?;
-        }
-
-        // Pack block indices into longs
-        let values_per_long = 64 / bits_per_entry as usize;
-        let num_longs = (4096 + values_per_long - 1) / values_per_long;
-        (num_longs as u32).azalea_write_var(buf)?;
-
-        let mask = (1u64 << bits_per_entry) - 1;
-        for long_i in 0..num_longs {
-            let mut long_val: u64 = 0;
-            for vi in 0..values_per_long {
-                let block_i = long_i * values_per_long + vi;
-                if block_i < 4096 {
-                    long_val |= ((blocks[block_i] as u64) & mask) << (vi * bits_per_entry as usize);
-                }
-            }
-            long_val.azalea_write(buf)?;
-        }
-    }
-
-    // Biomes: single-valued (plains = 0)
-    0u8.azalea_write(buf)?;
-    0u32.azalea_write_var(buf)?;
-    0u32.azalea_write_var(buf)?;
-
-    Ok(())
-}
 
 /// Send ClientboundLightUpdate packets for a batch of light changes.
 ///

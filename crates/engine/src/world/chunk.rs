@@ -227,6 +227,12 @@ impl Chunk {
         self.sections.len()
     }
 
+    /// Get a non-empty section by section index, if present. Returns `None`
+    /// for sections that are entirely air (those are never allocated).
+    pub fn section(&self, section_idx: i32) -> Option<&ChunkSection> {
+        self.sections.get(&section_idx)
+    }
+
     /// Iterate over all non-empty sections as (section_index, section).
     pub fn sections(&self) -> impl Iterator<Item = (&i32, &ChunkSection)> {
         self.sections.iter()

@@ -110,16 +110,45 @@ causality is the only ordering.
 - [x] Vanilla-accurate block placement orientation (`placement.rs`: facing/axis/half/rotation/stair shape)
 - [x] Light engine with emission + opacity + sky-light column propagation
 - [x] Dashboard (graph snapshots + metrics)
+- [x] **Chunk render fix**: work around azalea-core's `ChunkPos` u64 packing
+      bug for negative coordinates, where `(x as u64) | ((z as u64) << 32)`
+      sign-extends a negative i32 across all 64 bits and silently destroys z.
+      `send_forget_level_chunk` builds the packet manually with `((cx as u32) as u64)`.
+- [x] **MC 1.20+ chunk batching**: wrap chunk sends in
+      `ChunkBatchStart` / `ChunkBatchFinished` markers — the client otherwise
+      receives the data but holds the chunks in a "pending batch" state and
+      won't render them.
 
 ## Phase 4 -- World Generation
 
-> Infinite procedural terrain, lazily generated.
+> Infinite procedural terrain, lazily generated. Replicating vanilla 1.21
+> overworld is multi-week work; broken into staged sub-phases.
 
-- [ ] Noise-based terrain generator (simplex/perlin height map)
-- [ ] Biome system (plains, mountains, ocean)
-- [ ] Chunk generation on demand (triggered when player approaches unloaded region)
-- [ ] Deterministic from seed
-- [ ] Cave carving, tree/structure placement
+### 4a -- Heightmap terrain (Stage 1, current)
+- [x] `WorldGen` trait + on-demand chunk generation hook in chunk-loading paths
+- [x] Octaved-Perlin heightmap with continent / hills / detail layers (`worldgen::noise_terrain`)
+- [x] Sea level + beach band + simple stone / dirt / grass / sand / water stratification
+- [x] Bedrock floor at y=0
+- [x] Deterministic from `--seed` CLI flag
+- [x] Pre-generate spawn area (radius 8) at startup; further chunks generated lazily as players walk
+
+### 4b -- Multi-noise biome system
+- [ ] Continentalness, erosion, peaks-and-valleys noise fields
+- [ ] Climate noise (temperature, humidity)
+- [ ] Biome assignment from multi-noise (plains, mountains, desert, forest, ocean, beach, river, snowy, etc.)
+- [ ] Per-biome surface rules (grass / sand / snow / podzol)
+- [ ] Per-biome height profiles (flat plains vs peaked mountains)
+
+### 4c -- Caves & ores
+- [ ] 3D-noise / worley cave carving (cheese caves + spaghetti tunnels)
+- [ ] Aquifers (water-filled cave regions)
+- [ ] Ore distribution by depth (coal / iron / diamond bands)
+
+### 4d -- Decorators & structures
+- [ ] Trees (oak, birch, jungle, spruce, dark oak, acacia, mangrove, cherry)
+- [ ] Plants (flowers, grass, kelp, sugarcane, etc.)
+- [ ] Simple structures (villages, dungeons)
+- [ ] Decorator framework: per-biome populator with rule-based placement
 
 ## Phase 5 -- Entities & Physics
 
