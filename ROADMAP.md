@@ -144,19 +144,45 @@ causality is the only ordering.
 - [x] Deterministic from `world.seed` (CLI `--seed` overrides).
 - [x] Pre-generate spawn area at startup; further chunks generated lazily.
 
-### 4b -- Multi-noise biome system
-- [ ] Continentalness, erosion, peaks-and-valleys noise fields
-- [ ] Climate noise (temperature, humidity)
-- [ ] Biome assignment from multi-noise (plains, mountains, desert, forest, ocean, beach, river, snowy, etc.)
-- [ ] Per-biome surface rules (grass / sand / snow / podzol)
-- [ ] Per-biome height profiles (flat plains vs peaked mountains)
+### 4b -- Biomes + composable surface rules
+- [x] **`Biome` enum** (Stage 4b starter set: plains, forest, desert, snowy_plains,
+      stony_peaks, beach, ocean, river) with stable wire IDs matching the
+      configuration-phase biome registry.
+- [x] **Climate noise** (`worldgen::climate`): temperature + humidity 2D
+      density-function fields, fully JSON-driven via the same `DensityFnSchema`.
+      Continentalness / erosion / peaks-and-valleys come in a later stage.
+- [x] **`BiomeSource` trait** + `MultiNoiseBiomeSource` (climate + elevation →
+      biome via a hand-coded decision table) + `FixedBiomeSource` (for
+      superflat / tests).
+- [x] **Composable surface rules** (`worldgen::surface`): `SurfaceRule` trait
+      + atoms (`block`) + combinators (`sequence`, `condition`). Conditions:
+      `at_surface`, `depth_at_most`, `above_y`, `below_y`, `in_biome`,
+      `above_water`, `below_water`. Mirrors vanilla's `surface_rule` data files.
+- [x] `DensityPipeline` consumes biome + surface rule per column. The previous
+      hand-rolled stratification is now a default `surface_rule` in the preset
+      JSON.
+- [x] Chunk packet sends per-chunk biome (single-valued biome paletted
+      container per section). Per-(4×4×4) cell biome data for smooth
+      transitions: TODO.
+- [x] Built-in `noise` preset + `presets/amplified.json` updated with
+      multi-noise biomes and per-biome surface rules.
+- [ ] Per-biome height profiles (climate-driven density adjustment — currently
+      all biomes share the same height field). Comes with multi-noise climate.
+- [ ] Per-(4×4×4) cell biome data in the chunk packet for smooth biome
+      transitions at sub-chunk scale.
 
-### 4c -- Caves & ores
+### 4c -- Multi-noise climate + per-biome height profiles
+- [ ] Continentalness, erosion, peaks-and-valleys noise fields
+- [ ] Climate-driven density splines (low continentalness → ocean basin,
+      high → mountains) — per-biome height profiles.
+- [ ] Expand biome set toward vanilla coverage.
+
+### 4d -- Caves & ores
 - [ ] 3D-noise / worley cave carving (cheese caves + spaghetti tunnels)
 - [ ] Aquifers (water-filled cave regions)
 - [ ] Ore distribution by depth (coal / iron / diamond bands)
 
-### 4d -- Decorators & structures
+### 4e -- Decorators & structures
 - [ ] Trees (oak, birch, jungle, spruce, dark oak, acacia, mangrove, cherry)
 - [ ] Plants (flowers, grass, kelp, sugarcane, etc.)
 - [ ] Simple structures (villages, dungeons)

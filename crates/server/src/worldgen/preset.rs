@@ -4,23 +4,24 @@
 //!   in the binary via `include_str!`.
 //! - **Operator-supplied:** a path to a JSON file on disk.
 //!
-//! Two preset kinds exist in Stage A:
+//! Two preset kinds exist:
 //!
 //! ## `density`
-//! Compositional density-function pipeline.
+//! Compositional density-function pipeline with biomes + surface rules.
 //!
 //! ```json
 //! { "kind": "density",
 //!   "sea_level": 63, "min_y": -64, "max_y": 319, "bedrock_y": 0,
-//!   "density": { "type": "sub", "argument1": { ... }, "argument2": { "type": "y_index" } } }
+//!   "density":     { ... density function tree ... },
+//!   "biome_source": { "type": "multi_noise", "temperature": {...}, "humidity": {...} },
+//!   "surface_rule": { "type": "sequence", "rules": [ ... ] } }
 //! ```
 //!
 //! ## `flat`
 //! Superflat: a bedrock floor + a stack of fixed layers per column.
 //!
 //! ```json
-//! { "kind": "flat",
-//!   "min_y": 0,
+//! { "kind": "flat", "min_y": 0, "biome": "plains",
 //!   "layers": [ { "block": "minecraft:bedrock", "height": 1 }, ... ] }
 //! ```
 
@@ -31,8 +32,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::block;
 use super::WorldGen;
+use super::biome::Biome;
+use super::climate::BiomeSourceSchema;
 use super::density::DensityFnSchema;
 use super::pipeline::{DensityPipeline, FlatPipeline};
+use super::surface::SurfaceRuleSchema;
 
 // ── Built-in preset bodies (embedded JSON) ──────────────────────────────────
 
@@ -55,22 +59,25 @@ pub struct DensityPresetSchema {
     pub min_y: i64,
     pub max_y: i64,
     pub bedrock_y: i64,
-    #[serde(default = "default_dirt_depth")]
-    pub dirt_depth: i64,
-    #[serde(default = "default_beach_band")]
-    pub beach_band: i64,
+    #[serde(default = "default_skin_depth")]
+    pub skin_depth: i64,
     pub density: DensityFnSchema,
+    pub biome_source: BiomeSourceSchema,
+    pub surface_rule: SurfaceRuleSchema,
 }
 
-fn default_dirt_depth() -> i64 { 4 }
-fn default_beach_band() -> i64 { 2 }
+fn default_skin_depth() -> i64 { 4 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FlatPresetSchema {
     pub min_y: i64,
     pub layers: Vec<FlatLayer>,
+    #[serde(default = "default_flat_biome")]
+    pub biome: Biome,
 }
+
+fn default_flat_biome() -> Biome { Biome::Plains }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -82,8 +89,7 @@ pub struct FlatLayer {
 // ── Loading ─────────────────────────────────────────────────────────────────
 
 /// Load a preset by spec — either a built-in name (`"noise"`,
-/// `"superflat"`) or a path to a JSON file. The resulting
-/// `Arc<dyn WorldGen>` is the worldgen the rest of the server uses.
+/// `"superflat"`) or a path to a JSON file.
 pub fn load(spec: &str, seed: u32) -> Result<Arc<dyn WorldGen>> {
     let (source, json) = match spec {
         "noise" => ("builtin:noise".to_string(), BUILTIN_NOISE.to_string()),
@@ -103,20 +109,20 @@ impl PresetSchema {
     pub fn build(self, seed: u32) -> Result<Arc<dyn WorldGen>> {
         match self {
             Self::Density(d) => {
-                // Detect the canonical heightmap pattern at build time so
-                // `surface_y` can sample the height field once per column
-                // instead of walking 384 y values.
                 let heightmap_shortcut = d.density.as_heightmap().map(|h| h.build(seed));
                 let density = d.density.build(seed);
+                let biome_source = d.biome_source.build(seed);
+                let surface_rule = d.surface_rule.build()?;
                 Ok(Arc::new(DensityPipeline {
                     density,
                     heightmap_shortcut,
+                    biome_source,
+                    surface_rule,
                     sea_level: d.sea_level,
                     min_y: d.min_y,
                     max_y: d.max_y,
                     bedrock_y: d.bedrock_y,
-                    dirt_depth: d.dirt_depth,
-                    beach_band: d.beach_band,
+                    skin_depth: d.skin_depth,
                 }))
             }
             Self::Flat(f) => {
@@ -129,7 +135,11 @@ impl PresetSchema {
                     }
                     layers.push((block_id, layer.height));
                 }
-                Ok(Arc::new(FlatPipeline { min_y: f.min_y, layers }))
+                Ok(Arc::new(FlatPipeline {
+                    min_y: f.min_y,
+                    layers,
+                    biome: f.biome,
+                }))
             }
         }
     }
@@ -155,7 +165,6 @@ mod tests {
         let schema: PresetSchema = serde_json::from_str(BUILTIN_SUPERFLAT).unwrap();
         let w = schema.build(0).unwrap();
         let chunk = w.generate_chunk(0, 0);
-        // y=0 should be bedrock per the embedded preset.
         assert_eq!(
             chunk.get_block(LocalBlockPos { x: 0, y: 0, z: 0 }),
             block::BEDROCK,
@@ -187,9 +196,25 @@ mod tests {
 
     #[test]
     fn unknown_block_in_flat_errors() {
-        let json = r#"{"kind": "flat", "min_y": 0,
+        let json = r#"{"kind": "flat", "min_y": 0, "biome": "plains",
             "layers": [{"block": "minecraft:not_a_real_block", "height": 1}]}"#;
         let schema: PresetSchema = serde_json::from_str(json).unwrap();
         assert!(schema.build(0).is_err());
+    }
+
+    #[test]
+    fn noise_preset_assigns_varied_biomes() {
+        // Across a wide patch, the multi-noise biome source should
+        // assign more than one biome (otherwise the noise is collapsed).
+        let w = load("noise", 0xC0FFEE).unwrap();
+        let mut biomes = std::collections::HashSet::new();
+        for cx in -8..8i32 {
+            for cz in -8..8i32 {
+                biomes.insert(w.biome_at(cx, cz));
+            }
+        }
+        assert!(biomes.len() >= 2,
+            "noise preset should produce >1 biome in a 16x16 chunk patch, got {:?}",
+            biomes);
     }
 }

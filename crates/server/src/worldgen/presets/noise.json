@@ -4,8 +4,7 @@
   "min_y": -64,
   "max_y": 319,
   "bedrock_y": 0,
-  "dirt_depth": 4,
-  "beach_band": 2,
+  "skin_depth": 4,
   "density": {
     "type": "sub",
     "argument1": {
@@ -55,5 +54,111 @@
       }
     },
     "argument2": { "type": "y_index" }
+  },
+
+  "biome_source": {
+    "type": "multi_noise",
+    "temperature": {
+      "type": "noise2d",
+      "seed_offset": 100,
+      "frequency": 0.0008,
+      "octaves": 3,
+      "persistence": 0.5,
+      "lacunarity": 2.0
+    },
+    "humidity": {
+      "type": "noise2d",
+      "seed_offset": 101,
+      "frequency": 0.0012,
+      "octaves": 3,
+      "persistence": 0.5,
+      "lacunarity": 2.0
+    }
+  },
+
+  "surface_rule": {
+    "type": "sequence",
+    "rules": [
+      {
+        "type": "condition",
+        "condition": { "type": "in_biome", "biomes": ["ocean", "river"] },
+        "rule": {
+          "type": "condition",
+          "condition": { "type": "depth_at_most", "depth": 4 },
+          "rule": { "type": "block", "block": "minecraft:sand" }
+        }
+      },
+      {
+        "type": "condition",
+        "condition": { "type": "in_biome", "biomes": ["beach", "desert"] },
+        "rule": {
+          "type": "condition",
+          "condition": { "type": "depth_at_most", "depth": 4 },
+          "rule": { "type": "block", "block": "minecraft:sand" }
+        }
+      },
+      {
+        "type": "condition",
+        "condition": { "type": "in_biome", "biomes": ["snowy_plains"] },
+        "rule": {
+          "type": "sequence",
+          "rules": [
+            {
+              "type": "condition",
+              "condition": { "type": "at_surface" },
+              "rule": { "type": "block", "block": "minecraft:snow_block" }
+            },
+            {
+              "type": "condition",
+              "condition": { "type": "depth_at_most", "depth": 4 },
+              "rule": { "type": "block", "block": "minecraft:dirt" }
+            }
+          ]
+        }
+      },
+      {
+        "type": "condition",
+        "condition": { "type": "in_biome", "biomes": ["stony_peaks"] },
+        "rule": {
+          "type": "sequence",
+          "rules": [
+            {
+              "type": "condition",
+              "condition": { "type": "above_y", "value": 100 },
+              "rule": { "type": "block", "block": "minecraft:stone" }
+            },
+            {
+              "type": "condition",
+              "condition": { "type": "at_surface" },
+              "rule": { "type": "block", "block": "minecraft:grass_block" }
+            },
+            {
+              "type": "condition",
+              "condition": { "type": "depth_at_most", "depth": 4 },
+              "rule": { "type": "block", "block": "minecraft:dirt" }
+            }
+          ]
+        }
+      },
+      {
+        "type": "condition",
+        "condition": { "type": "above_water" },
+        "rule": {
+          "type": "sequence",
+          "rules": [
+            {
+              "type": "condition",
+              "condition": { "type": "at_surface" },
+              "rule": { "type": "block", "block": "minecraft:grass_block" }
+            },
+            {
+              "type": "condition",
+              "condition": { "type": "depth_at_most", "depth": 4 },
+              "rule": { "type": "block", "block": "minecraft:dirt" }
+            }
+          ]
+        }
+      }
+    ]
   }
 }

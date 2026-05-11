@@ -632,7 +632,7 @@ where
     for cx in (chunk_x - view_distance)..=(chunk_x + view_distance) {
         for cz in (chunk_z - view_distance)..=(chunk_z + view_distance) {
             worldgen.ensure_generated(world, cx, cz);
-            send_chunk_from_world(write, compression, cipher_enc, world, cx, cz).await?;
+            send_chunk_from_world(write, compression, cipher_enc, world, &*worldgen, cx, cz).await?;
             loaded_chunks.insert((cx, cz));
             batch_count += 1;
         }
@@ -828,7 +828,7 @@ where
 
                 for &(cx, cz) in &to_send {
                     worldgen.ensure_generated(world, cx, cz);
-                    send_chunk_from_world(write, compression, cipher_enc, world, cx, cz).await?;
+                    send_chunk_from_world(write, compression, cipher_enc, world, &*worldgen, cx, cz).await?;
                     sent_to_client.insert((cx, cz));
                 }
 
@@ -1467,7 +1467,7 @@ async fn update_loaded_chunks<W: AsyncWrite + Unpin + Send>(
 
         for (cx, cz) in &immediate {
             worldgen.ensure_generated(world, *cx, *cz);
-            send_chunk_from_world(write, compression, cipher, world, *cx, *cz).await?;
+            send_chunk_from_world(write, compression, cipher, world, worldgen, *cx, *cz).await?;
             loaded_chunks.insert((*cx, *cz));
             sent_to_client.insert((*cx, *cz));
         }
@@ -1586,16 +1586,23 @@ fn ensure_sky_light(world: &World, cx: i32, cz: i32) {
 
 /// Send a chunk read from the World in MC 1.21.5+ wire format.
 /// Reads actual block state from the engine World, so edits persist.
+///
+/// `worldgen` supplies the biome registry ID for the chunk (Stage 4b ships
+/// one biome per chunk, encoded as a single-valued biome paletted container
+/// in every section).
 async fn send_chunk_from_world<W: AsyncWrite + Unpin + Send>(
     write: &mut W,
     compression: Option<u32>,
     cipher: &mut Option<azalea_crypto::Aes128CfbEnc>,
     world: &World,
+    worldgen: &dyn WorldGen,
     cx: i32,
     cz: i32,
 ) -> Result<()> {
     use ultimate_engine::world::block::BlockId;
     use ultimate_engine::world::position::ChunkPos;
+
+    let biome_id = worldgen.biome_at(cx, cz);
 
     let total_sections = 24;
     let min_y: i64 = -64;
@@ -1618,7 +1625,7 @@ async fn send_chunk_from_world<W: AsyncWrite + Unpin + Send>(
         // HashMap is by definition all-air and can be sent without scanning.
         let section_opt = chunk_ref.as_ref().and_then(|c| c.section(engine_section_idx));
         let Some(section) = section_opt else {
-            write_empty_section(&mut section_data)?;
+            write_empty_section(&mut section_data, biome_id)?;
             continue;
         };
 
@@ -1649,12 +1656,12 @@ async fn send_chunk_from_world<W: AsyncWrite + Unpin + Send>(
 
         if all_same {
             if first == BlockId::AIR {
-                write_empty_section(&mut section_data)?;
+                write_empty_section(&mut section_data, biome_id)?;
             } else {
-                write_single_section(&mut section_data, first.0 as u32)?;
+                write_single_section(&mut section_data, first.0 as u32, biome_id)?;
             }
         } else {
-            write_section_from_blocks(&mut section_data, blocks, non_air)?;
+            write_section_from_blocks(&mut section_data, blocks, non_air, biome_id)?;
         }
     }
     drop(chunk_ref);
@@ -1830,6 +1837,7 @@ fn write_section_from_blocks(
     buf: &mut Vec<u8>,
     blocks_in: &[ultimate_engine::world::block::BlockId; 4096],
     non_air_count: u16,
+    biome_id: u32,
 ) -> Result<()> {
     use azalea_buf::AzaleaWriteVar;
 
@@ -1881,9 +1889,9 @@ fn write_section_from_blocks(
         long_val.azalea_write(buf)?;
     }
 
-    // Biomes: single-valued (plains = 0).
+    // Biomes: single-valued palette = whichever biome this section sits in.
     0u8.azalea_write(buf)?;
-    0u32.azalea_write_var(buf)?;
+    biome_id.azalea_write_var(buf)?;
 
     Ok(())
 }
@@ -1891,19 +1899,17 @@ fn write_section_from_blocks(
 /// Write a single-valued non-air chunk section (all blocks the same).
 ///
 /// 1.21.5+ format: no VarInt data_length for paletted containers.
-fn write_single_section(buf: &mut Vec<u8>, block_state_id: u32) -> Result<()> {
+fn write_single_section(buf: &mut Vec<u8>, block_state_id: u32, biome_id: u32) -> Result<()> {
     use azalea_buf::AzaleaWriteVar;
 
     // Block count (i16)
     4096i16.azalea_write(buf)?;
     // Block states: single-valued palette (bpe=0, value, NO data array)
-    0u8.azalea_write(buf)?;                    // bits_per_entry = 0
-    block_state_id.azalea_write_var(buf)?;     // palette value
-    // No data array length or data for single-valued (1.21.5+)
-    // Biomes: single-valued (plains = 0)
     0u8.azalea_write(buf)?;
-    0u32.azalea_write_var(buf)?;
-    // No data array for biomes either
+    block_state_id.azalea_write_var(buf)?;
+    // Biomes: single-valued palette = `biome_id`.
+    0u8.azalea_write(buf)?;
+    biome_id.azalea_write_var(buf)?;
 
     Ok(())
 }
@@ -1911,19 +1917,17 @@ fn write_single_section(buf: &mut Vec<u8>, block_state_id: u32) -> Result<()> {
 /// Write an empty (all-air) chunk section to the buffer.
 ///
 /// 1.21.5+ format: no VarInt data_length for paletted containers.
-fn write_empty_section(buf: &mut Vec<u8>) -> Result<()> {
+fn write_empty_section(buf: &mut Vec<u8>, biome_id: u32) -> Result<()> {
     use azalea_buf::AzaleaWriteVar;
 
     // Block count: 0 (no non-air blocks)
     0i16.azalea_write(buf)?;
     // Block states: single-valued palette = air (0)
-    0u8.azalea_write(buf)?;       // bits_per_entry = 0
-    0u32.azalea_write_var(buf)?;   // palette value = 0 (air)
-    // No data array (1.21.5+)
-    // Biomes: single-valued = plains (0)
     0u8.azalea_write(buf)?;
     0u32.azalea_write_var(buf)?;
-    // No data array
+    // Biomes: single-valued palette = `biome_id`.
+    0u8.azalea_write(buf)?;
+    biome_id.azalea_write_var(buf)?;
 
     Ok(())
 }

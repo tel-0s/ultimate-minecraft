@@ -1,14 +1,11 @@
-//! Pipelines compose a density function (and other layers, later) into a
-//! concrete [`WorldGen`].
+//! Pipelines compose a density function, biome source, and surface rule
+//! into a concrete [`WorldGen`].
 //!
-//! ## Stage A scope
-//!
-//! - [`DensityPipeline`] — walks each column top-down through a density
-//!   function to find the surface, then stratifies with a fixed
-//!   bedrock / stone / dirt / grass / sand / water stack. Stage B will
-//!   replace the fixed stratification with a composable surface-rule tree.
+//! - [`DensityPipeline`] — walks each column for the surface Y, asks the
+//!   [`BiomeSource`] for the column's biome, then walks the surface band
+//!   top-down letting the [`SurfaceRule`] tree choose every block.
 //! - [`FlatPipeline`] — superflat preset: bedrock floor + a stack of fixed
-//!   layers per column. No noise sampling, instant generation.
+//!   layers per column, with a single biome. No noise sampling.
 
 use std::sync::Arc;
 
@@ -18,34 +15,44 @@ use ultimate_engine::world::position::LocalBlockPos;
 
 use crate::block;
 use super::WorldGen;
+use super::biome::Biome;
+use super::climate::BiomeSource;
 use super::density::DensityFunction;
+use super::surface::{SurfaceContext, SurfaceRule};
 
-/// Stage-A density-function pipeline. Hand-rolled stratification; Stage B
-/// will replace the `if`-cascade with a composable `SurfaceRule` tree.
+/// Density-function pipeline with composable biomes + surface rules.
+///
+/// Generation per chunk:
+/// 1. For each column `(x, z)`: find `surface_y` from the density function
+///    (heightmap shortcut when available, otherwise a column scan).
+/// 2. Ask `biome_source` for the column's biome.
+/// 3. Walk `bedrock_y..=surface_y`, placing:
+///    - `BEDROCK` at `bedrock_y`,
+///    - stone bulk up to `surface_y - skin_depth`,
+///    - `surface_rule.try_apply(...)` from the skin band up through the
+///      surface block (falls back to stone if no rule fires),
+///    - water from `surface_y + 1` up to `sea_level` for submerged columns.
 pub struct DensityPipeline {
     pub density: Arc<dyn DensityFunction>,
     /// If the preset's density was structurally `height(x,z) - y_index`
     /// with `height` y-independent, this holds the compiled height field.
     /// `surface_y` then samples it once per column instead of walking up
-    /// to ~384 y values — the difference between sub-second pregeneration
-    /// and tens-of-minutes hangs.
+    /// to ~384 y values.
     pub heightmap_shortcut: Option<Arc<dyn DensityFunction>>,
+    pub biome_source: Arc<dyn BiomeSource>,
+    pub surface_rule: Arc<dyn SurfaceRule>,
     pub sea_level: i64,
     pub min_y: i64,
     pub max_y: i64,
     pub bedrock_y: i64,
-    pub dirt_depth: i64,
-    pub beach_band: i64,
+    /// Depth of the surface band (skin) over which the `surface_rule` runs.
+    /// Below this is stone; above the surface is water (or air) regardless
+    /// of rule.
+    pub skin_depth: i64,
 }
 
 impl DensityPipeline {
-    /// Find the surface Y for column `(x, z)`.
-    ///
-    /// Fast path: if the density was structurally `height(x,z) - y_index`,
-    /// the surface is exactly `floor(height(x,z))`. One density evaluation.
-    ///
-    /// Slow path (true 3D density, e.g. with caves): walk the column
-    /// top-down looking for the first y where density crosses positive.
+    /// Find the surface Y for column `(x, z)`. See struct doc for paths.
     fn surface_y(&self, x: i64, z: i64) -> i64 {
         if let Some(h) = &self.heightmap_shortcut {
             let raw = h.sample(x, 0, z).floor() as i64;
@@ -71,6 +78,7 @@ impl WorldGen for DensityPipeline {
                 let wx = base_x + lx as i64;
                 let wz = base_z + lz as i64;
                 let surface = self.surface_y(wx, wz);
+                let biome = self.biome_source.sample(wx, wz, surface, self.sea_level);
 
                 // Bedrock floor.
                 chunk.set_block(
@@ -78,40 +86,24 @@ impl WorldGen for DensityPipeline {
                     block::BEDROCK,
                 );
 
-                // Stone bulk up to where the dirt skin starts.
-                let dirt_top = surface;
-                let dirt_bottom = (surface - self.dirt_depth).max(self.bedrock_y + 1);
-                for y in (self.bedrock_y + 1)..dirt_bottom {
+                // Stone bulk up to where the surface skin starts.
+                let skin_bottom = (surface - self.skin_depth).max(self.bedrock_y + 1);
+                for y in (self.bedrock_y + 1)..skin_bottom {
                     chunk.set_block(LocalBlockPos { x: lx, y, z: lz }, block::STONE);
                 }
 
-                // Skin band: dirt normally, sand near the waterline.
-                let skin = if surface <= self.sea_level + self.beach_band
-                    && surface >= self.sea_level - self.beach_band
-                {
-                    block::SAND
-                } else {
-                    block::DIRT
-                };
-                for y in dirt_bottom..dirt_top {
-                    chunk.set_block(LocalBlockPos { x: lx, y, z: lz }, skin);
+                // Surface skin: walk through the rule tree. Anything the
+                // rule declines to place falls back to stone (a sensible
+                // "nothing more specific" default for sub-surface fill).
+                for y in skin_bottom..=surface {
+                    let ctx = SurfaceContext {
+                        biome, x: wx, y, z: wz, surface_y: surface, sea_level: self.sea_level,
+                    };
+                    let b = self.surface_rule.try_apply(&ctx).unwrap_or(block::STONE);
+                    chunk.set_block(LocalBlockPos { x: lx, y, z: lz }, b);
                 }
 
-                // Top block.
-                let top = if surface < self.sea_level {
-                    if self.sea_level - surface <= self.beach_band {
-                        block::SAND
-                    } else {
-                        block::DIRT
-                    }
-                } else if surface <= self.sea_level + self.beach_band {
-                    block::SAND
-                } else {
-                    block::GRASS_BLOCK
-                };
-                chunk.set_block(LocalBlockPos { x: lx, y: surface, z: lz }, top);
-
-                // Water from surface+1 up to sea level (only for sub-sea columns).
+                // Water from surface+1 up to sea level (submerged columns).
                 if surface < self.sea_level {
                     for y in (surface + 1)..=self.sea_level {
                         chunk.set_block(LocalBlockPos { x: lx, y, z: lz }, block::WATER);
@@ -127,6 +119,15 @@ impl WorldGen for DensityPipeline {
         let surface = self.surface_y(x, z);
         (surface.max(self.sea_level) + 1) as f64 + 0.001
     }
+
+    fn biome_at(&self, cx: i32, cz: i32) -> u32 {
+        // Sample the biome at the centre column of the chunk. Stage 4b
+        // ships one biome per chunk; per-(4×4×4) cells come later.
+        let wx = cx as i64 * 16 + 8;
+        let wz = cz as i64 * 16 + 8;
+        let surface = self.surface_y(wx, wz);
+        self.biome_source.sample(wx, wz, surface, self.sea_level).registry_id()
+    }
 }
 
 /// Superflat pipeline: bedrock + a fixed stack of layers per column.
@@ -135,6 +136,7 @@ pub struct FlatPipeline {
     pub min_y: i64,
     /// `(block, count)` pairs, stacked upward from `min_y`.
     pub layers: Vec<(BlockId, i64)>,
+    pub biome: Biome,
 }
 
 impl WorldGen for FlatPipeline {
@@ -158,12 +160,18 @@ impl WorldGen for FlatPipeline {
         let total_height: i64 = self.layers.iter().map(|(_, c)| c).sum();
         (self.min_y + total_height) as f64 + 0.001
     }
+
+    fn biome_at(&self, _cx: i32, _cz: i32) -> u32 {
+        self.biome.registry_id()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::climate::FixedBiomeSource;
     use super::super::density::DensityFnSchema;
+    use super::super::surface::SurfaceRuleSchema;
 
     fn flat_density(height: i64) -> Arc<dyn DensityFunction> {
         DensityFnSchema::Sub {
@@ -172,48 +180,59 @@ mod tests {
         }.build(0)
     }
 
+    /// Surface rule: grass on top, dirt in skin, fall through (stone).
+    fn vanilla_ish_rule() -> Arc<dyn SurfaceRule> {
+        SurfaceRuleSchema::Sequence {
+            rules: vec![
+                SurfaceRuleSchema::Condition {
+                    condition: super::super::surface::ConditionSchema::AtSurface,
+                    rule: Box::new(SurfaceRuleSchema::Block { block: "minecraft:grass_block".into() }),
+                },
+                SurfaceRuleSchema::Condition {
+                    condition: super::super::surface::ConditionSchema::DepthAtMost { depth: 4 },
+                    rule: Box::new(SurfaceRuleSchema::Block { block: "minecraft:dirt".into() }),
+                },
+            ],
+        }.build().unwrap()
+    }
+
+    fn pipe_with(density: Arc<dyn DensityFunction>) -> DensityPipeline {
+        DensityPipeline {
+            density,
+            heightmap_shortcut: None,
+            biome_source: Arc::new(FixedBiomeSource(Biome::Plains)),
+            surface_rule: vanilla_ish_rule(),
+            sea_level: 63, min_y: -64, max_y: 319, bedrock_y: 0,
+            skin_depth: 4,
+        }
+    }
+
     #[test]
     fn density_pipeline_finds_constant_surface() {
-        let pipe = DensityPipeline {
-            density: flat_density(70),
-            heightmap_shortcut: None,  // exercise the column-scan path
-            sea_level: 63, min_y: -64, max_y: 319, bedrock_y: 0,
-            dirt_depth: 4, beach_band: 2,
-        };
+        let pipe = pipe_with(flat_density(70));
         assert_eq!(pipe.surface_y(0, 0), 70);
         assert_eq!(pipe.surface_y(123, -456), 70);
     }
 
     #[test]
-    fn density_pipeline_stratifies_correctly() {
-        let pipe = DensityPipeline {
-            density: flat_density(70),
-            heightmap_shortcut: None,
-            sea_level: 63, min_y: -64, max_y: 319, bedrock_y: 0,
-            dirt_depth: 4, beach_band: 2,
-        };
+    fn density_pipeline_stratifies_via_surface_rule() {
+        let pipe = pipe_with(flat_density(70));
         let chunk = pipe.generate_chunk(0, 0);
-        // y=0: bedrock
+        // y=0: bedrock floor
         assert_eq!(chunk.get_block(LocalBlockPos { x: 8, y: 0, z: 8 }), block::BEDROCK);
-        // y=1..65: stone (70 - 4 = 66 is dirt_bottom; stone is 1..65)
+        // y=50: deep stone
         assert_eq!(chunk.get_block(LocalBlockPos { x: 8, y: 50, z: 8 }), block::STONE);
-        // y=66..69: dirt skin (surface is 70 → grass; surface is above sea+beach, so skin = DIRT)
+        // y=68: skin band — the DepthAtMost(4) rule fires → dirt
         assert_eq!(chunk.get_block(LocalBlockPos { x: 8, y: 68, z: 8 }), block::DIRT);
-        // y=70: grass (surface > sea + beach)
+        // y=70: AtSurface rule fires → grass
         assert_eq!(chunk.get_block(LocalBlockPos { x: 8, y: 70, z: 8 }), block::GRASS_BLOCK);
-        // y=71: air (no block written)
+        // y=71: above surface, no block placed
         assert_eq!(chunk.get_block(LocalBlockPos { x: 8, y: 71, z: 8 }), BlockId::AIR);
     }
 
     #[test]
     fn density_pipeline_underwater_fills_with_water() {
-        // Surface below sea level → water from surface+1 up to sea_level.
-        let pipe = DensityPipeline {
-            density: flat_density(50),
-            heightmap_shortcut: None,
-            sea_level: 63, min_y: -64, max_y: 319, bedrock_y: 0,
-            dirt_depth: 4, beach_band: 2,
-        };
+        let pipe = pipe_with(flat_density(50));
         let chunk = pipe.generate_chunk(0, 0);
         assert_eq!(chunk.get_block(LocalBlockPos { x: 0, y: 51, z: 0 }), block::WATER);
         assert_eq!(chunk.get_block(LocalBlockPos { x: 0, y: 63, z: 0 }), block::WATER);
@@ -223,8 +242,6 @@ mod tests {
 
     #[test]
     fn heightmap_shortcut_matches_column_scan() {
-        // Build the same density both ways: with and without the
-        // shortcut. The surface_y output must agree.
         let h_schema = DensityFnSchema::Add {
             argument1: Box::new(DensityFnSchema::Constant { value: 75.0 }),
             argument2: Box::new(DensityFnSchema::Mul {
@@ -240,18 +257,10 @@ mod tests {
             argument2: Box::new(DensityFnSchema::YIndex),
         };
 
-        let with_shortcut = DensityPipeline {
-            density: full_schema.build(7),
-            heightmap_shortcut: Some(h_schema.build(7)),
-            sea_level: 63, min_y: -64, max_y: 319, bedrock_y: 0,
-            dirt_depth: 4, beach_band: 2,
-        };
-        let without_shortcut = DensityPipeline {
-            density: full_schema.build(7),
-            heightmap_shortcut: None,
-            sea_level: 63, min_y: -64, max_y: 319, bedrock_y: 0,
-            dirt_depth: 4, beach_band: 2,
-        };
+        let mut with_shortcut = pipe_with(full_schema.build(7));
+        with_shortcut.heightmap_shortcut = Some(h_schema.build(7));
+        let without_shortcut = pipe_with(full_schema.build(7));
+
         for x in -20..20i64 {
             for z in -20..20i64 {
                 let a = with_shortcut.surface_y(x, z);
@@ -259,6 +268,13 @@ mod tests {
                 assert_eq!(a, b, "shortcut/scan disagree at ({},{})", x, z);
             }
         }
+    }
+
+    #[test]
+    fn biome_at_uses_biome_source() {
+        let mut pipe = pipe_with(flat_density(70));
+        pipe.biome_source = Arc::new(FixedBiomeSource(Biome::Desert));
+        assert_eq!(pipe.biome_at(0, 0), Biome::Desert.registry_id());
     }
 
     #[test]
@@ -271,6 +287,7 @@ mod tests {
                 (block::DIRT, 2),
                 (block::GRASS_BLOCK, 1),
             ],
+            biome: Biome::Plains,
         };
         let chunk = pipe.generate_chunk(0, 0);
         assert_eq!(chunk.get_block(LocalBlockPos { x: 8, y: 0, z: 8 }), block::BEDROCK);
@@ -280,5 +297,6 @@ mod tests {
         assert_eq!(chunk.get_block(LocalBlockPos { x: 8, y: 7, z: 8 }), block::DIRT);
         assert_eq!(chunk.get_block(LocalBlockPos { x: 8, y: 8, z: 8 }), block::GRASS_BLOCK);
         assert_eq!(chunk.get_block(LocalBlockPos { x: 8, y: 9, z: 8 }), BlockId::AIR);
+        assert_eq!(pipe.biome_at(0, 0), Biome::Plains.registry_id());
     }
 }

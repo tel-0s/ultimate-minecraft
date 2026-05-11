@@ -1,6 +1,7 @@
 {
   "kind": "flat",
   "min_y": 0,
+  "biome": "plains",
   "layers": [
     { "block": "minecraft:bedrock",     "height": 1  },
     { "block": "minecraft:stone",       "height": 62 },

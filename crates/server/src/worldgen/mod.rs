@@ -14,9 +14,12 @@
 //! - **4d**: 3D-noise carvers (caves, ravines) + decorators (trees, ores,
 //!   features).
 
+pub mod biome;
+pub mod climate;
 pub mod density;
 pub mod pipeline;
 pub mod preset;
+pub mod surface;
 
 use ultimate_engine::world::World;
 use ultimate_engine::world::chunk::Chunk;
@@ -33,6 +36,14 @@ pub trait WorldGen: Send + Sync + 'static {
     /// position. Generators that have a sea level or surface height should
     /// return the surface for that column.
     fn spawn_y(&self, x: i64, z: i64) -> f64;
+
+    /// Wire ID of the biome covering chunk `(cx, cz)`. Indexes into the
+    /// `worldgen/biome` registry the server sent during configuration —
+    /// see `worldgen::biome::Biome::registry_id`. Default: 0
+    /// (`minecraft:badlands`); implementations should override.
+    fn biome_at(&self, _cx: i32, _cz: i32) -> u32 {
+        0
+    }
 
     /// Pre-generate every chunk inside a radius around the world origin.
     /// Used at server startup so the spawn region is immediate.
