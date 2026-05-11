@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use crate::block;
 use super::WorldGen;
 use super::biome::Biome;
+use super::carver::CarverSchema;
 use super::climate::BiomeSourceSchema;
 use super::density::DensityFnSchema;
 use super::pipeline::{DensityPipeline, FlatPipeline};
@@ -64,6 +65,10 @@ pub struct DensityPresetSchema {
     pub density: DensityFnSchema,
     pub biome_source: BiomeSourceSchema,
     pub surface_rule: SurfaceRuleSchema,
+    /// Carvers run in declared order after the heightmap stratification.
+    /// Empty/omitted → solid terrain (no caves). See `worldgen::carver`.
+    #[serde(default)]
+    pub carvers: Vec<CarverSchema>,
 }
 
 fn default_skin_depth() -> i64 { 4 }
@@ -113,11 +118,15 @@ impl PresetSchema {
                 let density = d.density.build(seed);
                 let biome_source = d.biome_source.build(seed);
                 let surface_rule = d.surface_rule.build()?;
+                let carvers = d.carvers.iter()
+                    .map(|c| c.build(seed))
+                    .collect::<Result<Vec<_>>>()?;
                 Ok(Arc::new(DensityPipeline {
                     density,
                     heightmap_shortcut,
                     biome_source,
                     surface_rule,
+                    carvers,
                     sea_level: d.sea_level,
                     min_y: d.min_y,
                     max_y: d.max_y,
@@ -200,6 +209,46 @@ mod tests {
             "layers": [{"block": "minecraft:not_a_real_block", "height": 1}]}"#;
         let schema: PresetSchema = serde_json::from_str(json).unwrap();
         assert!(schema.build(0).is_err());
+    }
+
+    #[test]
+    fn noise_preset_carvers_actually_carve() {
+        // Regression: the previous default threshold of 0.55 was higher
+        // than the noise crate's FBM ever produced for our parameters
+        // (peaks around ±0.73), so the carver fired on <0.3% of cells —
+        // effectively no visible caves in-game. Assert the default produces
+        // a meaningful number of air cells inside the carver range across
+        // a small chunk patch.
+        use ultimate_engine::world::block::BlockId;
+        use ultimate_engine::world::position::LocalBlockPos;
+        let w = load("noise", 0xC0FFEE).unwrap();
+        let mut air_in_range = 0usize;
+        // Probe a 4x4 chunk patch (64 chunks worth of cells if we sampled
+        // every block; we sample sparsely to keep the test fast).
+        for cx in -2..2i32 {
+            for cz in -2..2i32 {
+                let chunk = w.generate_chunk(cx, cz);
+                // y=-30..40 is inside the carver range (-56..55) AND
+                // typically below the surface (~70-90), so any AIR we
+                // find here is from carving, not from "above-surface".
+                for lx in 0..16u8 {
+                    for lz in 0..16u8 {
+                        for y in -30..=40i64 {
+                            if chunk.get_block(LocalBlockPos { x: lx, y, z: lz }) == BlockId::AIR {
+                                air_in_range += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 4*4*16*16 columns × 71 y values = 1,163,264 cells inspected.
+        // At ~3% carved we expect ~35K air cells; sanity-check at least 5K.
+        assert!(
+            air_in_range > 5000,
+            "default carver only produced {} air cells in 4x4 chunk patch — caves probably aren't generating",
+            air_in_range,
+        );
     }
 
     #[test]

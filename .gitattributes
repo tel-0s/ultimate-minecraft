@@ -1,0 +1,19 @@
+# Normalize line endings in the repository to LF, but let git check out
+# whatever's native to each platform. Suppresses the LF→CRLF warning spam
+# every Windows git command otherwise emits.
+* text=auto eol=lf
+
+# Always-LF: source and config files that may be read by tools sensitive
+# to line endings (rustfmt, serde JSON parsers expect either but
+# diffing/blame is cleaner with one canonical form).
+*.rs       text eol=lf
+*.toml     text eol=lf
+*.md       text eol=lf
+*.json     text eol=lf
+*.yaml     text eol=lf
+*.yml      text eol=lf
+*.lock     text eol=lf
+
+# Binary — don't munge.
+*.png      binary
+*.mca      binary

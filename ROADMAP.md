@@ -161,15 +161,15 @@ causality is the only ordering.
 - [x] `DensityPipeline` consumes biome + surface rule per column. The previous
       hand-rolled stratification is now a default `surface_rule` in the preset
       JSON.
-- [x] Chunk packet sends per-chunk biome (single-valued biome paletted
-      container per section). Per-(4×4×4) cell biome data for smooth
-      transitions: TODO.
+- [x] Chunk packet sends biomes per **4×4×4 cell** via indirect biome
+      paletted containers. Single-valued fast path when all 64 cells share a
+      biome; otherwise indirect palette with `ceil(log2(palette_len))` bits
+      per entry. Biome edges now fall on 4-block boundaries instead of
+      16-block chunk borders.
 - [x] Built-in `noise` preset + `presets/amplified.json` updated with
       multi-noise biomes and per-biome surface rules.
 - [ ] Per-biome height profiles (climate-driven density adjustment — currently
       all biomes share the same height field). Comes with multi-noise climate.
-- [ ] Per-(4×4×4) cell biome data in the chunk packet for smooth biome
-      transitions at sub-chunk scale.
 
 ### 4c -- Multi-noise climate + per-biome height profiles
 - [ ] Continentalness, erosion, peaks-and-valleys noise fields
@@ -178,9 +178,24 @@ causality is the only ordering.
 - [ ] Expand biome set toward vanilla coverage.
 
 ### 4d -- Caves & ores
-- [ ] 3D-noise / worley cave carving (cheese caves + spaghetti tunnels)
-- [ ] Aquifers (water-filled cave regions)
-- [ ] Ore distribution by depth (coal / iron / diamond bands)
+- [x] **Carver framework** (`worldgen::carver`): `Carver` trait + JSON
+      schema (`carvers: [...]` array at the preset level). Carvers run as
+      a post-pass after heightmap stratification, mutating the chunk in
+      place. They skip bedrock, water, and air so the world floor stays
+      solid, oceans don't drain, and air cells aren't re-processed.
+      Architectural choice: keeping caves as a post-pass (rather than
+      baking 3D noise into the main density function) preserves the
+      heightmap shortcut.
+- [x] **NoiseCarver**: 3D-noise density + threshold + y-range. Cheese
+      caves out of the box; spaghetti tunnels / ravines come with more
+      specialised density-function compositions.
+- [x] Default `noise` preset ships a single cheese-cave carver
+      (`seed_offset: 500`, frequency 0.035, threshold 0.55,
+      y ∈ [-56, 55]).
+- [ ] Worley/cellular noise atom for vanilla-style spaghetti tunnels.
+- [ ] Aquifers (water-filled cave regions).
+- [ ] Ore distribution by depth (coal / iron / diamond bands) — likely
+      a separate "ore decorator" pass, not a carver.
 
 ### 4e -- Decorators & structures
 - [ ] Trees (oak, birch, jungle, spruce, dark oak, acacia, mangrove, cherry)

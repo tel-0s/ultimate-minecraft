@@ -15,6 +15,7 @@
 //!   features).
 
 pub mod biome;
+pub mod carver;
 pub mod climate;
 pub mod density;
 pub mod pipeline;
@@ -43,6 +44,18 @@ pub trait WorldGen: Send + Sync + 'static {
     /// (`minecraft:badlands`); implementations should override.
     fn biome_at(&self, _cx: i32, _cz: i32) -> u32 {
         0
+    }
+
+    /// Wire ID of the biome at a specific 4×4×4 cell within a section.
+    /// World coordinates `(x, y, z)` are the *block* coordinates of the
+    /// cell's anchor (typically the cell's centre block). Default
+    /// implementation falls back to per-chunk biome assignment; the noise
+    /// pipeline overrides this so biome edges fall on 4-block boundaries
+    /// rather than 16-block chunk boundaries.
+    fn biome_at_cell(&self, x: i64, _y: i64, z: i64) -> u32 {
+        let cx = (x.div_euclid(16)) as i32;
+        let cz = (z.div_euclid(16)) as i32;
+        self.biome_at(cx, cz)
     }
 
     /// Pre-generate every chunk inside a radius around the world origin.

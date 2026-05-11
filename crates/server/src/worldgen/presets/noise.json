@@ -76,6 +76,23 @@
     }
   },
 
+  "carvers": [
+    {
+      "type": "noise",
+      "min_y": -56,
+      "max_y": 55,
+      "threshold": 0.30,
+      "density": {
+        "type": "noise3d",
+        "seed_offset": 500,
+        "frequency": 0.035,
+        "octaves": 3,
+        "persistence": 0.5,
+        "lacunarity": 2.0
+      }
+    }
+  ],
+
   "surface_rule": {
     "type": "sequence",
     "rules": [

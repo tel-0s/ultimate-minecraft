@@ -16,6 +16,7 @@ use ultimate_engine::world::position::LocalBlockPos;
 use crate::block;
 use super::WorldGen;
 use super::biome::Biome;
+use super::carver::Carver;
 use super::climate::BiomeSource;
 use super::density::DensityFunction;
 use super::surface::{SurfaceContext, SurfaceRule};
@@ -41,6 +42,10 @@ pub struct DensityPipeline {
     pub heightmap_shortcut: Option<Arc<dyn DensityFunction>>,
     pub biome_source: Arc<dyn BiomeSource>,
     pub surface_rule: Arc<dyn SurfaceRule>,
+    /// Carvers run in order *after* the heightmap stratification, each
+    /// mutating the chunk in place. The most common kind is `NoiseCarver`
+    /// (a 3D-noise mask + threshold).
+    pub carvers: Vec<Arc<dyn Carver>>,
     pub sea_level: i64,
     pub min_y: i64,
     pub max_y: i64,
@@ -112,6 +117,13 @@ impl WorldGen for DensityPipeline {
             }
         }
 
+        // Carve passes (caves, ravines, ...). Each carver mutates the chunk
+        // in place, skipping bedrock / water / air so we never break the
+        // world floor or drain the oceans.
+        for carver in &self.carvers {
+            carver.carve(&mut chunk, cx, cz);
+        }
+
         chunk
     }
 
@@ -121,12 +133,21 @@ impl WorldGen for DensityPipeline {
     }
 
     fn biome_at(&self, cx: i32, cz: i32) -> u32 {
-        // Sample the biome at the centre column of the chunk. Stage 4b
-        // ships one biome per chunk; per-(4×4×4) cells come later.
+        // Convenience: sample at the centre column. The chunk packet
+        // doesn't actually use this — it goes through `biome_at_cell`
+        // for per-(4×4×4) granularity — but it satisfies the
+        // single-biome convenience accessor.
         let wx = cx as i64 * 16 + 8;
         let wz = cz as i64 * 16 + 8;
         let surface = self.surface_y(wx, wz);
         self.biome_source.sample(wx, wz, surface, self.sea_level).registry_id()
+    }
+
+    fn biome_at_cell(&self, x: i64, _y: i64, z: i64) -> u32 {
+        // Biome assignment depends on (x, z) and the column's surface_y,
+        // not directly on y, so the sample column anchors the result.
+        let surface = self.surface_y(x, z);
+        self.biome_source.sample(x, z, surface, self.sea_level).registry_id()
     }
 }
 
@@ -162,6 +183,10 @@ impl WorldGen for FlatPipeline {
     }
 
     fn biome_at(&self, _cx: i32, _cz: i32) -> u32 {
+        self.biome.registry_id()
+    }
+
+    fn biome_at_cell(&self, _x: i64, _y: i64, _z: i64) -> u32 {
         self.biome.registry_id()
     }
 }
@@ -202,6 +227,7 @@ mod tests {
             heightmap_shortcut: None,
             biome_source: Arc::new(FixedBiomeSource(Biome::Plains)),
             surface_rule: vanilla_ish_rule(),
+            carvers: Vec::new(),
             sea_level: 63, min_y: -64, max_y: 319, bedrock_y: 0,
             skin_depth: 4,
         }
@@ -275,6 +301,33 @@ mod tests {
         let mut pipe = pipe_with(flat_density(70));
         pipe.biome_source = Arc::new(FixedBiomeSource(Biome::Desert));
         assert_eq!(pipe.biome_at(0, 0), Biome::Desert.registry_id());
+    }
+
+    #[test]
+    fn density_pipeline_runs_carvers_after_stratification() {
+        use super::super::carver::NoiseCarver;
+
+        let mut pipe = pipe_with(flat_density(70));
+        // Carver that carves everything between y=10 and y=30.
+        let always = DensityFnSchema::Constant { value: 1.0 }.build(0);
+        pipe.carvers = vec![Arc::new(NoiseCarver {
+            density: always,
+            threshold: 0.0,
+            min_y: 10,
+            max_y: 30,
+        })];
+
+        let chunk = pipe.generate_chunk(0, 0);
+        // y=0: bedrock survives carving (carvers skip bedrock).
+        assert_eq!(chunk.get_block(LocalBlockPos { x: 0, y: 0, z: 0 }), block::BEDROCK);
+        // y=5: below carver range, stone stays.
+        assert_eq!(chunk.get_block(LocalBlockPos { x: 0, y: 5, z: 0 }), block::STONE);
+        // y=15: within carver range AND stratified as stone → carved to air.
+        assert_eq!(chunk.get_block(LocalBlockPos { x: 0, y: 15, z: 0 }), BlockId::AIR);
+        // y=50: above carver range, stone stays.
+        assert_eq!(chunk.get_block(LocalBlockPos { x: 0, y: 50, z: 0 }), block::STONE);
+        // y=70: still grass at the surface (carver range doesn't reach here).
+        assert_eq!(chunk.get_block(LocalBlockPos { x: 0, y: 70, z: 0 }), block::GRASS_BLOCK);
     }
 
     #[test]

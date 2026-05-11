@@ -651,7 +651,7 @@ where
     tracing::info!("{} joined the game at ({}, {}, {})", player_name, spawn_x, spawn_y, spawn_z);
 
     // ── Causal engine for this connection ────────────────────────────────
-    use azalea_block::{blocks as mc_blocks, BlockState, BlockTrait};
+    use azalea_block::BlockState;
     use azalea_core::direction::Direction;
     use azalea_protocol::packets::game::{
         ClientboundBlockUpdate, ClientboundBlockChangedAck,
@@ -786,11 +786,8 @@ where
     let mut player_z = spawn_z;
     let mut player_y_rot: f32 = 0.0;
     let mut player_x_rot: f32 = 0.0;
-    let mut player_on_ground = false;
-
     // Track hotbar contents and selected slot for creative placement.
     use azalea_inventory::ItemStack;
-    use azalea_registry::builtin::{BlockKind, ItemKind};
     let mut hotbar: [BlockState; 9] = [BlockState::AIR; 9];
     let mut selected_slot: usize = 0;
 
@@ -1107,10 +1104,9 @@ where
                                 player_x = pkt.pos.x;
                                 player_y = pkt.pos.y;
                                 player_z = pkt.pos.z;
-                                player_on_ground = pkt.flags.on_ground;
                                 registry.update_position(
                                     conn_id, player_x, player_y, player_z,
-                                    player_y_rot, player_x_rot, player_on_ground,
+                                    player_y_rot, player_x_rot, pkt.flags.on_ground,
                                 );
                                 update_loaded_chunks(
                                     write, compression, cipher_enc, world,
@@ -1127,10 +1123,9 @@ where
                                 player_z = pkt.pos.z;
                                 player_y_rot = pkt.look_direction.y_rot();
                                 player_x_rot = pkt.look_direction.x_rot();
-                                player_on_ground = pkt.flags.on_ground;
                                 registry.update_position(
                                     conn_id, player_x, player_y, player_z,
-                                    player_y_rot, player_x_rot, player_on_ground,
+                                    player_y_rot, player_x_rot, pkt.flags.on_ground,
                                 );
                                 update_loaded_chunks(
                                     write, compression, cipher_enc, world,
@@ -1144,10 +1139,9 @@ where
                             ServerboundGamePacket::MovePlayerRot(pkt) => {
                                 player_y_rot = pkt.look_direction.y_rot();
                                 player_x_rot = pkt.look_direction.x_rot();
-                                player_on_ground = pkt.flags.on_ground;
                                 registry.update_position(
                                     conn_id, player_x, player_y, player_z,
-                                    player_y_rot, player_x_rot, player_on_ground,
+                                    player_y_rot, player_x_rot, pkt.flags.on_ground,
                                 );
                             }
 
@@ -1602,10 +1596,10 @@ async fn send_chunk_from_world<W: AsyncWrite + Unpin + Send>(
     use ultimate_engine::world::block::BlockId;
     use ultimate_engine::world::position::ChunkPos;
 
-    let biome_id = worldgen.biome_at(cx, cz);
-
     let total_sections = 24;
     let min_y: i64 = -64;
+    let base_x = cx as i64 * 16;
+    let base_z = cz as i64 * 16;
     let mut section_data = Vec::new();
 
     // Track the highest non-air Y for each column (for MOTION_BLOCKING heightmap).
@@ -1621,11 +1615,28 @@ async fn send_chunk_from_world<W: AsyncWrite + Unpin + Send>(
         let engine_section_idx = section_i as i32 + (min_y as i32 >> 4);
         let section_base_y = min_y + (section_i as i64) * 16;
 
+        // Per-section 4×4×4 biome cells: 64 entries, indexed
+        // y*16 + z*4 + x (matches azalea-world's PalletedContainerKind<Biome>).
+        // Sample at the centre of each cell. Our current biome sources are
+        // y-independent, but we plumb y anyway so 3D biomes (e.g.
+        // dripstone_caves vs surface) can override later.
+        let mut biomes = [0u32; 64];
+        for by in 0..4usize {
+            for bz in 0..4usize {
+                for bx in 0..4usize {
+                    let wx = base_x + (bx as i64) * 4 + 2;
+                    let wy = section_base_y + (by as i64) * 4 + 2;
+                    let wz = base_z + (bz as i64) * 4 + 2;
+                    biomes[by * 16 + bz * 4 + bx] = worldgen.biome_at_cell(wx, wy, wz);
+                }
+            }
+        }
+
         // Sparse fast path: a section that doesn't exist in the chunk's
         // HashMap is by definition all-air and can be sent without scanning.
         let section_opt = chunk_ref.as_ref().and_then(|c| c.section(engine_section_idx));
         let Some(section) = section_opt else {
-            write_empty_section(&mut section_data, biome_id)?;
+            write_empty_section(&mut section_data, &biomes)?;
             continue;
         };
 
@@ -1656,12 +1667,12 @@ async fn send_chunk_from_world<W: AsyncWrite + Unpin + Send>(
 
         if all_same {
             if first == BlockId::AIR {
-                write_empty_section(&mut section_data, biome_id)?;
+                write_empty_section(&mut section_data, &biomes)?;
             } else {
-                write_single_section(&mut section_data, first.0 as u32, biome_id)?;
+                write_single_section(&mut section_data, first.0 as u32, &biomes)?;
             }
         } else {
-            write_section_from_blocks(&mut section_data, blocks, non_air, biome_id)?;
+            write_section_from_blocks(&mut section_data, blocks, non_air, &biomes)?;
         }
     }
     drop(chunk_ref);
@@ -1837,7 +1848,7 @@ fn write_section_from_blocks(
     buf: &mut Vec<u8>,
     blocks_in: &[ultimate_engine::world::block::BlockId; 4096],
     non_air_count: u16,
-    biome_id: u32,
+    biomes: &[u32; 64],
 ) -> Result<()> {
     use azalea_buf::AzaleaWriteVar;
 
@@ -1889,9 +1900,8 @@ fn write_section_from_blocks(
         long_val.azalea_write(buf)?;
     }
 
-    // Biomes: single-valued palette = whichever biome this section sits in.
-    0u8.azalea_write(buf)?;
-    biome_id.azalea_write_var(buf)?;
+    // Biomes: per-4×4×4-cell palette (64 entries per section).
+    write_biome_container(buf, biomes)?;
 
     Ok(())
 }
@@ -1899,7 +1909,7 @@ fn write_section_from_blocks(
 /// Write a single-valued non-air chunk section (all blocks the same).
 ///
 /// 1.21.5+ format: no VarInt data_length for paletted containers.
-fn write_single_section(buf: &mut Vec<u8>, block_state_id: u32, biome_id: u32) -> Result<()> {
+fn write_single_section(buf: &mut Vec<u8>, block_state_id: u32, biomes: &[u32; 64]) -> Result<()> {
     use azalea_buf::AzaleaWriteVar;
 
     // Block count (i16)
@@ -1907,9 +1917,8 @@ fn write_single_section(buf: &mut Vec<u8>, block_state_id: u32, biome_id: u32) -
     // Block states: single-valued palette (bpe=0, value, NO data array)
     0u8.azalea_write(buf)?;
     block_state_id.azalea_write_var(buf)?;
-    // Biomes: single-valued palette = `biome_id`.
-    0u8.azalea_write(buf)?;
-    biome_id.azalea_write_var(buf)?;
+    // Biomes: per-cell.
+    write_biome_container(buf, biomes)?;
 
     Ok(())
 }
@@ -1917,7 +1926,7 @@ fn write_single_section(buf: &mut Vec<u8>, block_state_id: u32, biome_id: u32) -
 /// Write an empty (all-air) chunk section to the buffer.
 ///
 /// 1.21.5+ format: no VarInt data_length for paletted containers.
-fn write_empty_section(buf: &mut Vec<u8>, biome_id: u32) -> Result<()> {
+fn write_empty_section(buf: &mut Vec<u8>, biomes: &[u32; 64]) -> Result<()> {
     use azalea_buf::AzaleaWriteVar;
 
     // Block count: 0 (no non-air blocks)
@@ -1925,9 +1934,69 @@ fn write_empty_section(buf: &mut Vec<u8>, biome_id: u32) -> Result<()> {
     // Block states: single-valued palette = air (0)
     0u8.azalea_write(buf)?;
     0u32.azalea_write_var(buf)?;
-    // Biomes: single-valued palette = `biome_id`.
-    0u8.azalea_write(buf)?;
-    biome_id.azalea_write_var(buf)?;
+    // Biomes: per-cell.
+    write_biome_container(buf, biomes)?;
+
+    Ok(())
+}
+
+/// Encode a 64-entry biome paletted container (4×4×4 cells per section).
+///
+/// - All 64 cells share one biome → bits_per_entry=0, single VarInt palette.
+/// - Otherwise → indirect palette with ceil(log2(palette_len)) bits per
+///   entry (min 1), no length prefix on the data array (1.21.5+ format).
+///
+/// Cell index layout matches azalea-world's `PalletedContainerKind<Biome>`:
+/// `index = y * 16 + z * 4 + x` where each axis is in `0..4`.
+fn write_biome_container(buf: &mut Vec<u8>, biomes: &[u32; 64]) -> Result<()> {
+    use azalea_buf::AzaleaWriteVar;
+
+    let first = biomes[0];
+    if biomes.iter().all(|&b| b == first) {
+        // Single-valued fast path — exactly what the per-chunk biome
+        // implementation used to write.
+        0u8.azalea_write(buf)?;
+        first.azalea_write_var(buf)?;
+        return Ok(());
+    }
+
+    // Indirect palette. Build it preserving insertion order so cell
+    // indices stay deterministic across runs.
+    let mut palette: Vec<u32> = Vec::with_capacity(8);
+    let mut indices = [0u8; 64];
+    for (i, &b) in biomes.iter().enumerate() {
+        let idx = match palette.iter().position(|&v| v == b) {
+            Some(p) => p,
+            None => {
+                palette.push(b);
+                palette.len() - 1
+            }
+        };
+        indices[i] = idx as u8;
+    }
+
+    let bpe = (palette.len() as f64).log2().ceil().max(1.0) as u8;
+
+    bpe.azalea_write(buf)?;
+    (palette.len() as u32).azalea_write_var(buf)?;
+    for &id in &palette {
+        id.azalea_write_var(buf)?;
+    }
+
+    // Packed data — no VarInt length prefix (1.21.5+).
+    let values_per_long = 64 / bpe as usize;
+    let num_longs = (64 + values_per_long - 1) / values_per_long;
+    let mask = (1u64 << bpe) - 1;
+    for long_i in 0..num_longs {
+        let mut long_val: u64 = 0;
+        for vi in 0..values_per_long {
+            let cell_i = long_i * values_per_long + vi;
+            if cell_i < 64 {
+                long_val |= ((indices[cell_i] as u64) & mask) << (vi * bpe as usize);
+            }
+        }
+        long_val.azalea_write(buf)?;
+    }
 
     Ok(())
 }
