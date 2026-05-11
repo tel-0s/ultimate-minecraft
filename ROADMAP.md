@@ -192,10 +192,18 @@ causality is the only ordering.
 - [x] Default `noise` preset ships a single cheese-cave carver
       (`seed_offset: 500`, frequency 0.035, threshold 0.55,
       y ∈ [-56, 55]).
+- [x] **Decorator framework** (`worldgen::decorator`): `Decorator` trait
+      + JSON schema (`decorators: [...]` array at the preset level).
+      Decorators run after carvers, each with a deterministic per-chunk
+      PRNG (SplitMix64) seeded from `(world_seed, cx, cz, decorator_index)`.
+- [x] **Ore decorator**: random-walk vein placement with substrate
+      filter. Default `noise` preset ships coal / iron / copper / gold /
+      redstone / lapis / diamond ores at vanilla-ish frequencies and
+      Y-band distributions.
 - [ ] Worley/cellular noise atom for vanilla-style spaghetti tunnels.
 - [ ] Aquifers (water-filled cave regions).
-- [ ] Ore distribution by depth (coal / iron / diamond bands) — likely
-      a separate "ore decorator" pass, not a carver.
+- [ ] Weighted Y distributions for ores (vanilla peaks ore density at
+      specific bands rather than uniform within a range).
 
 ### 4e -- Decorators & structures
 - [ ] Trees (oak, birch, jungle, spruce, dark oak, acacia, mangrove, cherry)

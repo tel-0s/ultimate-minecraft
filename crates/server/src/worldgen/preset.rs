@@ -35,6 +35,7 @@ use super::WorldGen;
 use super::biome::Biome;
 use super::carver::CarverSchema;
 use super::climate::BiomeSourceSchema;
+use super::decorator::DecoratorSchema;
 use super::density::DensityFnSchema;
 use super::pipeline::{DensityPipeline, FlatPipeline};
 use super::surface::SurfaceRuleSchema;
@@ -69,6 +70,10 @@ pub struct DensityPresetSchema {
     /// Empty/omitted → solid terrain (no caves). See `worldgen::carver`.
     #[serde(default)]
     pub carvers: Vec<CarverSchema>,
+    /// Decorators run after carvers, scattering features per chunk.
+    /// Empty/omitted → no ores / plants / trees. See `worldgen::decorator`.
+    #[serde(default)]
+    pub decorators: Vec<DecoratorSchema>,
 }
 
 fn default_skin_depth() -> i64 { 4 }
@@ -121,12 +126,17 @@ impl PresetSchema {
                 let carvers = d.carvers.iter()
                     .map(|c| c.build(seed))
                     .collect::<Result<Vec<_>>>()?;
+                let decorators = d.decorators.iter()
+                    .map(|x| x.build())
+                    .collect::<Result<Vec<_>>>()?;
                 Ok(Arc::new(DensityPipeline {
                     density,
                     heightmap_shortcut,
                     biome_source,
                     surface_rule,
                     carvers,
+                    decorators,
+                    seed,
                     sea_level: d.sea_level,
                     min_y: d.min_y,
                     max_y: d.max_y,

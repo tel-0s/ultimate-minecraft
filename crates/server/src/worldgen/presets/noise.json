@@ -93,6 +93,72 @@
     }
   ],
 
+  "decorators": [
+    {
+      "type": "ore",
+      "block": "minecraft:coal_ore",
+      "replaces": ["minecraft:stone"],
+      "attempts_per_chunk": 20,
+      "vein_size": 14,
+      "min_y": 0,
+      "max_y": 100
+    },
+    {
+      "type": "ore",
+      "block": "minecraft:iron_ore",
+      "replaces": ["minecraft:stone"],
+      "attempts_per_chunk": 14,
+      "vein_size": 9,
+      "min_y": -32,
+      "max_y": 60
+    },
+    {
+      "type": "ore",
+      "block": "minecraft:copper_ore",
+      "replaces": ["minecraft:stone"],
+      "attempts_per_chunk": 8,
+      "vein_size": 10,
+      "min_y": 0,
+      "max_y": 55
+    },
+    {
+      "type": "ore",
+      "block": "minecraft:gold_ore",
+      "replaces": ["minecraft:stone"],
+      "attempts_per_chunk": 4,
+      "vein_size": 9,
+      "min_y": -48,
+      "max_y": 16
+    },
+    {
+      "type": "ore",
+      "block": "minecraft:redstone_ore",
+      "replaces": ["minecraft:stone"],
+      "attempts_per_chunk": 6,
+      "vein_size": 8,
+      "min_y": -56,
+      "max_y": 16
+    },
+    {
+      "type": "ore",
+      "block": "minecraft:lapis_ore",
+      "replaces": ["minecraft:stone"],
+      "attempts_per_chunk": 2,
+      "vein_size": 7,
+      "min_y": -48,
+      "max_y": 32
+    },
+    {
+      "type": "ore",
+      "block": "minecraft:diamond_ore",
+      "replaces": ["minecraft:stone"],
+      "attempts_per_chunk": 2,
+      "vein_size": 5,
+      "min_y": -56,
+      "max_y": 0
+    }
+  ],
+
   "surface_rule": {
     "type": "sequence",
     "rules": [

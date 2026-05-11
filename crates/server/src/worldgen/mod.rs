@@ -17,6 +17,7 @@
 pub mod biome;
 pub mod carver;
 pub mod climate;
+pub mod decorator;
 pub mod density;
 pub mod pipeline;
 pub mod preset;

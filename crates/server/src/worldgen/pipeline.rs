@@ -18,6 +18,7 @@ use super::WorldGen;
 use super::biome::Biome;
 use super::carver::Carver;
 use super::climate::BiomeSource;
+use super::decorator::Decorator;
 use super::density::DensityFunction;
 use super::surface::{SurfaceContext, SurfaceRule};
 
@@ -46,6 +47,12 @@ pub struct DensityPipeline {
     /// mutating the chunk in place. The most common kind is `NoiseCarver`
     /// (a 3D-noise mask + threshold).
     pub carvers: Vec<Arc<dyn Carver>>,
+    /// Decorators run after carvers, scattering features (ores, plants,
+    /// trees, structures) deterministically per-chunk.
+    pub decorators: Vec<Arc<dyn Decorator>>,
+    /// World seed, forwarded to decorators so their per-chunk PRNGs
+    /// derive from `(seed, cx, cz, decorator_index)`.
+    pub seed: u32,
     pub sea_level: i64,
     pub min_y: i64,
     pub max_y: i64,
@@ -122,6 +129,13 @@ impl WorldGen for DensityPipeline {
         // world floor or drain the oceans.
         for carver in &self.carvers {
             carver.carve(&mut chunk, cx, cz);
+        }
+
+        // Decoration passes (ores, plants, trees, structures). Each
+        // decorator's PRNG is seeded from `(seed, cx, cz, idx)` so the
+        // same chunk decorates identically across runs.
+        for (idx, decorator) in self.decorators.iter().enumerate() {
+            decorator.decorate(&mut chunk, cx, cz, self.seed, idx);
         }
 
         chunk
@@ -228,6 +242,8 @@ mod tests {
             biome_source: Arc::new(FixedBiomeSource(Biome::Plains)),
             surface_rule: vanilla_ish_rule(),
             carvers: Vec::new(),
+            decorators: Vec::new(),
+            seed: 0,
             sea_level: 63, min_y: -64, max_y: 319, bedrock_y: 0,
             skin_depth: 4,
         }
