@@ -162,11 +162,48 @@
       "log_block": "minecraft:oak_log",
       "leaves_block": "minecraft:oak_leaves",
       "surface_block": "minecraft:grass_block",
-      "attempts_per_chunk": 3,
+      "attempts_per_chunk": 2,
       "trunk_min": 4,
       "trunk_max": 6,
       "min_y": 60,
-      "max_y": 110
+      "max_y": 110,
+      "in_biomes": ["plains"]
+    },
+    {
+      "type": "tree",
+      "log_block": "minecraft:oak_log",
+      "leaves_block": "minecraft:oak_leaves",
+      "surface_block": "minecraft:grass_block",
+      "attempts_per_chunk": 8,
+      "trunk_min": 4,
+      "trunk_max": 7,
+      "min_y": 60,
+      "max_y": 110,
+      "in_biomes": ["forest"]
+    },
+    {
+      "type": "tree",
+      "log_block": "minecraft:birch_log",
+      "leaves_block": "minecraft:birch_leaves",
+      "surface_block": "minecraft:grass_block",
+      "attempts_per_chunk": 3,
+      "trunk_min": 5,
+      "trunk_max": 7,
+      "min_y": 60,
+      "max_y": 110,
+      "in_biomes": ["forest"]
+    },
+    {
+      "type": "tree",
+      "log_block": "minecraft:spruce_log",
+      "leaves_block": "minecraft:spruce_leaves",
+      "surface_block": "minecraft:snow_block",
+      "attempts_per_chunk": 4,
+      "trunk_min": 6,
+      "trunk_max": 9,
+      "min_y": 60,
+      "max_y": 110,
+      "in_biomes": ["snowy_plains"]
     }
   ],
 

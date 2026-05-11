@@ -32,12 +32,46 @@ use ultimate_engine::world::chunk::Chunk;
 use ultimate_engine::world::position::LocalBlockPos;
 
 use crate::block;
+use super::biome::Biome;
+use super::climate::BiomeSource;
+
+/// Per-decoration-pass context handed to every decorator. Carries the
+/// mutable chunk plus enough auxiliary state (biome source, surface Y
+/// grid, sea level) that decorators can filter on biome / elevation
+/// without re-running the density pipeline.
+pub struct DecorationContext<'a> {
+    pub chunk: &'a mut Chunk,
+    pub cx: i32,
+    pub cz: i32,
+    /// World seed; decorators derive their per-chunk PRNG from
+    /// `chunk_decorator_seed(seed, cx, cz, decorator_index)`.
+    pub seed: u32,
+    pub decorator_index: usize,
+    pub biome_source: &'a dyn BiomeSource,
+    pub sea_level: i64,
+    /// Surface Y per column, indexed `lz * 16 + lx`. Computed from the
+    /// density function *before* carving runs, so biome sampling stays
+    /// stable regardless of cave hollow-outs at the surface.
+    pub surface_y: &'a [i64; 256],
+}
+
+impl<'a> DecorationContext<'a> {
+    /// Biome at the local column `(lx, lz)`. Convenience wrapper around
+    /// `biome_source.sample` that resolves world coords and uses the
+    /// pre-computed `surface_y` grid.
+    pub fn biome_at_local(&self, lx: u8, lz: u8) -> Biome {
+        let wx = self.cx as i64 * 16 + lx as i64;
+        let wz = self.cz as i64 * 16 + lz as i64;
+        let sy = self.surface_y[lz as usize * 16 + lx as usize];
+        self.biome_source.sample(wx, wz, sy, self.sea_level)
+    }
+}
 
 /// A post-pass that mutates a chunk to place features. Implementations
-/// must be deterministic given the same `seed`, `cx`, `cz`, and any
-/// `decorator_index` baked into the seed they build.
+/// must be deterministic given the same `ctx.seed`, `ctx.cx`, `ctx.cz`,
+/// and `ctx.decorator_index`.
 pub trait Decorator: Send + Sync {
-    fn decorate(&self, chunk: &mut Chunk, cx: i32, cz: i32, seed: u32, decorator_index: usize);
+    fn decorate(&self, ctx: &mut DecorationContext);
 }
 
 // ── Deterministic PRNG ──────────────────────────────────────────────────────
@@ -101,22 +135,34 @@ pub struct OreDecorator {
     pub vein_size: u32,
     pub min_y: i64,
     pub max_y: i64,
+    /// If `Some`, only place veins in columns whose biome is in the list.
+    /// `None` = place anywhere.
+    pub in_biomes: Option<Vec<Biome>>,
 }
 
 impl Decorator for OreDecorator {
-    fn decorate(&self, chunk: &mut Chunk, cx: i32, cz: i32, seed: u32, decorator_index: usize) {
-        let mut rng = SplitMix64::new(chunk_decorator_seed(seed, cx, cz, decorator_index));
+    fn decorate(&self, ctx: &mut DecorationContext) {
+        let mut rng = SplitMix64::new(chunk_decorator_seed(ctx.seed, ctx.cx, ctx.cz, ctx.decorator_index));
 
         for _ in 0..self.attempts_per_chunk {
             let mut x = rng.range_u32(16) as u8;
             let mut z = rng.range_u32(16) as u8;
             let mut y = rng.range_i64(self.min_y, self.max_y);
 
+            // Biome filter at the attempt's starting column. Veins drift
+            // a few blocks during the walk; checking the start is enough
+            // resolution at our vein sizes and biome cell size.
+            if let Some(biomes) = &self.in_biomes {
+                if !biomes.contains(&ctx.biome_at_local(x, z)) {
+                    continue;
+                }
+            }
+
             for _ in 0..self.vein_size {
                 let pos = LocalBlockPos { x, y, z };
-                let current = chunk.get_block(pos);
+                let current = ctx.chunk.get_block(pos);
                 if self.replaces.contains(&current) {
-                    chunk.set_block(pos, self.block);
+                    ctx.chunk.set_block(pos, self.block);
                 }
 
                 // Random walk one of the 6 cardinal directions.
@@ -159,24 +205,34 @@ pub struct TreeDecorator {
     pub trunk_max: u32,
     pub min_y: i64,
     pub max_y: i64,
+    /// If `Some`, only grow trees in columns whose biome is in the list.
+    /// `None` = anywhere the `surface_block` filter allows.
+    pub in_biomes: Option<Vec<Biome>>,
 }
 
 impl Decorator for TreeDecorator {
-    fn decorate(&self, chunk: &mut Chunk, cx: i32, cz: i32, seed: u32, decorator_index: usize) {
-        let mut rng = SplitMix64::new(chunk_decorator_seed(seed, cx, cz, decorator_index));
+    fn decorate(&self, ctx: &mut DecorationContext) {
+        let mut rng = SplitMix64::new(chunk_decorator_seed(ctx.seed, ctx.cx, ctx.cz, ctx.decorator_index));
 
         for _ in 0..self.attempts_per_chunk {
             let lx = rng.range_u32(16) as u8;
             let lz = rng.range_u32(16) as u8;
 
+            // Biome filter (sampled at the column).
+            if let Some(biomes) = &self.in_biomes {
+                if !biomes.contains(&ctx.biome_at_local(lx, lz)) {
+                    continue;
+                }
+            }
+
             // Find the topmost non-air block in this column inside the Y band.
             let surface_y = (self.min_y..=self.max_y).rev().find(|&y| {
-                chunk.get_block(LocalBlockPos { x: lx, y, z: lz }) != BlockId::AIR
+                ctx.chunk.get_block(LocalBlockPos { x: lx, y, z: lz }) != BlockId::AIR
             });
             let Some(sy) = surface_y else { continue };
 
-            // Biome proxy: only grow on the configured ground block.
-            if chunk.get_block(LocalBlockPos { x: lx, y: sy, z: lz }) != self.surface_block {
+            // Surface-block filter: only grow on the configured ground block.
+            if ctx.chunk.get_block(LocalBlockPos { x: lx, y: sy, z: lz }) != self.surface_block {
                 continue;
             }
 
@@ -191,7 +247,7 @@ impl Decorator for TreeDecorator {
             // Trunk: logs from sy+1 up through sy+trunk_h. The top log is
             // covered by the canopy's middle layer, which preserves logs.
             for dy in 1..=(trunk_h as i64) {
-                chunk.set_block(
+                ctx.chunk.set_block(
                     LocalBlockPos { x: lx, y: sy + dy, z: lz },
                     self.log_block,
                 );
@@ -199,9 +255,9 @@ impl Decorator for TreeDecorator {
 
             // Canopy.
             let trunk_top_y = sy + trunk_h as i64;
-            place_canopy_layer(chunk, lx, trunk_top_y - 1, lz, 2, self.leaves_block, false);
-            place_canopy_layer(chunk, lx, trunk_top_y,     lz, 2, self.leaves_block, true);
-            place_canopy_layer(chunk, lx, trunk_top_y + 1, lz, 1, self.leaves_block, false);
+            place_canopy_layer(ctx.chunk, lx, trunk_top_y - 1, lz, 2, self.leaves_block, false);
+            place_canopy_layer(ctx.chunk, lx, trunk_top_y,     lz, 2, self.leaves_block, true);
+            place_canopy_layer(ctx.chunk, lx, trunk_top_y + 1, lz, 1, self.leaves_block, false);
         }
     }
 }
@@ -254,6 +310,9 @@ pub struct OreDecoratorSchema {
     pub vein_size: u32,
     pub min_y: i64,
     pub max_y: i64,
+    /// Optional biome whitelist. `None` / omitted = place in any biome.
+    #[serde(default)]
+    pub in_biomes: Option<Vec<Biome>>,
 }
 
 fn default_vein_size() -> u32 { 8 }
@@ -264,15 +323,18 @@ pub struct TreeDecoratorSchema {
     pub log_block: String,
     pub leaves_block: String,
     /// Only place trees on top of this block (e.g. `"minecraft:grass_block"`).
-    /// Acts as a biome proxy: surface rules paint grass / sand / snow per
-    /// biome, so filtering by surface block keeps trees out of deserts
-    /// and tundras automatically.
+    /// Acts as a coarse surface filter; the finer `in_biomes` filter (below)
+    /// gates by biome directly.
     pub surface_block: String,
     pub attempts_per_chunk: u32,
     pub trunk_min: u32,
     pub trunk_max: u32,
     pub min_y: i64,
     pub max_y: i64,
+    /// Optional biome whitelist. `None` / omitted = anywhere the
+    /// `surface_block` filter allows.
+    #[serde(default)]
+    pub in_biomes: Option<Vec<Biome>>,
 }
 
 impl DecoratorSchema {
@@ -292,6 +354,7 @@ impl DecoratorSchema {
                     vein_size: o.vein_size,
                     min_y: o.min_y,
                     max_y: o.max_y,
+                    in_biomes: o.in_biomes.clone(),
                 }))
             }
             Self::Tree(t) => {
@@ -313,6 +376,7 @@ impl DecoratorSchema {
                     trunk_max: t.trunk_max,
                     min_y: t.min_y,
                     max_y: t.max_y,
+                    in_biomes: t.in_biomes.clone(),
                 }))
             }
         }
@@ -324,6 +388,31 @@ impl DecoratorSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::climate::FixedBiomeSource;
+
+    /// Helper: run a decorator against a test chunk using a fixed-biome
+    /// biome source. Returns the chunk so tests can inspect it.
+    fn run_decorator(
+        dec: &dyn Decorator,
+        mut chunk: Chunk,
+        cx: i32, cz: i32,
+        seed: u32,
+        idx: usize,
+        biome: Biome,
+        surface_y_value: i64,
+    ) -> Chunk {
+        let source = FixedBiomeSource(biome);
+        let surface_y = [surface_y_value; 256];
+        let mut ctx = DecorationContext {
+            chunk: &mut chunk,
+            cx, cz, seed, decorator_index: idx,
+            biome_source: &source,
+            sea_level: 63,
+            surface_y: &surface_y,
+        };
+        dec.decorate(&mut ctx);
+        chunk
+    }
 
     fn stone_chunk() -> Chunk {
         let mut c = Chunk::new();
@@ -355,18 +444,22 @@ mod tests {
         block::block_id_from_name("minecraft:coal_ore").expect("coal_ore must resolve")
     }
 
-    #[test]
-    fn ore_decorator_places_ore() {
-        let dec = OreDecorator {
+    fn unfiltered_ore() -> OreDecorator {
+        OreDecorator {
             block: coal_ore(),
             replaces: vec![block::STONE],
             attempts_per_chunk: 20,
             vein_size: 8,
             min_y: 0,
             max_y: 100,
-        };
-        let mut chunk = stone_chunk();
-        dec.decorate(&mut chunk, 0, 0, 0xC0FFEE, 0);
+            in_biomes: None,
+        }
+    }
+
+    #[test]
+    fn ore_decorator_places_ore() {
+        let dec = unfiltered_ore();
+        let chunk = run_decorator(&dec, stone_chunk(), 0, 0, 0xC0FFEE, 0, Biome::Plains, 70);
         let n = count_block(&chunk, coal_ore(), 0..=100);
         // 20 attempts × 8 vein steps with self-overlap and OOB-bumps
         // typically lands ~80-120 ore blocks. Sanity-check a wide band.
@@ -376,15 +469,12 @@ mod tests {
     #[test]
     fn ore_decorator_respects_y_range() {
         let dec = OreDecorator {
-            block: coal_ore(),
-            replaces: vec![block::STONE],
             attempts_per_chunk: 30,
-            vein_size: 8,
             min_y: 20,
             max_y: 40,
+            ..unfiltered_ore()
         };
-        let mut chunk = stone_chunk();
-        dec.decorate(&mut chunk, 0, 0, 42, 0);
+        let chunk = run_decorator(&dec, stone_chunk(), 0, 0, 42, 0, Biome::Plains, 70);
         // No ore should appear outside [20, 40].
         assert_eq!(count_block(&chunk, coal_ore(), 0..=19), 0);
         assert_eq!(count_block(&chunk, coal_ore(), 41..=100), 0);
@@ -395,32 +485,19 @@ mod tests {
     #[test]
     fn ore_decorator_only_replaces_listed_blocks() {
         let dec = OreDecorator {
-            block: coal_ore(),
             replaces: vec![block::DIRT], // only dirt, but chunk is all stone
             attempts_per_chunk: 50,
-            vein_size: 8,
-            min_y: 0,
-            max_y: 100,
+            ..unfiltered_ore()
         };
-        let mut chunk = stone_chunk();
-        dec.decorate(&mut chunk, 0, 0, 0, 0);
+        let chunk = run_decorator(&dec, stone_chunk(), 0, 0, 0, 0, Biome::Plains, 70);
         assert_eq!(count_block(&chunk, coal_ore(), 0..=100), 0);
     }
 
     #[test]
     fn ore_decorator_is_deterministic_per_seed() {
-        let dec = OreDecorator {
-            block: coal_ore(),
-            replaces: vec![block::STONE],
-            attempts_per_chunk: 20,
-            vein_size: 8,
-            min_y: 0,
-            max_y: 100,
-        };
-        let mut c1 = stone_chunk();
-        let mut c2 = stone_chunk();
-        dec.decorate(&mut c1, 3, 7, 0xC0FFEE, 0);
-        dec.decorate(&mut c2, 3, 7, 0xC0FFEE, 0);
+        let dec = unfiltered_ore();
+        let c1 = run_decorator(&dec, stone_chunk(), 3, 7, 0xC0FFEE, 0, Biome::Plains, 70);
+        let c2 = run_decorator(&dec, stone_chunk(), 3, 7, 0xC0FFEE, 0, Biome::Plains, 70);
         for lx in 0..16u8 {
             for lz in 0..16u8 {
                 for y in 0..=100i64 {
@@ -433,18 +510,9 @@ mod tests {
 
     #[test]
     fn different_chunks_get_different_veins() {
-        let dec = OreDecorator {
-            block: coal_ore(),
-            replaces: vec![block::STONE],
-            attempts_per_chunk: 20,
-            vein_size: 8,
-            min_y: 0,
-            max_y: 100,
-        };
-        let mut c1 = stone_chunk();
-        let mut c2 = stone_chunk();
-        dec.decorate(&mut c1, 0, 0, 0xC0FFEE, 0);
-        dec.decorate(&mut c2, 1, 0, 0xC0FFEE, 0);
+        let dec = unfiltered_ore();
+        let c1 = run_decorator(&dec, stone_chunk(), 0, 0, 0xC0FFEE, 0, Biome::Plains, 70);
+        let c2 = run_decorator(&dec, stone_chunk(), 1, 0, 0xC0FFEE, 0, Biome::Plains, 70);
         let mut differences = 0;
         for lx in 0..16u8 {
             for lz in 0..16u8 {
@@ -460,6 +528,23 @@ mod tests {
     }
 
     #[test]
+    fn ore_decorator_in_biomes_filter_skips_outside() {
+        let dec = OreDecorator {
+            in_biomes: Some(vec![Biome::Plains]),
+            attempts_per_chunk: 50,
+            ..unfiltered_ore()
+        };
+        // Run in Desert — filter should skip everything.
+        let chunk = run_decorator(&dec, stone_chunk(), 0, 0, 0, 0, Biome::Desert, 70);
+        assert_eq!(count_block(&chunk, coal_ore(), 0..=100), 0,
+            "ore decorator with in_biomes=[plains] should place nothing in a desert chunk");
+        // Same dec, in Plains: places ore.
+        let chunk = run_decorator(&dec, stone_chunk(), 0, 0, 0, 0, Biome::Plains, 70);
+        assert!(count_block(&chunk, coal_ore(), 0..=100) > 0,
+            "ore decorator should still fire in an allowed biome");
+    }
+
+    #[test]
     fn schema_round_trips_through_json() {
         let schema = DecoratorSchema::Ore(OreDecoratorSchema {
             block: "minecraft:coal_ore".into(),
@@ -468,12 +553,12 @@ mod tests {
             vein_size: 8,
             min_y: 0,
             max_y: 100,
+            in_biomes: None,
         });
         let json = serde_json::to_string(&schema).unwrap();
         let parsed: DecoratorSchema = serde_json::from_str(&json).unwrap();
         let built = parsed.build().unwrap();
-        let mut chunk = stone_chunk();
-        built.decorate(&mut chunk, 0, 0, 42, 0);
+        let chunk = run_decorator(&*built, stone_chunk(), 0, 0, 42, 0, Biome::Plains, 70);
         assert!(count_block(&chunk, coal_ore(), 0..=100) > 0);
     }
 
@@ -501,9 +586,8 @@ mod tests {
         c
     }
 
-    #[test]
-    fn tree_decorator_places_log_and_leaves() {
-        let dec = TreeDecorator {
+    fn unfiltered_tree() -> TreeDecorator {
+        TreeDecorator {
             log_block: oak_log(),
             leaves_block: oak_leaves(),
             surface_block: block::GRASS_BLOCK,
@@ -511,10 +595,14 @@ mod tests {
             trunk_min: 4,
             trunk_max: 6,
             min_y: 60, max_y: 90,
-        };
-        let mut chunk = grassy_chunk();
-        dec.decorate(&mut chunk, 0, 0, 0xC0FFEE, 0);
+            in_biomes: None,
+        }
+    }
 
+    #[test]
+    fn tree_decorator_places_log_and_leaves() {
+        let dec = unfiltered_tree();
+        let chunk = run_decorator(&dec, grassy_chunk(), 0, 0, 0xC0FFEE, 0, Biome::Plains, 70);
         let mut logs = 0;
         let mut leaves = 0;
         for lx in 0..16u8 {
@@ -526,32 +614,21 @@ mod tests {
                 }
             }
         }
-        // 4 trees × 4-6 trunk logs ≈ 16-24 logs.
         assert!(logs >= 8, "expected ≥8 log blocks, got {}", logs);
-        // 4 trees × ~30 leaves each (5x5 + 5x5-corners + 3x3 = 25+21+9 = 55, minus
-        // the trunk-top slot in the middle layer ≈ ~50). Clipping near
-        // chunk edges trims some, hence the loose lower bound.
         assert!(leaves >= 40, "expected ≥40 leaf blocks, got {}", leaves);
     }
 
     #[test]
     fn tree_decorator_skips_non_surface_blocks() {
-        // Replace the surface with sand (still flat, just wrong substrate).
+        // Surface is sand, not grass.
         let mut chunk = grassy_chunk();
         for lx in 0..16u8 {
             for lz in 0..16u8 {
                 chunk.set_block(LocalBlockPos { x: lx, y: 70, z: lz }, block::SAND);
             }
         }
-        let dec = TreeDecorator {
-            log_block: oak_log(),
-            leaves_block: oak_leaves(),
-            surface_block: block::GRASS_BLOCK,
-            attempts_per_chunk: 10,
-            trunk_min: 4, trunk_max: 6,
-            min_y: 60, max_y: 90,
-        };
-        dec.decorate(&mut chunk, 0, 0, 0xC0FFEE, 0);
+        let dec = TreeDecorator { attempts_per_chunk: 10, ..unfiltered_tree() };
+        let chunk = run_decorator(&dec, chunk, 0, 0, 0xC0FFEE, 0, Biome::Plains, 70);
         let logs: usize = (0..16u8).flat_map(|lx| (0..16u8).map(move |lz| (lx, lz)))
             .flat_map(|(lx, lz)| (60..=90i64).map(move |y| (lx, y, lz)))
             .filter(|&(lx, y, lz)| chunk.get_block(LocalBlockPos { x: lx, y, z: lz }) == oak_log())
@@ -561,18 +638,9 @@ mod tests {
 
     #[test]
     fn tree_decorator_is_deterministic() {
-        let dec = TreeDecorator {
-            log_block: oak_log(),
-            leaves_block: oak_leaves(),
-            surface_block: block::GRASS_BLOCK,
-            attempts_per_chunk: 3,
-            trunk_min: 4, trunk_max: 6,
-            min_y: 60, max_y: 90,
-        };
-        let mut a = grassy_chunk();
-        let mut b = grassy_chunk();
-        dec.decorate(&mut a, 5, 7, 0xC0FFEE, 0);
-        dec.decorate(&mut b, 5, 7, 0xC0FFEE, 0);
+        let dec = TreeDecorator { attempts_per_chunk: 3, ..unfiltered_tree() };
+        let a = run_decorator(&dec, grassy_chunk(), 5, 7, 0xC0FFEE, 0, Biome::Plains, 70);
+        let b = run_decorator(&dec, grassy_chunk(), 5, 7, 0xC0FFEE, 0, Biome::Plains, 70);
         for lx in 0..16u8 {
             for lz in 0..16u8 {
                 for y in 0..=100i64 {
@@ -585,28 +653,14 @@ mod tests {
 
     #[test]
     fn tree_decorator_clips_at_chunk_edge() {
-        // Saturate the chunk with placement attempts so every column gets
-        // hit, including the four extreme corners where canopy writes
-        // would go out of bounds without the chunk clip. The test passes
-        // when no panic occurs; the count assertion just confirms work
-        // happened.
-        let mut chunk = grassy_chunk();
+        // Saturate the chunk so every column gets hit, including corners.
+        // Asserts no out-of-bounds panic from canopy writes near edges.
         let dec = TreeDecorator {
-            log_block: oak_log(),
-            leaves_block: oak_leaves(),
-            surface_block: block::GRASS_BLOCK,
             attempts_per_chunk: 200,
             trunk_min: 5, trunk_max: 5,
-            min_y: 60, max_y: 90,
+            ..unfiltered_tree()
         };
-        dec.decorate(&mut chunk, 0, 0, 0xC0FFEE, 0);
-
-        // The actual test is "no panic from out-of-bounds canopy writes
-        // when trees land near chunk corners". Saturation + a loose log
-        // count confirms work happened — most attempts get rejected
-        // because previous trees' canopies have already overwritten the
-        // grass surface, so we end up with ~20-30 trees out of 200
-        // attempts, not 200.
+        let chunk = run_decorator(&dec, grassy_chunk(), 0, 0, 0xC0FFEE, 0, Biome::Plains, 70);
         let mut hit = 0usize;
         for lx in 0..16u8 {
             for lz in 0..16u8 {
@@ -620,6 +674,30 @@ mod tests {
     }
 
     #[test]
+    fn tree_decorator_in_biomes_filter_skips_outside() {
+        let dec = TreeDecorator {
+            attempts_per_chunk: 20,
+            in_biomes: Some(vec![Biome::Forest]),
+            ..unfiltered_tree()
+        };
+        // Run in Plains — filter is Forest-only, no trees expected.
+        let chunk = run_decorator(&dec, grassy_chunk(), 0, 0, 0xC0FFEE, 0, Biome::Plains, 70);
+        let logs = (0..16u8).flat_map(|lx| (0..16u8).map(move |lz| (lx, lz)))
+            .flat_map(|(lx, lz)| (70..=90i64).map(move |y| (lx, y, lz)))
+            .filter(|&(lx, y, lz)| chunk.get_block(LocalBlockPos { x: lx, y, z: lz }) == oak_log())
+            .count();
+        assert_eq!(logs, 0, "tree decorator filtered to forest should skip plains");
+
+        // Same dec in Forest: should place trees.
+        let chunk = run_decorator(&dec, grassy_chunk(), 0, 0, 0xC0FFEE, 0, Biome::Forest, 70);
+        let logs = (0..16u8).flat_map(|lx| (0..16u8).map(move |lz| (lx, lz)))
+            .flat_map(|(lx, lz)| (70..=90i64).map(move |y| (lx, y, lz)))
+            .filter(|&(lx, y, lz)| chunk.get_block(LocalBlockPos { x: lx, y, z: lz }) == oak_log())
+            .count();
+        assert!(logs > 0, "tree decorator should fire in its allowed biome");
+    }
+
+    #[test]
     fn tree_schema_round_trips() {
         let schema = DecoratorSchema::Tree(TreeDecoratorSchema {
             log_block: "minecraft:oak_log".into(),
@@ -630,14 +708,12 @@ mod tests {
             trunk_max: 6,
             min_y: 60,
             max_y: 100,
+            in_biomes: Some(vec![Biome::Plains, Biome::Forest]),
         });
         let json = serde_json::to_string(&schema).unwrap();
         let parsed: DecoratorSchema = serde_json::from_str(&json).unwrap();
         let built = parsed.build().unwrap();
-        let mut chunk = grassy_chunk();
-        built.decorate(&mut chunk, 0, 0, 42, 0);
-        // Smoke test: just verify it ran.
-        let _ = chunk;
+        let _chunk = run_decorator(&*built, grassy_chunk(), 0, 0, 42, 0, Biome::Plains, 70);
     }
 
     #[test]
@@ -649,6 +725,7 @@ mod tests {
             vein_size: 1,
             min_y: 0,
             max_y: 10,
+            in_biomes: None,
         });
         assert!(bad.build().is_err());
     }

@@ -208,14 +208,17 @@ causality is the only ordering.
 ### 4e -- Decorators & structures
 - [x] **Tree decorator** (oak, MVP): trunk + 3-layer canopy
       (5×5 bottom, 5×5-minus-corners middle, 3×3 top), placed only on top
-      of a configured `surface_block` so the grass-only filter naturally
-      keeps trees out of deserts/tundras. Trees clip at chunk borders for
+      of a configured `surface_block`. Trees clip at chunk borders for
       now; deferred cross-chunk writes come with the next decorator
       iteration.
-- [x] Default `noise` preset ships oak trees at 3 attempts/chunk in
-      `[60, 110]` Y range.
-- [ ] Per-biome decorator filter so we can ship birch/spruce/etc. and
-      vary tree density (forest >> plains, none in tundra).
+- [x] **Per-biome decorator filter** (`in_biomes: ["plains", "forest"]`)
+      on Ore and Tree schemas. Decorator API restructured to
+      `Decorator::decorate(&mut DecorationContext)` carrying the chunk,
+      biome source, surface-Y grid, sea level — so filters/conditions
+      have everything they need without re-running the density pipeline.
+- [x] Default `noise` preset ships **biome-varied trees**: oak in
+      plains/forest, extra-dense oak + birch in forest, tall spruce on
+      snow_block in snowy_plains.
 - [ ] Deferred cross-chunk writes for decorators (trees, structures) so
       canopies don't clip at chunk borders.
 - [ ] Plants (flowers, grass, kelp, sugarcane, etc.)

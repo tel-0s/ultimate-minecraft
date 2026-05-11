@@ -18,7 +18,7 @@ use super::WorldGen;
 use super::biome::Biome;
 use super::carver::Carver;
 use super::climate::BiomeSource;
-use super::decorator::Decorator;
+use super::decorator::{Decorator, DecorationContext};
 use super::density::DensityFunction;
 use super::surface::{SurfaceContext, SurfaceRule};
 
@@ -85,11 +85,23 @@ impl WorldGen for DensityPipeline {
         let base_x = cx as i64 * 16;
         let base_z = cz as i64 * 16;
 
-        for lx in 0..16u8 {
-            for lz in 0..16u8 {
+        // Pre-compute the surface-Y grid for all 256 columns. Used by
+        // stratification AND handed to decorators so they can sample
+        // biomes per column without rerunning the density function.
+        let mut surface_grid = [0i64; 256];
+        for lz in 0..16u8 {
+            for lx in 0..16u8 {
                 let wx = base_x + lx as i64;
                 let wz = base_z + lz as i64;
-                let surface = self.surface_y(wx, wz);
+                surface_grid[lz as usize * 16 + lx as usize] = self.surface_y(wx, wz);
+            }
+        }
+
+        for lz in 0..16u8 {
+            for lx in 0..16u8 {
+                let wx = base_x + lx as i64;
+                let wz = base_z + lz as i64;
+                let surface = surface_grid[lz as usize * 16 + lx as usize];
                 let biome = self.biome_source.sample(wx, wz, surface, self.sea_level);
 
                 // Bedrock floor.
@@ -132,10 +144,20 @@ impl WorldGen for DensityPipeline {
         }
 
         // Decoration passes (ores, plants, trees, structures). Each
-        // decorator's PRNG is seeded from `(seed, cx, cz, idx)` so the
-        // same chunk decorates identically across runs.
+        // decorator's PRNG is seeded from `(seed, cx, cz, idx)` and
+        // gets access to the biome source + surface grid so it can
+        // filter by biome.
         for (idx, decorator) in self.decorators.iter().enumerate() {
-            decorator.decorate(&mut chunk, cx, cz, self.seed, idx);
+            let mut ctx = DecorationContext {
+                chunk: &mut chunk,
+                cx, cz,
+                seed: self.seed,
+                decorator_index: idx,
+                biome_source: &*self.biome_source,
+                sea_level: self.sea_level,
+                surface_y: &surface_grid,
+            };
+            decorator.decorate(&mut ctx);
         }
 
         chunk
