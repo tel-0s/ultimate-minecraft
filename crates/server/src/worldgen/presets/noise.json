@@ -156,6 +156,17 @@
       "vein_size": 5,
       "min_y": -56,
       "max_y": 0
+    },
+    {
+      "type": "tree",
+      "log_block": "minecraft:oak_log",
+      "leaves_block": "minecraft:oak_leaves",
+      "surface_block": "minecraft:grass_block",
+      "attempts_per_chunk": 3,
+      "trunk_min": 4,
+      "trunk_max": 6,
+      "min_y": 60,
+      "max_y": 110
     }
   ],
 
