@@ -8,7 +8,7 @@ use ultimate_server::dashboard::{self, DashboardState};
 use ultimate_server::event_bus::{self, WorldChangeBatch};
 use ultimate_server::persistence;
 use ultimate_server::player_registry::PlayerRegistry;
-use ultimate_server::worldgen::{WorldGen, noise_terrain::NoiseTerrainGen};
+use ultimate_server::worldgen::{self, WorldGen};
 
 /// Pull a `--key value` flag out of the CLI args.
 fn cli_arg(key: &str) -> Option<String> {
@@ -68,8 +68,17 @@ async fn main() {
 
     // ── Generate base world, then overlay saved modifications ──────────
     let world = Arc::new(World::new());
-    let worldgen: Arc<dyn WorldGen> = Arc::new(NoiseTerrainGen::new(cfg.world.seed));
-    tracing::info!("Generating noise terrain (seed {:#x})...", cfg.world.seed);
+    let worldgen: Arc<dyn WorldGen> = match worldgen::preset::load(&cfg.world.preset, cfg.world.seed) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::error!("Worldgen preset {:?} failed to load: {:#}", cfg.world.preset, e);
+            return;
+        }
+    };
+    tracing::info!(
+        "Generating world from preset {:?} (seed {:#x})...",
+        cfg.world.preset, cfg.world.seed,
+    );
     worldgen.pregenerate_radius(&world, cfg.world.pregenerate_radius);
     tracing::info!(
         "Base world ready: {} chunks pre-generated; further chunks generated on demand",

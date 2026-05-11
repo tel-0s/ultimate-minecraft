@@ -1,6 +1,8 @@
 /target
 nul
+# Anvil-format world saves (default `world/`, custom `--world <name>` dirs).
 world/
+world-*/
 # Operator-local server config; auto-created on first run from
 # crates/server/src/config.rs::DEFAULT_CONFIG_YAML.
 /server.yaml

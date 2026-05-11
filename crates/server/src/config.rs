@@ -64,6 +64,11 @@ pub struct WorldConfig {
     /// at startup so the spawn region is immediate. Beyond this, chunks
     /// generate lazily as players approach.
     pub pregenerate_radius: i32,
+    /// Worldgen preset: a built-in name (`"noise"`, `"superflat"`) or
+    /// a path to a JSON file describing a custom pipeline. See
+    /// `crates/server/src/worldgen/presets/*.json` for examples and
+    /// `worldgen::preset` for the schema.
+    pub preset: String,
 }
 
 /// Dashboard (live graph + metrics over HTTP).
@@ -106,6 +111,7 @@ impl Default for WorldConfig {
             autosave_interval_secs: 300,
             seed: 0xC0FFEE,
             pregenerate_radius: 8,
+            preset: "noise".to_string(),
         }
     }
 }
@@ -156,6 +162,11 @@ world:
   seed: 12648430   # 0xC0FFEE
   # Chunks (radius) to pre-generate at startup so spawn is immediate.
   pregenerate_radius: 8
+  # Worldgen preset. Built-in: "noise" (default, vanilla-ish noise terrain)
+  # or "superflat" (flat layered world). Anything else is treated as a
+  # path to a JSON file -- see crates/server/src/worldgen/presets/ for
+  # examples and the worldgen::preset module for the schema.
+  preset: "noise"
 
 dashboard:
   # HTTP port for the live dashboard. Bound to localhost only.

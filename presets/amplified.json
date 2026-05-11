@@ -1,0 +1,49 @@
+{
+  "kind": "density",
+  "sea_level": 70,
+  "min_y": -64,
+  "max_y": 319,
+  "bedrock_y": 0,
+  "dirt_depth": 5,
+  "beach_band": 3,
+  "density": {
+    "type": "sub",
+    "argument1": {
+      "type": "add",
+      "argument1": {
+        "type": "add",
+        "argument1": { "type": "constant", "value": 80.0 },
+        "argument2": {
+          "type": "mul",
+          "argument1": {
+            "type": "noise2d",
+            "seed_offset": 10,
+            "frequency": 0.0009765625,
+            "octaves": 5,
+            "persistence": 0.6,
+            "lacunarity": 2.0
+          },
+          "argument2": { "type": "constant", "value": 50.0 }
+        }
+      },
+      "argument2": {
+        "type": "mul",
+        "argument1": {
+          "type": "clamp",
+          "input": {
+            "type": "noise2d",
+            "seed_offset": 11,
+            "frequency": 0.008,
+            "octaves": 6,
+            "persistence": 0.55,
+            "lacunarity": 2.0
+          },
+          "min": -1.0,
+          "max": 1.2
+        },
+        "argument2": { "type": "constant", "value": 70.0 }
+      }
+    },
+    "argument2": { "type": "y_index" }
+  }
+}

@@ -351,6 +351,25 @@ pub fn light_opacity(id: BlockId) -> u8 {
     }
 }
 
+/// Look up the *default-state* `BlockId` by Minecraft name (with or without
+/// the `minecraft:` namespace). Returns `None` for unknown blocks.
+///
+/// Used by worldgen presets that name blocks via JSON. Only resolves the
+/// default state of each block (no property overrides); for stateful
+/// placement (e.g. stairs facing a direction) use the placement module.
+pub fn block_id_from_name(name: &str) -> Option<BlockId> {
+    use azalea_block::BlockState;
+    use azalea_registry::builtin::BlockKind;
+    use std::str::FromStr;
+
+    let bare = name.strip_prefix("minecraft:").unwrap_or(name);
+    let kind = BlockKind::from_str(bare).ok()?;
+    // Default state lookup. azalea's BlockKind → BlockState conversion uses
+    // each block's `default` state, matching vanilla.
+    let state: u32 = BlockState::from(kind).into();
+    Some(BlockId::new(state as u16))
+}
+
 /// Human-readable name for dashboard display.
 pub fn name(id: BlockId) -> String {
     match id {

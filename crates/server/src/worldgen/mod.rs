@@ -1,16 +1,22 @@
 //! World generation.
 //!
-//! Phase 4 stage 1: deterministic noise-based heightmap terrain. Chunks
-//! generate on demand (and a small initial area is pre-generated at startup
-//! so the spawn region is immediate).
+//! Compositional pipeline modeled on vanilla 1.18+'s noise router. The
+//! shape of a world is described by a JSON [`preset`] that compiles to a
+//! [`pipeline`] using a tree of [`density`] functions. Each layer is
+//! independently replaceable so an operator can swap to a superflat preset
+//! by changing a single field in `server.yaml` — no recompile.
 //!
 //! ## Stages
-//! 1. Heightmap noise terrain + sea level + on-demand chunks  ← *current*
-//! 2. Multi-noise biomes (continentalness / erosion / peaks-and-valleys)
-//! 3. 3D-noise cave carving + ore distribution
-//! 4. Surface rules + decorators (trees, plants) + simple structures
+//! - **4a (current)**: density functions + heightmap stratification + JSON
+//!   presets (`noise`, `superflat`).
+//! - **4b**: composable surface rules (per-biome top blocks, depth bands).
+//! - **4c**: multi-noise climate → biome assignment.
+//! - **4d**: 3D-noise carvers (caves, ravines) + decorators (trees, ores,
+//!   features).
 
-pub mod noise_terrain;
+pub mod density;
+pub mod pipeline;
+pub mod preset;
 
 use ultimate_engine::world::World;
 use ultimate_engine::world::chunk::Chunk;

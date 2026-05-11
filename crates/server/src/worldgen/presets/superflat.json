@@ -1,0 +1,10 @@
+{
+  "kind": "flat",
+  "min_y": 0,
+  "layers": [
+    { "block": "minecraft:bedrock",     "height": 1  },
+    { "block": "minecraft:stone",       "height": 62 },
+    { "block": "minecraft:dirt",        "height": 3  },
+    { "block": "minecraft:grass_block", "height": 1  }
+  ]
+}

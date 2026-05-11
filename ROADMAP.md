@@ -124,13 +124,25 @@ causality is the only ordering.
 > Infinite procedural terrain, lazily generated. Replicating vanilla 1.21
 > overworld is multi-week work; broken into staged sub-phases.
 
-### 4a -- Heightmap terrain (Stage 1, current)
+### 4a -- Heightmap terrain (compositional, JSON-driven)
 - [x] `WorldGen` trait + on-demand chunk generation hook in chunk-loading paths
-- [x] Octaved-Perlin heightmap with continent / hills / detail layers (`worldgen::noise_terrain`)
-- [x] Sea level + beach band + simple stone / dirt / grass / sand / water stratification
-- [x] Bedrock floor at y=0
-- [x] Deterministic from `--seed` CLI flag
-- [x] Pre-generate spawn area (radius 8) at startup; further chunks generated lazily as players walk
+- [x] **Density-function framework** (`worldgen::density`): composable scalar
+      fields over `(x,y,z)`. Atoms: `constant`, `y_index`, `noise2d`, `noise3d`.
+      Combinators: `add`, `sub`, `mul`, `min`, `max`, `clamp`. Mirrors
+      vanilla 1.18+'s noise-router shape; tree described in JSON, compiled
+      to `Arc<dyn DensityFunction>` at startup.
+- [x] **Pipelines** (`worldgen::pipeline`): `DensityPipeline` walks each
+      column top-down through the density function, stratifying
+      bedrock / stone / dirt / grass / sand / water + sea level. `FlatPipeline`
+      for superflat (bedrock + layer stack).
+- [x] **JSON presets** (`worldgen::preset`): built-in `"noise"` and
+      `"superflat"`, or any path to a JSON file. Schema uses
+      `#[serde(tag = "kind")]` for preset kind and `#[serde(tag = "type")]`
+      for density-function nodes — fully data-driven, no recompile needed
+      to swap pipelines.
+- [x] Operator-configurable via `world.preset` in `server.yaml`.
+- [x] Deterministic from `world.seed` (CLI `--seed` overrides).
+- [x] Pre-generate spawn area at startup; further chunks generated lazily.
 
 ### 4b -- Multi-noise biome system
 - [ ] Continentalness, erosion, peaks-and-valleys noise fields
