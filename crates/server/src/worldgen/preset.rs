@@ -98,10 +98,10 @@ pub struct FlatLayer {
 
 // ── Loading ─────────────────────────────────────────────────────────────────
 
-/// Load a preset by spec — either a built-in name (`"noise"`,
-/// `"superflat"`) or a path to a JSON file.
-pub fn load(spec: &str, seed: u32) -> Result<Arc<dyn WorldGen>> {
-    let (source, json) = match spec {
+/// Resolve a preset spec to `(source_label, json_text)` — either a
+/// built-in name (`"noise"`, `"superflat"`) or a path to a JSON file.
+fn resolve(spec: &str) -> Result<(String, String)> {
+    Ok(match spec {
         "noise" => ("builtin:noise".to_string(), BUILTIN_NOISE.to_string()),
         "superflat" => ("builtin:superflat".to_string(), BUILTIN_SUPERFLAT.to_string()),
         path => {
@@ -109,10 +109,42 @@ pub fn load(spec: &str, seed: u32) -> Result<Arc<dyn WorldGen>> {
                 .map_err(|e| anyhow!("reading worldgen preset {}: {}", path, e))?;
             (format!("file:{}", path), text)
         }
-    };
+    })
+}
+
+/// Load a preset by spec — either a built-in name (`"noise"`,
+/// `"superflat"`) or a path to a JSON file.
+pub fn load(spec: &str, seed: u32) -> Result<Arc<dyn WorldGen>> {
+    let (source, json) = resolve(spec)?;
     let schema: PresetSchema = serde_json::from_str(&json)
         .map_err(|e| anyhow!("parsing worldgen preset {}: {}", source, e))?;
     schema.build(seed)
+}
+
+/// Stable fingerprint of the effective generator: FNV-1a over the
+/// *canonical re-serialization* of the parsed preset schema plus the seed.
+///
+/// Persistence stamps every saved chunk with this value and skips chunks
+/// whose stamp doesn't match at load time — terrain from an older
+/// generator version must regenerate rather than be stitched against new
+/// terrain (mismatched heights/biomes at chunk borders). Canonical
+/// re-serialization makes the fingerprint insensitive to JSON whitespace
+/// and key order, but sensitive to any value or schema-default change.
+pub fn fingerprint(spec: &str, seed: u32) -> Result<u64> {
+    let (source, json) = resolve(spec)?;
+    let schema: PresetSchema = serde_json::from_str(&json)
+        .map_err(|e| anyhow!("parsing worldgen preset {}: {}", source, e))?;
+    let canonical = serde_json::to_string(&schema)
+        .map_err(|e| anyhow!("canonicalizing worldgen preset {}: {}", source, e))?;
+
+    // FNV-1a 64-bit: deterministic across runs and platforms (unlike the
+    // std SipHash `DefaultHasher`, whose keys are per-process random).
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in canonical.bytes().chain(seed.to_le_bytes()) {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    Ok(h)
 }
 
 impl PresetSchema {
@@ -137,6 +169,7 @@ impl PresetSchema {
                     carvers,
                     decorators,
                     seed,
+                    pending: Arc::new(super::decorator::PendingWrites::new()),
                     sea_level: d.sea_level,
                     min_y: d.min_y,
                     max_y: d.max_y,
@@ -169,13 +202,14 @@ impl PresetSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ultimate_engine::world::World;
     use ultimate_engine::world::position::LocalBlockPos;
 
     #[test]
     fn builtin_noise_parses_and_builds() {
         let schema: PresetSchema = serde_json::from_str(BUILTIN_NOISE).unwrap();
         let w = schema.build(42).unwrap();
-        let chunk = w.generate_chunk(0, 0);
+        let chunk = w.generate_chunk(0, 0, &World::new());
         assert!(chunk.section_count() > 0, "noise preset should produce non-empty chunks");
     }
 
@@ -183,7 +217,7 @@ mod tests {
     fn builtin_superflat_parses_and_builds() {
         let schema: PresetSchema = serde_json::from_str(BUILTIN_SUPERFLAT).unwrap();
         let w = schema.build(0).unwrap();
-        let chunk = w.generate_chunk(0, 0);
+        let chunk = w.generate_chunk(0, 0, &World::new());
         assert_eq!(
             chunk.get_block(LocalBlockPos { x: 0, y: 0, z: 0 }),
             block::BEDROCK,
@@ -194,8 +228,10 @@ mod tests {
     fn deterministic_from_seed() {
         let w1 = load("noise", 42).unwrap();
         let w2 = load("noise", 42).unwrap();
-        let c_a = w1.generate_chunk(3, 7);
-        let c_b = w2.generate_chunk(3, 7);
+        let world = World::new();
+        let c_a = w1.generate_chunk(3, 7, &world);
+        let world = World::new();
+        let c_b = w2.generate_chunk(3, 7, &world);
         for lx in 0..16u8 {
             for lz in 0..16u8 {
                 for y in 0..=70i64 {
@@ -205,6 +241,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_input_sensitive() {
+        // Same preset + seed → same fingerprint across calls (FNV, not the
+        // per-process-random std hasher).
+        let a = fingerprint("noise", 42).unwrap();
+        let b = fingerprint("noise", 42).unwrap();
+        assert_eq!(a, b);
+
+        // Different seed → different fingerprint.
+        assert_ne!(fingerprint("noise", 42).unwrap(), fingerprint("noise", 43).unwrap());
+
+        // Different preset → different fingerprint.
+        assert_ne!(fingerprint("noise", 42).unwrap(), fingerprint("superflat", 42).unwrap());
+    }
+
+    #[test]
+    fn fingerprint_ignores_whitespace_formatting() {
+        // Canonical re-serialization: reformatting the JSON (whitespace
+        // only) must not change the fingerprint. Compare a re-pretty-printed
+        // copy of the built-in noise preset against the built-in itself.
+        let schema: PresetSchema = serde_json::from_str(BUILTIN_NOISE).unwrap();
+        let pretty = serde_json::to_string_pretty(&schema).unwrap();
+        let tmp = std::env::temp_dir().join("umc_fingerprint_ws_test.json");
+        std::fs::write(&tmp, &pretty).unwrap();
+
+        let from_file = fingerprint(tmp.to_str().unwrap(), 7).unwrap();
+        let builtin = fingerprint("noise", 7).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(from_file, builtin);
     }
 
     #[test]
@@ -237,7 +304,7 @@ mod tests {
         // every block; we sample sparsely to keep the test fast).
         for cx in -2..2i32 {
             for cz in -2..2i32 {
-                let chunk = w.generate_chunk(cx, cz);
+                let chunk = w.generate_chunk(cx, cz, &World::new());
                 // y=-30..40 is inside the carver range (-56..55) AND
                 // typically below the surface (~70-90), so any AIR we
                 // find here is from carving, not from "above-surface".

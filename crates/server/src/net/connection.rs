@@ -62,8 +62,8 @@ use ultimate_engine::world::World;
 use uuid::Uuid;
 
 use crate::config::ServerConfig;
-use crate::dashboard::{self, DashboardState};
-use crate::event_bus::{self, ChangeSource, WorldChangeBatch};
+use crate::dashboard::DashboardState;
+use crate::event_bus::{self};
 use crate::player_registry::{PlayerEvent, PlayerInfo, PlayerRegistry};
 use crate::worldgen::WorldGen;
 
@@ -75,10 +75,11 @@ pub async fn handle(
     stream: TcpStream,
     world: Arc<World>,
     dashboard: Arc<DashboardState>,
-    bus_tx: tokio::sync::broadcast::Sender<WorldChangeBatch>,
+    spatial: Arc<crate::event_bus::SpatialBus>,
     registry: Arc<PlayerRegistry>,
     worldgen: Arc<dyn WorldGen>,
     config: Arc<ServerConfig>,
+    physics: crate::physics::PhysicsHandle,
 ) -> Result<()> {
     let (read, write) = stream.into_split();
     let mut read = read;
@@ -116,7 +117,7 @@ pub async fn handle(
             handle_configuration(&mut read, &mut write, &mut buf, compression, &mut cipher_enc, &mut cipher_dec).await?;
             dashboard.metrics.player_joined();
             // handle_play registers/deregisters with the player registry internally.
-            let result = handle_play(&mut read, &mut write, &mut buf, compression, &mut cipher_enc, &mut cipher_dec, &world, &name, uuid, &dashboard, &bus_tx, &registry, &*worldgen, &config).await;
+            let result = handle_play(&mut read, &mut write, &mut buf, compression, &mut cipher_enc, &mut cipher_dec, &world, &name, uuid, &dashboard, &spatial, &registry, &*worldgen, &config, &physics).await;
             dashboard.metrics.player_left();
             result?;
         }
@@ -530,11 +531,14 @@ async fn handle_play<R, W>(
     world: &World,
     player_name: &str,
     player_uuid: Uuid,
-    dashboard: &DashboardState,
-    bus_tx: &tokio::sync::broadcast::Sender<WorldChangeBatch>,
+    // Cascade metrics moved to the physics service in 6b-1; the slot stays
+    // for future per-connection dashboards (latency, packet rates).
+    _dashboard: &DashboardState,
+    spatial: &Arc<crate::event_bus::SpatialBus>,
     registry: &PlayerRegistry,
     worldgen: &dyn WorldGen,
     config: &ServerConfig,
+    physics: &crate::physics::PhysicsHandle,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + Sync,
@@ -650,20 +654,20 @@ where
 
     tracing::info!("{} joined the game at ({}, {}, {})", player_name, spawn_x, spawn_y, spawn_z);
 
-    // ── Causal engine for this connection ────────────────────────────────
+    // ── Physics submission (Phase 6b-1) ──────────────────────────────────
+    // This connection is a pure event SOURCE: block actions are submitted
+    // to the shared physics service and acknowledged immediately. All
+    // resulting world changes — including our own — come back through the
+    // event bus as `ChangeSource::Physics` batches.
     use azalea_block::BlockState;
     use azalea_core::direction::Direction;
     use azalea_protocol::packets::game::{
         ClientboundBlockUpdate, ClientboundBlockChangedAck,
         s_player_action::Action,
     };
-    use ultimate_engine::causal::event::{Event, EventPayload};
-    use ultimate_engine::causal::graph::CausalGraph;
-    use ultimate_engine::causal::scheduler::Scheduler;
     use ultimate_engine::world::block::BlockId;
 
-    let rules = crate::rules::standard();
-    let scheduler = Scheduler::new();
+    use crate::physics::BlockAction;
 
     // Unique ID for this connection (used to filter self-originated bus messages).
     let conn_id = NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -683,9 +687,12 @@ where
     }
     let _deregister_guard = DeregisterGuard { registry, conn_id };
 
-    // Subscribe to the world-change event bus for cross-player sync.
-    let mut bus_rx = bus_tx.subscribe();
-    // Subscribe to player lifecycle events (join/leave).
+    // Spatial subscription (Phase 6f): world changes and entity moves are
+    // delivered only for regions near this player; re-pointed on chunk
+    // border crossings.
+    let (mut spatial_sub, mut spatial_rx) = spatial.subscribe();
+    spatial_sub.set_view(chunk_x, chunk_z, config.network.view_distance);
+    // Subscribe to player lifecycle events (join/leave/chat — global).
     let mut player_rx = registry.subscribe();
 
     // ── Multiplayer: send existing players to newcomer, then register ───
@@ -870,88 +877,25 @@ where
                                         pos.x as i64, pos.y as i64, pos.z as i64,
                                     );
 
-                                    // Fresh causal graph per action -- the world state is the
-                                    // persistent data; the graph is scratch space for the cascade.
-                                    let mut graph = CausalGraph::new();
-                                    let old = world.get_block(epos);
-                                    let root = graph.insert_root(Event {
-                                        payload: EventPayload::BlockSet {
-                                            pos: epos,
-                                            old,
-                                            new: BlockId::AIR,
-                                        },
+                                    // Submit to the shared physics service; the
+                                    // cascade runs off this task. `old` is our
+                                    // observation — physics' stale-precondition
+                                    // guard drops the action if another event
+                                    // got to the cell first.
+                                    physics.submit_action(BlockAction {
+                                        pos: epos,
+                                        old: world.get_block(epos),
+                                        new: BlockId::AIR,
+                                        update_stairs: true,
                                     });
-                                    // Notify all 6 neighbors (causal children of the break)
-                                    for neighbor in epos.neighbors() {
-                                        graph.insert(Event {
-                                            payload: EventPayload::BlockNotify { pos: neighbor },
-                                        }, vec![root]);
-                                    }
 
-                                    // Run causal engine -- gravity, fluid spread cascade
-                                    let cascade_start = std::time::Instant::now();
-                                    let cascade_events = scheduler.run_until_quiet(world, &mut graph, &rules, 1000);
-                                    let cascade_dur = cascade_start.elapsed();
-
-                                    // Record metrics + publish graph snapshot (non-blocking).
-                                    dashboard.metrics.record_cascade(
-                                        graph.len() as u64,
-                                        cascade_dur,
-                                    );
-                                    dashboard.publish_graph(dashboard::snapshot_graph(&graph));
-
-                                    // Collect changes and publish to event bus (other players pick these up).
-                                    let mut changes = event_bus::collect_block_changes(&graph);
-                                    let light_changes = event_bus::collect_light_changes(&graph);
-
-                                    // Update adjacent stair shapes (the broken
-                                    // block is now air, so neighbors revert).
-                                    let stair_updates =
-                                        crate::placement::update_adjacent_stair_shapes(world, epos);
-                                    for &(npos, new_id) in &stair_updates {
-                                        world.set_block(npos, new_id);
-                                        changes.push((npos, new_id));
-                                    }
-
-                                    // Send light updates BEFORE block updates so
-                                    // that when the client re-renders the chunk
-                                    // (triggered by the block update), the light
-                                    // data is already up to date.
-                                    send_light_updates(write, compression, cipher_enc, world, &light_changes).await?;
-
-                                    for &(ep, new) in &changes {
-                                        let mc_pos = azalea_core::position::BlockPos::new(
-                                            ep.x as i32, ep.y as i32, ep.z as i32,
-                                        );
-                                        let mc_state = engine_block_to_mc(new);
-                                        let update: ClientboundGamePacket = ClientboundBlockUpdate {
-                                            pos: mc_pos,
-                                            block_state: mc_state,
-                                        }.into_variant();
-                                        write_packet(&update, write, compression, cipher_enc).await?;
-                                    }
-
-                                    // Publish to bus for other players.
-                                    if !changes.is_empty() || !light_changes.is_empty() {
-                                        let _ = bus_tx.send(WorldChangeBatch {
-                                            source: ChangeSource::Player(conn_id),
-                                            changes: changes.into(),
-                                            light_changes: light_changes.into(),
-                                        });
-                                    }
-
-                                    // Acknowledge the sequence
+                                    // Acknowledge the sequence immediately; the
+                                    // authoritative block updates arrive via the
+                                    // event bus once the cascade settles.
                                     let ack: ClientboundGamePacket = ClientboundBlockChangedAck {
                                         seq: action.seq,
                                     }.into_variant();
                                     write_packet(&ack, write, compression, cipher_enc).await?;
-
-                                    if cascade_events > 0 {
-                                        tracing::info!(
-                                            "Block break at ({},{},{}) -> {} causal events in {:?}",
-                                            pos.x, pos.y, pos.z, cascade_events, cascade_dur
-                                        );
-                                    }
                                 }
                             }
 
@@ -995,86 +939,22 @@ where
                                 let old = world.get_block(epos);
                                 let new_id = BlockId::new(u32::from(held) as u16);
 
-                                // Fresh causal graph per action.
-                                let mut graph = CausalGraph::new();
-                                let root = graph.insert_root(Event {
-                                    payload: EventPayload::BlockSet {
-                                        pos: epos,
-                                        old,
-                                        new: new_id,
-                                    },
+                                // Submit to the shared physics service; gravity,
+                                // fluid, and light cascades run off this task and
+                                // come back via the event bus.
+                                physics.submit_action(BlockAction {
+                                    pos: epos,
+                                    old,
+                                    new: new_id,
+                                    update_stairs: true,
                                 });
-                                // Notify all 6 neighbors (gravity, fluid rules react).
-                                for neighbor in epos.neighbors() {
-                                    graph.insert(Event {
-                                        payload: EventPayload::BlockNotify { pos: neighbor },
-                                    }, vec![root]);
-                                }
 
-                                // Run causal engine to quiescence.
-                                let cascade_start = std::time::Instant::now();
-                                let cascade_events = scheduler.run_until_quiet(world, &mut graph, &rules, 1000);
-                                let cascade_dur = cascade_start.elapsed();
-
-                                // Record metrics + publish graph snapshot.
-                                dashboard.metrics.record_cascade(
-                                    graph.len() as u64,
-                                    cascade_dur,
-                                );
-                                dashboard.publish_graph(dashboard::snapshot_graph(&graph));
-
-                                // Collect changes and publish to event bus.
-                                let mut changes = event_bus::collect_block_changes(&graph);
-                                let light_changes = event_bus::collect_light_changes(&graph);
-
-                                // Update adjacent stair shapes (the placed block
-                                // is now in the world so neighbors can see it).
-                                let stair_updates =
-                                    crate::placement::update_adjacent_stair_shapes(world, epos);
-                                for &(npos, new_id) in &stair_updates {
-                                    world.set_block(npos, new_id);
-                                    changes.push((npos, new_id));
-                                }
-
-                                // Send light updates BEFORE block updates so
-                                // that when the client re-renders the chunk
-                                // (triggered by the block update), the light
-                                // data is already up to date.
-                                send_light_updates(write, compression, cipher_enc, world, &light_changes).await?;
-
-                                for &(ep, new) in &changes {
-                                    let mc_pos = azalea_core::position::BlockPos::new(
-                                        ep.x as i32, ep.y as i32, ep.z as i32,
-                                    );
-                                    let mc_state = engine_block_to_mc(new);
-                                    let update: ClientboundGamePacket = ClientboundBlockUpdate {
-                                        pos: mc_pos,
-                                        block_state: mc_state,
-                                    }.into_variant();
-                                    write_packet(&update, write, compression, cipher_enc).await?;
-                                }
-
-                                // Publish to bus for other players.
-                                if !changes.is_empty() || !light_changes.is_empty() {
-                                    let _ = bus_tx.send(WorldChangeBatch {
-                                        source: ChangeSource::Player(conn_id),
-                                        changes: changes.into(),
-                                        light_changes: light_changes.into(),
-                                    });
-                                }
-
-                                // Acknowledge
+                                // Acknowledge immediately; authoritative updates
+                                // arrive via the event bus once the cascade settles.
                                 let ack: ClientboundGamePacket = ClientboundBlockChangedAck {
                                     seq: place.seq,
                                 }.into_variant();
                                 write_packet(&ack, write, compression, cipher_enc).await?;
-
-                                if cascade_events > 0 {
-                                    tracing::info!(
-                                        "Block place at ({},{},{}) -> {} causal events in {:?}",
-                                        target.x, target.y, target.z, cascade_events, cascade_dur
-                                    );
-                                }
                             }
 
                             // ── Creative inventory slot update ───────────
@@ -1116,6 +996,7 @@ where
                                     &mut loaded_chunks, &mut sent_to_client,
                                     &mut chunk_send_queue,
                                 ).await?;
+                                spatial_sub.set_view(current_chunk_x, current_chunk_z, view_distance);
                             }
                             ServerboundGamePacket::MovePlayerPosRot(pkt) => {
                                 player_x = pkt.pos.x;
@@ -1135,6 +1016,7 @@ where
                                     &mut loaded_chunks, &mut sent_to_client,
                                     &mut chunk_send_queue,
                                 ).await?;
+                                spatial_sub.set_view(current_chunk_x, current_chunk_z, view_distance);
                             }
                             ServerboundGamePacket::MovePlayerRot(pkt) => {
                                 player_y_rot = pkt.look_direction.y_rot();
@@ -1174,45 +1056,87 @@ where
                 }
             }
 
-            // ── Event bus: receive world changes from other players / simulation ──
-            result = bus_rx.recv() => {
-                match result {
-                    Ok(batch) => {
-                        // Skip changes we originated ourselves.
-                        if batch.source == ChangeSource::Player(conn_id) {
-                            continue;
+            // ── Spatial bus: world changes + entity moves near this player ──
+            // Region-scoped (Phase 6f): we only receive events for regions
+            // inside our subscribed view, so a busy far-away area costs us
+            // nothing. World batches apply in arrival order; movement
+            // bursts coalesce to the newest absolute position per entity
+            // (entity-tracker pattern).
+            spatial_msg = spatial_rx.recv() => {
+                let Some(first) = spatial_msg else {
+                    tracing::info!("{}: spatial bus closed", player_name);
+                    break;
+                };
+                let mut burst = vec![first];
+                while burst.len() < 8192 {
+                    match spatial_rx.try_recv() {
+                        Ok(m) => burst.push(m),
+                        Err(_) => break,
+                    }
+                }
+                let mut latest_move: std::collections::HashMap<i32, PlayerEvent> =
+                    std::collections::HashMap::new();
+
+                for msg in &burst {
+                    match &**msg {
+                        event_bus::SpatialMsg::World(batch) => {
+                            // Light updates before block updates so the
+                            // client re-renders with fresh light data.
+                            if !batch.light_changes.is_empty() {
+                                send_light_updates(write, compression, cipher_enc, world, &batch.light_changes).await?;
+                            }
+                            for &(pos, new_block) in batch.changes.iter() {
+                                let mc_pos = azalea_core::position::BlockPos::new(
+                                    pos.x as i32, pos.y as i32, pos.z as i32,
+                                );
+                                let mc_state = engine_block_to_mc(new_block);
+                                let update: ClientboundGamePacket = ClientboundBlockUpdate {
+                                    pos: mc_pos,
+                                    block_state: mc_state,
+                                }.into_variant();
+                                write_packet(&update, write, compression, cipher_enc).await?;
+                            }
                         }
-                        // Send light updates before block updates so the
-                        // client re-renders with up-to-date light data.
-                        if !batch.light_changes.is_empty() {
-                            send_light_updates(write, compression, cipher_enc, world, &batch.light_changes).await?;
-                        }
-                        for &(pos, new_block) in batch.changes.iter() {
-                            let mc_pos = azalea_core::position::BlockPos::new(
-                                pos.x as i32, pos.y as i32, pos.z as i32,
-                            );
-                            let mc_state = engine_block_to_mc(new_block);
-                            let update: ClientboundGamePacket = ClientboundBlockUpdate {
-                                pos: mc_pos,
-                                block_state: mc_state,
-                            }.into_variant();
-                            write_packet(&update, write, compression, cipher_enc).await?;
+                        event_bus::SpatialMsg::Move(ev) => {
+                            if let PlayerEvent::Moved { entity_id, .. } = ev {
+                                latest_move.insert(*entity_id, ev.clone());
+                            }
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        // We fell behind -- some batches were dropped. The client
-                        // will self-correct on the next chunk load. Log and continue.
-                        tracing::warn!("{} event bus lagged, skipped {} batches", player_name, n);
+                }
+
+                for ev in latest_move.into_values() {
+                    let PlayerEvent::Moved { conn_id: moved_id, entity_id: eid, x, y, z, y_rot, x_rot, on_ground } = ev else {
+                        continue;
+                    };
+                    if moved_id == conn_id { continue; }
+                    // Fine AOI filter on top of region-granular delivery.
+                    let aoi = ((config.network.view_distance as f64) + 2.0) * 16.0;
+                    if (x - player_x).abs() > aoi || (z - player_z).abs() > aoi {
+                        continue;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        // Bus shut down (server stopping).
-                        tracing::info!("{}: event bus closed", player_name);
-                        break;
-                    }
+
+                    let tp: ClientboundGamePacket = ClientboundTeleportEntity {
+                        id: MinecraftEntityId(eid),
+                        change: PositionMoveRotation {
+                            pos: Vec3 { x, y, z },
+                            delta: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+                            look_direction: LookDirection::new(y_rot, x_rot),
+                        },
+                        relative: RelativeMovements::default(),
+                        on_ground,
+                    }.into_variant();
+                    write_packet(&tp, write, compression, cipher_enc).await?;
+
+                    let head: ClientboundGamePacket = ClientboundRotateHead {
+                        entity_id: MinecraftEntityId(eid),
+                        y_head_rot: degrees_to_byte_angle(y_rot),
+                    }.into_variant();
+                    write_packet(&head, write, compression, cipher_enc).await?;
                 }
             }
 
-            // ── Player events: join/leave notifications from other connections ──
+            // ── Player lifecycle: join/leave/chat (movement is spatial now) ──
             result = player_rx.recv() => {
                 match result {
                     Ok(event) => {
@@ -1264,28 +1188,9 @@ where
                                 }.into_variant();
                                 write_packet(&spawn_pkt, write, compression, cipher_enc).await?;
                             }
-                            PlayerEvent::Moved { conn_id: moved_id, entity_id: eid, x, y, z, y_rot, x_rot, on_ground } => {
-                                if moved_id == conn_id { continue; }
-
-                                // Teleport the entity to the new absolute position.
-                                let tp: ClientboundGamePacket = ClientboundTeleportEntity {
-                                    id: MinecraftEntityId(eid),
-                                    change: PositionMoveRotation {
-                                        pos: Vec3 { x, y, z },
-                                        delta: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
-                                        look_direction: LookDirection::new(y_rot, x_rot),
-                                    },
-                                    relative: RelativeMovements::default(), // all absolute
-                                    on_ground,
-                                }.into_variant();
-                                write_packet(&tp, write, compression, cipher_enc).await?;
-
-                                // Update head rotation (MC renders head separately).
-                                let head: ClientboundGamePacket = ClientboundRotateHead {
-                                    entity_id: MinecraftEntityId(eid),
-                                    y_head_rot: degrees_to_byte_angle(y_rot),
-                                }.into_variant();
-                                write_packet(&head, write, compression, cipher_enc).await?;
+                            PlayerEvent::Moved { .. } => {
+                                // Movement is delivered through the spatial
+                                // bus; nothing should arrive here.
                             }
                             PlayerEvent::Left { conn_id: left_id, entity_id: eid, uuid } => {
                                 if left_id == conn_id { continue; }
@@ -1555,6 +1460,13 @@ fn ensure_sky_light(world: &World, cx: i32, cz: i32) {
 
     // Single write-lock acquisition for the whole chunk.
     if let Some(mut chunk) = world.get_chunk_mut(&cp) {
+        // Re-check under the lock: with many players joining at once,
+        // hundreds of tasks pass the lock-free `is_sky_lit` check above
+        // and queue here — without this, each would redo the full-chunk
+        // scan (a thundering herd measured at 1,000 concurrent joins).
+        if world.is_sky_lit(&cp) {
+            return;
+        }
         for lx in 0..16u8 {
             for lz in 0..16u8 {
                 let mut sky_level: u8 = 15;
@@ -1573,8 +1485,13 @@ fn ensure_sky_light(world: &World, cx: i32, cz: i32) {
                 }
             }
         }
+        // Mark while still holding the chunk guard so the under-lock
+        // re-check above is exact (no scan/mark race window).
+        world.mark_sky_lit(cp);
+        return;
     }
 
+    // Chunk absent: nothing to scan, but mark so we don't retry forever.
     world.mark_sky_lit(cp);
 }
 
@@ -1640,9 +1557,31 @@ async fn send_chunk_from_world<W: AsyncWrite + Unpin + Send>(
             continue;
         };
 
-        // Scan the section's flat block array directly. Order matches
-        // ChunkSection::index: y * 256 + z * 16 + x.
-        let blocks = section.blocks();
+        // Uniform fast path: a single-entry palette means every cell is
+        // that block — no per-cell scan needed at all (Phase 6c paletted
+        // sections make this O(1)).
+        if section.palette().len() == 1 {
+            let only = section.palette()[0];
+            if only == BlockId::AIR {
+                write_empty_section(&mut section_data, &biomes)?;
+            } else {
+                let top = section_base_y + 15;
+                for h in highest_y.iter_mut() {
+                    if top > *h {
+                        *h = top;
+                    }
+                }
+                write_single_section(&mut section_data, only.0 as u32, &biomes)?;
+            }
+            continue;
+        }
+
+        // General path: materialize the section once (cheap palette-index
+        // reads) and scan in XZY order (y * 256 + z * 16 + x).
+        let mut blocks = [BlockId::AIR; 4096];
+        for (idx, b) in blocks.iter_mut().enumerate() {
+            *b = section.get_by_index(idx);
+        }
         let first = blocks[0];
         let mut all_same = true;
         let mut non_air: u16 = 0;
@@ -1672,7 +1611,7 @@ async fn send_chunk_from_world<W: AsyncWrite + Unpin + Send>(
                 write_single_section(&mut section_data, first.0 as u32, &biomes)?;
             }
         } else {
-            write_section_from_blocks(&mut section_data, blocks, non_air, &biomes)?;
+            write_section_from_blocks(&mut section_data, &blocks, non_air, &biomes)?;
         }
     }
     drop(chunk_ref);
@@ -1787,6 +1726,14 @@ async fn send_chunk_from_world<W: AsyncWrite + Unpin + Send>(
     // Extra section above (bit 25): empty
     empty_sky_y_mask.set(num_light_sections - 1);
     empty_block_y_mask.set(num_light_sections - 1);
+
+    // CRITICAL: release the DashMap read guard BEFORE the awaits below.
+    // A guard held across an await parks with its task; under hundreds of
+    // concurrent joins all reading the same spawn chunks, the write-side
+    // (`ensure_sky_light`'s `get_chunk_mut`) then blocks tokio worker
+    // threads on locks whose holders can never be polled — wedging the
+    // whole runtime (found by the 1,000-player load test: 0 joins, ~0 CPU).
+    drop(chunk_ref);
 
     sky_y_mask.azalea_write(&mut raw_packet)?;
     block_y_mask.azalea_write(&mut raw_packet)?;
@@ -2083,6 +2030,11 @@ async fn send_light_updates<W: AsyncWrite + Unpin + Send>(
                 }
             }
         }
+
+        // Release the read guard BEFORE the packet write awaits below —
+        // guards held across awaits wedge the runtime under load (see
+        // the matching comment in send_chunk_from_world).
+        drop(chunk_ref);
 
         // Build the LightUpdate packet manually (azalea's Write impls
         // don't always match the server-side wire format).

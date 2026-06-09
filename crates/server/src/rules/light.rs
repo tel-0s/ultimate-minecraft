@@ -50,6 +50,82 @@ fn update_light(world: &World, pos: BlockPos, old: BlockId, new: BlockId) -> Vec
     events
 }
 
+// ── Cached world access ──────────────────────────────────────────────────────
+
+/// Last-chunk-memoized world access for the BFS hot loops.
+///
+/// `bench_access` measured the per-read `DashMap` lookup at ~59% of a
+/// block read's cost; BFS visits are spatially clustered, so caching the
+/// most recent chunk's guard removes most lookups. Holds at most ONE
+/// guard at a time — the previous guard is dropped before the next is
+/// acquired — so two workers flooding light near a shared border cannot
+/// deadlock on opposite acquisition orders.
+struct CachedWorld<'w> {
+    world: &'w World,
+    current: Option<(
+        ultimate_engine::world::position::ChunkPos,
+        dashmap::mapref::one::RefMut<'w, ultimate_engine::world::position::ChunkPos,
+            ultimate_engine::world::chunk::Chunk>,
+    )>,
+}
+
+impl<'w> CachedWorld<'w> {
+    fn new(world: &'w World) -> Self {
+        Self { world, current: None }
+    }
+
+    #[inline]
+    fn chunk(&mut self, pos: BlockPos) -> Option<&mut ultimate_engine::world::chunk::Chunk> {
+        let cp = pos.chunk();
+        let hit = matches!(&self.current, Some((c, _)) if *c == cp);
+        if !hit {
+            self.current = None; // release the old guard BEFORE acquiring
+            self.current = self.world.get_chunk_mut(&cp).map(|r| (cp, r));
+        }
+        self.current.as_mut().map(|(_, c)| &mut **c)
+    }
+
+    #[inline]
+    fn get_block(&mut self, pos: BlockPos) -> BlockId {
+        self.chunk(pos).map_or(BlockId::AIR, |c| c.get_block(pos.local()))
+    }
+
+    #[inline]
+    fn get_block_light(&mut self, pos: BlockPos) -> u8 {
+        self.chunk(pos).map_or(0, |c| c.get_block_light(pos.local()))
+    }
+
+    /// Mirrors `World::set_block_light_if_loaded`.
+    #[inline]
+    fn set_block_light_if_loaded(&mut self, pos: BlockPos, val: u8) -> bool {
+        match self.chunk(pos) {
+            Some(c) => {
+                c.set_block_light(pos.local(), val);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Mirrors `World::get_sky_light` (unloaded chunks read as full sky).
+    #[inline]
+    fn get_sky_light(&mut self, pos: BlockPos) -> u8 {
+        self.chunk(pos).map_or(15, |c| c.get_sky_light(pos.local()))
+    }
+
+    /// Mirrors `World::set_sky_light_if_loaded`.
+    #[inline]
+    fn set_sky_light_if_loaded(&mut self, pos: BlockPos, val: u8) -> bool {
+        match self.chunk(pos) {
+            Some(c) => {
+                c.set_sky_light(pos.local(), val);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 // ── Block light ──────────────────────────────────────────────────────────────
 
 /// BFS update for block-light after an emission/opacity change at `pos`.
@@ -93,23 +169,26 @@ fn update_block_light(
         // addition. Nothing extra needed.
     }
 
+    // BFS hot loops run on the chunk-memoized view (see `CachedWorld`).
+    let mut cw = CachedWorld::new(world);
+
     // Removal phase.
     while let Some((p, old_l)) = removal.pop_front() {
         for n in p.neighbors() {
             if n.y < MIN_Y || n.y > MAX_Y { continue; }
-            let n_block = world.get_block(n);
+            let n_block = cw.get_block(n);
             let n_emit = block::light_emission(n_block);
             if n_emit > 0 {
                 // Neighbor is an emitter — keep its level, re-propagate from it.
                 addition.push_back(n);
                 continue;
             }
-            let n_l = world.get_block_light(n);
+            let n_l = cw.get_block_light(n);
             if n_l == 0 { continue; }
             if n_l < old_l {
                 // Possibly lit by us; clear and propagate the removal outward.
                 record(&mut changed, n, n_l, 0);
-                world.set_block_light_if_loaded(n, 0);
+                cw.set_block_light_if_loaded(n, 0);
                 removal.push_back((n, n_l));
             } else {
                 // Independent source; re-propagate from it.
@@ -120,19 +199,19 @@ fn update_block_light(
 
     // Addition phase.
     while let Some(p) = addition.pop_front() {
-        let p_l = world.get_block_light(p);
+        let p_l = cw.get_block_light(p);
         if p_l == 0 { continue; }
         for n in p.neighbors() {
             if n.y < MIN_Y || n.y > MAX_Y { continue; }
-            let n_block = world.get_block(n);
+            let n_block = cw.get_block(n);
             let n_opacity = block::light_opacity(n_block);
             let n_emit = block::light_emission(n_block);
-            let n_current = world.get_block_light(n);
+            let n_current = cw.get_block_light(n);
             let from_p = p_l.saturating_sub(1.max(n_opacity));
             let target = from_p.max(n_emit);
             if target > n_current {
                 record(&mut changed, n, n_current, target);
-                if !world.set_block_light_if_loaded(n, target) { continue; }
+                if !cw.set_block_light_if_loaded(n, target) { continue; }
                 addition.push_back(n);
             }
         }
@@ -176,14 +255,17 @@ fn update_sky_light(
         addition.push_back(pos);
     }
 
+    // BFS hot loops run on the chunk-memoized view (see `CachedWorld`).
+    let mut cw = CachedWorld::new(world);
+
     while let Some((p, old_l)) = removal.pop_front() {
         for n in p.neighbors() {
             if n.y < MIN_Y || n.y > MAX_Y { continue; }
-            let n_l = world.get_sky_light(n);
+            let n_l = cw.get_sky_light(n);
             if n_l == 0 { continue; }
             if n_l < old_l {
                 record(&mut changed, n, n_l, 0);
-                world.set_sky_light_if_loaded(n, 0);
+                cw.set_sky_light_if_loaded(n, 0);
                 removal.push_back((n, n_l));
             } else {
                 addition.push_back(n);
@@ -192,13 +274,13 @@ fn update_sky_light(
     }
 
     while let Some(p) = addition.pop_front() {
-        let p_l = world.get_sky_light(p);
+        let p_l = cw.get_sky_light(p);
         if p_l == 0 { continue; }
         for n in p.neighbors() {
             if n.y < MIN_Y || n.y > MAX_Y { continue; }
-            let n_block = world.get_block(n);
+            let n_block = cw.get_block(n);
             let n_opacity = block::light_opacity(n_block);
-            let n_current = world.get_sky_light(n);
+            let n_current = cw.get_sky_light(n);
             // Column rule: moving down one cell at level 15 through a transparent
             // target preserves 15.
             let is_down_column = p_l == 15 && n.y == p.y - 1 && n_opacity == 0;
@@ -209,7 +291,7 @@ fn update_sky_light(
             };
             if target > n_current {
                 record(&mut changed, n, n_current, target);
-                if !world.set_sky_light_if_loaded(n, target) { continue; }
+                if !cw.set_sky_light_if_loaded(n, target) { continue; }
                 addition.push_back(n);
             }
         }
@@ -254,17 +336,23 @@ fn emit_light_events(
     light_type: LightType,
     events: &mut Vec<Event>,
 ) {
-    events.reserve(changed.len());
-    for (cell, (old_v, new_v)) in changed {
-        if old_v != new_v {
-            events.push(Event {
-                payload: EventPayload::LightSet {
-                    pos: cell,
-                    light_type,
-                    old: old_v,
-                    new: new_v,
-                },
-            });
-        }
+    // ONE LightBatch event per flood instead of one LightSet per cell:
+    // these are reporting-only (the BFS already wrote light storage), and
+    // per-cell events made graph bookkeeping ~95% of a torch placement's
+    // cost (~1,800 inserts/executes/reaps for zero physics).
+    let cells: Vec<ultimate_engine::causal::event::LightCell> = changed
+        .into_iter()
+        .filter(|(_, (old_v, new_v))| old_v != new_v)
+        .map(|(pos, (old, new))| ultimate_engine::causal::event::LightCell {
+            pos,
+            light_type,
+            old,
+            new,
+        })
+        .collect();
+    if !cells.is_empty() {
+        events.push(Event {
+            payload: EventPayload::LightBatch { changes: cells.into() },
+        });
     }
 }

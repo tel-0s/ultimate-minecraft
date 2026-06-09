@@ -1,11 +1,10 @@
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
 use ultimate_engine::world::World;
 
 use crate::config::ServerConfig;
 use crate::dashboard::DashboardState;
-use crate::event_bus::WorldChangeBatch;
+use crate::event_bus::SpatialBus;
 use crate::player_registry::PlayerRegistry;
 use crate::worldgen::WorldGen;
 
@@ -13,10 +12,11 @@ use crate::worldgen::WorldGen;
 pub async fn run(
     world: Arc<World>,
     dashboard: Arc<DashboardState>,
-    bus_tx: broadcast::Sender<WorldChangeBatch>,
+    spatial: Arc<SpatialBus>,
     registry: Arc<PlayerRegistry>,
     worldgen: Arc<dyn WorldGen>,
     config: Arc<ServerConfig>,
+    physics: crate::physics::PhysicsHandle,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&config.network.bind).await?;
     tracing::info!("Listening on {}", config.network.bind);
@@ -34,12 +34,13 @@ pub async fn run(
 
         let world = Arc::clone(&world);
         let dashboard = Arc::clone(&dashboard);
-        let bus_tx = bus_tx.clone();
+        let spatial = Arc::clone(&spatial);
         let registry = Arc::clone(&registry);
         let worldgen = Arc::clone(&worldgen);
         let config = Arc::clone(&config);
+        let physics = physics.clone();
         tokio::spawn(async move {
-            if let Err(e) = super::connection::handle(stream, world, dashboard, bus_tx, registry, worldgen, config).await {
+            if let Err(e) = super::connection::handle(stream, world, dashboard, spatial, registry, worldgen, config, physics).await {
                 tracing::warn!("Connection from {} closed: {}", addr, e);
             }
         });

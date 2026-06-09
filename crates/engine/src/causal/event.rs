@@ -20,6 +20,15 @@ pub struct Event {
     pub payload: EventPayload,
 }
 
+/// One cell of a [`EventPayload::LightBatch`].
+#[derive(Debug, Clone, Copy)]
+pub struct LightCell {
+    pub pos: BlockPos,
+    pub light_type: LightType,
+    pub old: u8,
+    pub new: u8,
+}
+
 /// What happened.
 #[derive(Debug, Clone)]
 pub enum EventPayload {
@@ -41,6 +50,14 @@ pub enum EventPayload {
         new: u8,
     },
 
+    /// Every cell changed by ONE synchronous light flood (BFS inside the
+    /// light rule). Reporting-only: the rule already wrote light storage;
+    /// this event exists so the write log / clients learn what changed.
+    /// One graph node instead of thousands of per-cell `LightSet`s — a
+    /// torch placement was paying ~1,800 events of pure bookkeeping.
+    /// `Arc` keeps `Event` clones cheap.
+    LightBatch { changes: std::sync::Arc<[LightCell]> },
+
     /// A position's light should be recalculated (a neighbor's light changed).
     LightNotify { pos: BlockPos },
 }
@@ -52,6 +69,7 @@ impl Event {
             | EventPayload::BlockNotify { pos }
             | EventPayload::LightSet { pos, .. }
             | EventPayload::LightNotify { pos } => vec![*pos],
+            EventPayload::LightBatch { changes } => changes.iter().map(|c| c.pos).collect(),
         }
     }
 
@@ -62,6 +80,11 @@ impl Event {
             | EventPayload::BlockNotify { pos }
             | EventPayload::LightSet { pos, .. }
             | EventPayload::LightNotify { pos } => pos.chunk(),
+            // A light flood spans chunks; its origin cell anchors it.
+            EventPayload::LightBatch { changes } => changes
+                .first()
+                .map(|c| c.pos.chunk())
+                .unwrap_or(ChunkPos::new(0, 0)),
         }
     }
 }
@@ -85,7 +108,9 @@ impl EventPayload {
         match self {
             EventPayload::BlockNotify { pos } => Some(DedupKey::BlockNotify(*pos)),
             EventPayload::LightNotify { pos } => Some(DedupKey::LightNotify(*pos)),
-            _ => None,
+            EventPayload::BlockSet { .. }
+            | EventPayload::LightSet { .. }
+            | EventPayload::LightBatch { .. } => None,
         }
     }
 }

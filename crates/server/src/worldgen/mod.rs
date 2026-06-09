@@ -31,8 +31,13 @@ use ultimate_engine::world::position::ChunkPos;
 /// `Chunk` from a `(cx, cz)` coordinate. Generation must be deterministic
 /// from the generator's internal seed.
 pub trait WorldGen: Send + Sync + 'static {
-    /// Generate the chunk at `(cx, cz)` from scratch.
-    fn generate_chunk(&self, cx: i32, cz: i32) -> Chunk;
+    /// Generate the chunk at `(cx, cz)` from scratch. The `world` reference
+    /// is for *cross-chunk* features (tree canopies spanning chunk borders,
+    /// future multi-chunk structures): when a decorator writes to a chunk
+    /// other than the in-flight one, the pipeline either mutates it via
+    /// `world.set_block` if already loaded, or queues the write for when
+    /// that chunk is eventually generated.
+    fn generate_chunk(&self, cx: i32, cz: i32, world: &World) -> Chunk;
 
     /// Recommended Y coordinate for the player to spawn at, given an XZ
     /// position. Generators that have a sea level or surface height should
@@ -65,7 +70,7 @@ pub trait WorldGen: Send + Sync + 'static {
         for cx in -chunk_radius..chunk_radius {
             for cz in -chunk_radius..chunk_radius {
                 if !world.has_chunk(ChunkPos::new(cx, cz)) {
-                    let chunk = self.generate_chunk(cx, cz);
+                    let chunk = self.generate_chunk(cx, cz, world);
                     world.insert_chunk(ChunkPos::new(cx, cz), chunk);
                 }
             }
@@ -78,7 +83,7 @@ pub trait WorldGen: Send + Sync + 'static {
     fn ensure_generated(&self, world: &World, cx: i32, cz: i32) {
         let pos = ChunkPos::new(cx, cz);
         if !world.has_chunk(pos) {
-            let chunk = self.generate_chunk(cx, cz);
+            let chunk = self.generate_chunk(cx, cz, world);
             world.insert_chunk(pos, chunk);
         }
     }

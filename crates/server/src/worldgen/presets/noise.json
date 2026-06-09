@@ -12,32 +12,57 @@
       "argument1": {
         "type": "add",
         "argument1": {
-          "type": "add",
-          "argument1": { "type": "constant", "value": 75.0 },
-          "argument2": {
-            "type": "mul",
-            "argument1": {
-              "type": "noise2d",
-              "seed_offset": 0,
-              "frequency": 0.001953125,
-              "octaves": 4,
-              "persistence": 0.55,
-              "lacunarity": 2.0
-            },
-            "argument2": { "type": "constant", "value": 28.0 }
-          }
+          "type": "spline",
+          "input": {
+            "type": "noise2d",
+            "seed_offset": 0,
+            "frequency": 0.0009765625,
+            "octaves": 3,
+            "persistence": 0.55,
+            "lacunarity": 2.0
+          },
+          "points": [
+            { "input": -1.0, "output": 40.0 },
+            { "input": -0.5, "output": 55.0 },
+            { "input": -0.2, "output": 62.0 },
+            { "input":  0.0, "output": 67.0 },
+            { "input":  0.3, "output": 74.0 },
+            { "input":  0.6, "output": 85.0 },
+            { "input":  0.85,"output": 95.0 },
+            { "input":  1.0, "output": 105.0 }
+          ]
         },
         "argument2": {
           "type": "mul",
           "argument1": {
-            "type": "noise2d",
-            "seed_offset": 1,
-            "frequency": 0.010416666666666666,
-            "octaves": 4,
-            "persistence": 0.5,
-            "lacunarity": 2.0
+            "type": "spline",
+            "input": {
+              "type": "noise2d",
+              "seed_offset": 3,
+              "frequency": 0.0025,
+              "octaves": 3,
+              "persistence": 0.5,
+              "lacunarity": 2.0
+            },
+            "points": [
+              { "input": -1.0, "output": 0.35 },
+              { "input":  0.0, "output": 0.65 },
+              { "input":  0.5, "output": 0.85 },
+              { "input":  1.0, "output": 1.0  }
+            ]
           },
-          "argument2": { "type": "constant", "value": 18.0 }
+          "argument2": {
+            "type": "mul",
+            "argument1": {
+              "type": "noise2d",
+              "seed_offset": 1,
+              "frequency": 0.010416666666666666,
+              "octaves": 4,
+              "persistence": 0.5,
+              "lacunarity": 2.0
+            },
+            "argument2": { "type": "constant", "value": 18.0 }
+          }
         }
       },
       "argument2": {
@@ -174,7 +199,7 @@
       "log_block": "minecraft:oak_log",
       "leaves_block": "minecraft:oak_leaves",
       "surface_block": "minecraft:grass_block",
-      "attempts_per_chunk": 8,
+      "attempts_per_chunk": 4,
       "trunk_min": 4,
       "trunk_max": 7,
       "min_y": 60,
@@ -186,7 +211,7 @@
       "log_block": "minecraft:birch_log",
       "leaves_block": "minecraft:birch_leaves",
       "surface_block": "minecraft:grass_block",
-      "attempts_per_chunk": 3,
+      "attempts_per_chunk": 2,
       "trunk_min": 5,
       "trunk_max": 7,
       "min_y": 60,
@@ -204,6 +229,32 @@
       "min_y": 60,
       "max_y": 110,
       "in_biomes": ["snowy_plains"]
+    },
+    {
+      "type": "plant",
+      "blocks": [
+        { "block": "minecraft:short_grass", "weight": 36 },
+        "minecraft:dandelion", "minecraft:poppy",
+        "minecraft:oxeye_daisy", "minecraft:cornflower"
+      ],
+      "surface_block": "minecraft:grass_block",
+      "attempts_per_chunk": 40,
+      "min_y": 60,
+      "max_y": 110,
+      "in_biomes": ["plains"]
+    },
+    {
+      "type": "plant",
+      "blocks": [
+        { "block": "minecraft:short_grass", "weight": 12 },
+        { "block": "minecraft:fern", "weight": 4 },
+        "minecraft:poppy"
+      ],
+      "surface_block": "minecraft:grass_block",
+      "attempts_per_chunk": 25,
+      "min_y": 60,
+      "max_y": 110,
+      "in_biomes": ["forest"]
     }
   ],
 

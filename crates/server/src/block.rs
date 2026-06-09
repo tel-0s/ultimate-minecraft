@@ -148,9 +148,39 @@ pub fn is_solid(id: BlockId) -> bool {
 }
 
 // ── Light property queries ──────────────────────────────────────────────
+//
+// The `*_uncached` functions resolve properties through azalea's
+// `Box<dyn BlockTrait>` — a heap allocation plus string matching PER
+// CALL, which dominated the light BFS inner loop (~84K property queries
+// per torch placement). The public functions read one-time lookup tables
+// built over the whole block-state space (~2 × 27 KB) at first use.
+
+static LIGHT_EMISSION_LUT: std::sync::LazyLock<Box<[u8]>> = std::sync::LazyLock::new(|| {
+    (0..=azalea_block::BlockState::MAX_STATE)
+        .map(|raw| light_emission_uncached(BlockId(raw as u16)))
+        .collect()
+});
+
+static LIGHT_OPACITY_LUT: std::sync::LazyLock<Box<[u8]>> = std::sync::LazyLock::new(|| {
+    (0..=azalea_block::BlockState::MAX_STATE)
+        .map(|raw| light_opacity_uncached(BlockId(raw as u16)))
+        .collect()
+});
+
+/// How much light this block emits (0-15). LUT-backed; O(1).
+#[inline]
+pub fn light_emission(id: BlockId) -> u8 {
+    LIGHT_EMISSION_LUT.get(id.0 as usize).copied().unwrap_or(0)
+}
+
+/// How much light this block absorbs (0-15). LUT-backed; O(1).
+#[inline]
+pub fn light_opacity(id: BlockId) -> u8 {
+    LIGHT_OPACITY_LUT.get(id.0 as usize).copied().unwrap_or(15)
+}
 
 /// How much light this block emits (0-15).
-pub fn light_emission(id: BlockId) -> u8 {
+fn light_emission_uncached(id: BlockId) -> u8 {
     use azalea_block::{BlockState, BlockTrait};
 
     // Fast path: air and common solid blocks never emit light.
@@ -234,7 +264,7 @@ pub fn light_emission(id: BlockId) -> u8 {
 /// 0 = fully transparent (air, glass, flowers, etc.)
 /// 15 = fully opaque (stone, dirt, etc.)
 /// 1 = slightly attenuating (water, ice, leaves)
-pub fn light_opacity(id: BlockId) -> u8 {
+fn light_opacity_uncached(id: BlockId) -> u8 {
     use azalea_block::{BlockState, BlockTrait};
 
     // Fast path: the vast majority of blocks hit during light propagation

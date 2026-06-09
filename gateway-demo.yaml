@@ -1,0 +1,17 @@
+# Gateway-node demo config (Phase 6f): this server owns NO regions —
+# node 1 of 2 with physics_nodes=1 — so every block action is submitted
+# over the cluster link to the physics peer, and all world changes come
+# back as WriteSync replica updates.
+network:
+  bind: "0.0.0.0:25565"
+world:
+  dir: "world-gateway-demo"
+  seed: 12648430
+  pregenerate_radius: 8
+cluster:
+  enabled: true
+  node_id: 1
+  total_nodes: 2
+  physics_nodes: 1
+  listen: "127.0.0.1:25621"
+  peers: ["127.0.0.1:25620"]

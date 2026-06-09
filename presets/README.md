@@ -67,14 +67,19 @@ Every node has a `type` field. Leaf nodes:
 
 Combinators (every "binary" combinator has `argument1` and `argument2`):
 
-| Type    | Behavior                                |
-|---------|-----------------------------------------|
-| `add`   | `argument1 + argument2`                 |
-| `sub`   | `argument1 - argument2`                 |
-| `mul`   | `argument1 * argument2`                 |
-| `min`   | `min(argument1, argument2)`             |
-| `max`   | `max(argument1, argument2)`             |
-| `clamp` | `clamp(input, min, max)` — three fields |
+| Type     | Behavior                                                                     |
+|----------|------------------------------------------------------------------------------|
+| `add`    | `argument1 + argument2`                                                      |
+| `sub`    | `argument1 - argument2`                                                      |
+| `mul`    | `argument1 * argument2`                                                      |
+| `min`    | `min(argument1, argument2)`                                                  |
+| `max`    | `max(argument1, argument2)`                                                  |
+| `clamp`  | `clamp(input, min, max)` — three fields                                      |
+| `spline` | Piecewise-linear remap of `input` through `points: [{ input, output }, …]`.  |
+|          | Inputs outside the range clamp to endpoints; out-of-order points are sorted. |
+|          | Used to map low-frequency climate noise (continentalness, erosion, PV) to a  |
+|          | non-linear terrain contribution: e.g., most of the range maps to "land",     |
+|          | small tails map to "deep ocean" and "mountain peak".                         |
 
 ## Authoring tip
 

@@ -50,6 +50,17 @@ impl World {
         self.dirty.insert(chunk_pos);
     }
 
+    /// Write a block WITHOUT marking the chunk dirty. For world generation
+    /// only (e.g. a feature spilling across a chunk border): the write is
+    /// part of procedural terrain, not a gameplay modification, so it must
+    /// not cause the chunk to be persisted.
+    pub fn set_block_untracked(&self, pos: BlockPos, block: BlockId) {
+        self.chunks
+            .entry(pos.chunk())
+            .or_default()
+            .set_block(pos.local(), block);
+    }
+
     pub fn has_chunk(&self, pos: ChunkPos) -> bool {
         self.chunks.contains_key(&pos)
     }
@@ -57,6 +68,20 @@ impl World {
     /// Insert a chunk without marking it dirty (used for generation/loading).
     pub fn insert_chunk(&self, pos: ChunkPos, chunk: Chunk) {
         self.chunks.insert(pos, chunk);
+    }
+
+    /// Remove a chunk entirely (Phase 6c eviction). Also clears its
+    /// sky-light bookkeeping so a future regeneration relights it.
+    /// Callers are responsible for ensuring the chunk is reproducible
+    /// (procedural baseline + persisted delta) before evicting.
+    pub fn remove_chunk(&self, pos: ChunkPos) -> bool {
+        self.sky_lit.remove(&pos);
+        self.chunks.remove(&pos).is_some()
+    }
+
+    /// Whether this chunk has unsaved modifications.
+    pub fn is_dirty(&self, pos: ChunkPos) -> bool {
+        self.dirty.contains(&pos)
     }
 
     pub fn chunk_count(&self) -> usize {
@@ -167,5 +192,25 @@ impl World {
 impl Default for World {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_block_marks_dirty_but_untracked_does_not() {
+        let world = World::new();
+        let pos_a = BlockPos::new(1, 10, 1);
+        let pos_b = BlockPos::new(40, 10, 40); // different chunk
+
+        world.set_block_untracked(pos_a, BlockId::new(7));
+        assert_eq!(world.get_block(pos_a), BlockId::new(7), "write must land");
+        assert_eq!(world.dirty_count(), 0, "untracked write must not dirty");
+
+        world.set_block(pos_b, BlockId::new(8));
+        assert_eq!(world.dirty_count(), 1);
+        assert_eq!(world.take_dirty_chunks(), vec![pos_b.chunk()]);
     }
 }

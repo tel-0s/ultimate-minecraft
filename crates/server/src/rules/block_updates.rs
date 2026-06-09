@@ -42,29 +42,30 @@ pub fn gravity(world: &World, payload: &EventPayload) -> Vec<Event> {
 
 // ── Generic fluid logic ──────────────────────────────────────────────────
 
-/// A flowing fluid block at `level` (> 0) is "supported" if it has a path
-/// back toward a source block:
-///   - Any fluid of the *same kind* directly above (falling fluid feeds it), OR
-///   - A horizontal neighbor of the same kind with a strictly lower level.
+/// The level a flowing fluid cell *should* have given its neighbors, or
+/// `None` if nothing supports it:
+///   - Fluid of the same kind directly above feeds it at level 1 (falling).
+///   - Otherwise `min(horizontal neighbor levels) + 1`.
 ///
-/// Source blocks (level 0) are always supported (player-placed, permanent).
-fn has_fluid_support(world: &World, pos: BlockPos, level: u8, kind: FluidKind) -> bool {
-    // Fluid from above always supports.
+/// This is the unique fixed point of fluid flow — every flowing cell's
+/// level equals its shortest-path distance from a source. Re-levelling
+/// toward it on notify makes fluid **confluent**: the final state is
+/// independent of event execution order, which spacelike-parallel and
+/// partitioned scheduling require. (Previously a cell kept whichever
+/// level arrived first, so two interacting fronts settled differently
+/// depending on arrival order.)
+fn desired_fluid_level(world: &World, pos: BlockPos, kind: FluidKind) -> Option<u8> {
+    // Fluid from above always feeds at level 1.
     let above = BlockPos::new(pos.x, pos.y + 1, pos.z);
     if kind.is_match(world.get_block(above)) {
-        return true;
+        return Some(1);
     }
 
-    // Horizontal neighbor with a strictly lower level supports.
-    for neighbor in horizontal_neighbors(pos) {
-        if let Some(n_level) = kind.level(world.get_block(neighbor)) {
-            if n_level < level {
-                return true;
-            }
-        }
-    }
-
-    false
+    horizontal_neighbors(pos)
+        .into_iter()
+        .filter_map(|n| kind.level(world.get_block(n)))
+        .min()
+        .map(|min_level| min_level.saturating_add(1))
 }
 
 /// Core fluid rule, parameterized by `FluidKind`.
@@ -82,6 +83,40 @@ fn generic_fluid(world: &World, payload: &EventPayload, kind: FluidKind) -> Vec<
         if kind.is_match(*old) && !kind.is_match(*new) {
             return notify_neighbors(*pos);
         }
+        // Re-level: same-kind fluid changed level. Horizontal neighbors'
+        // levels may now be wrong (their min-neighbor changed) — notify
+        // them so the relaxation propagates. The spread logic below also
+        // runs for the new level via the normal BlockSet path.
+        if let (Some(old_l), Some(new_l)) = (kind.level(*old), kind.level(*new)) {
+            if old_l != new_l {
+                let mut events: Vec<Event> = horizontal_neighbors(*pos)
+                    .into_iter()
+                    .map(|n| Event { payload: EventPayload::BlockNotify { pos: n } })
+                    .collect();
+                events.extend(spread_events(world, *pos, new_l, kind));
+                return events;
+            }
+        }
+        // Appearance: a fluid cell came into existence (old was not this
+        // kind). Besides spreading, wake any ADJACENT same-kind fluid so
+        // it re-levels against the new cell. This is what makes the
+        // relaxation self-stabilizing under concurrent partitioned
+        // execution: a neighbour that drained against a stale read of
+        // this cell (its rule ran before our write was visible) gets
+        // re-evaluated by this notify, which is emitted *after* our write
+        // and therefore observes it. Without it, spread only targets AIR
+        // and a wrongly-drained fluid cell is never revisited.
+        if kind.level(*old).is_none() && kind.is_match(*new) {
+            let level = kind.level(*new).expect("is_match implies level");
+            let mut events = spread_events(world, *pos, level, kind);
+            let below = BlockPos::new(pos.x, pos.y - 1, pos.z);
+            for n in horizontal_neighbors(*pos).into_iter().chain([below]) {
+                if kind.is_match(world.get_block(n)) {
+                    events.push(Event { payload: EventPayload::BlockNotify { pos: n } });
+                }
+            }
+            return events;
+        }
     }
 
     let is_notify = matches!(payload, EventPayload::BlockNotify { .. });
@@ -98,26 +133,30 @@ fn generic_fluid(world: &World, payload: &EventPayload, kind: FluidKind) -> Vec<
         None => return Vec::new(),
     };
 
-    // ── Drainage (flowing only, on BlockNotify) ──────────────────────
-    if level > 0 && is_notify && !has_fluid_support(world, pos, level, kind) {
-        // Emit only the drain BlockSet. The removal trigger (lines 80-83)
-        // will fire on this BlockSet and emit notify_neighbors, propagating
-        // the drain cascade to all 6 directions. No extra notifications needed.
-        return vec![block_set(pos, block_id, block::AIR)];
-    }
-
-    // Flowing blocks on BlockNotify: the drain check above was the only action.
-    // Do NOT fall through to spread -- that causes a feedback loop where
-    // surviving neighbors re-spread into freshly drained spaces, generating
-    // hundreds of thousands of redundant events.
-    // Only source blocks (level 0) may re-spread on notify, allowing them to
-    // fill newly opened spaces; the spread then cascades via BlockSet events.
+    // ── Re-level / drain (flowing only, on BlockNotify) ───────────────
+    // Relax toward the unique fixed point `level = desired`:
+    //   - no feed at all, or desired beyond the spread cap → drain to air
+    //     (the removal trigger above then notifies neighbors);
+    //   - wrong level → set the correct one (the level-change trigger
+    //     above then notifies neighbors, continuing the relaxation);
+    //   - correct level → nothing. No re-spread from notify (that caused
+    //     feedback loops); spreading cascades via BlockSet events only.
     if level > 0 && is_notify {
-        return Vec::new();
+        return match desired_fluid_level(world, pos, kind) {
+            None => vec![block_set(pos, block_id, block::AIR)],
+            Some(d) if d > kind.max_spread() => vec![block_set(pos, block_id, block::AIR)],
+            Some(d) if d != level => vec![block_set(pos, block_id, kind.at_level(d))],
+            Some(_) => Vec::new(),
+        };
     }
 
     // ── Spread (BlockSet, or source on BlockNotify) ──────────────────
+    spread_events(world, pos, level, kind)
+}
 
+/// Spread from a fluid cell at `level`: fall into air below as level 1,
+/// otherwise flow horizontally into air at `level + 1` (capped).
+fn spread_events(world: &World, pos: BlockPos, level: u8, kind: FluidKind) -> Vec<Event> {
     // Falls down first (gravity-like). Falling fluid becomes level 1.
     let below = BlockPos::new(pos.x, pos.y - 1, pos.z);
     let below_id = world.get_block(below);

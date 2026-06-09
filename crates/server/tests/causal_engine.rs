@@ -65,26 +65,38 @@ where
                 Some(node) => node.event.clone(),
                 None => continue,
             };
-            // Apply
-            match &event.payload {
-                EventPayload::BlockSet { pos, new, .. } => {
-                    world.set_block(*pos, *new);
+            // Apply — mirrors the engine scheduler's semantics, including
+            // the stale-precondition guard (a BlockSet whose `old` no
+            // longer matches the world is skipped along with its rules).
+            let effective = match &event.payload {
+                EventPayload::BlockSet { pos, old, new } => {
+                    if world.get_block(*pos) != *old || old == new {
+                        false
+                    } else {
+                        world.set_block(*pos, *new);
+                        true
+                    }
                 }
-                EventPayload::BlockNotify { .. } => {}
+                EventPayload::BlockNotify { .. } => true,
                 EventPayload::LightSet { pos, light_type, new, .. } => {
                     match light_type {
                         ultimate_engine::causal::event::LightType::Sky => world.set_sky_light(*pos, *new),
                         ultimate_engine::causal::event::LightType::Block => world.set_block_light(*pos, *new),
                     }
+                    true
                 }
-                EventPayload::LightNotify { .. } => {}
-            }
+                EventPayload::LightNotify { .. } => true,
+                // Reporting-only: the light rule already wrote storage.
+                EventPayload::LightBatch { .. } => true,
+            };
             graph.mark_executed(id);
             total += 1;
 
-            let consequents = rules.evaluate(world, &event.payload);
-            for new_event in consequents {
-                graph.insert(new_event, vec![id]);
+            if effective {
+                let consequents = rules.evaluate(world, &event.payload);
+                for new_event in consequents {
+                    graph.insert(new_event, vec![id]);
+                }
             }
         }
     }
@@ -626,15 +638,22 @@ fn torch_lights_surrounding_area() {
         "block light at distance 15 should be 0"
     );
 
-    // Also count how many LightSet events were produced (for collect_light_changes).
-    let light_count = graph.all_ids().iter().filter(|id| {
-        graph.get(**id).is_some_and(|n| {
-            n.executed && matches!(n.event.payload, EventPayload::LightSet { .. })
+    // The flood's report arrives as LightBatch events (one per BFS run);
+    // count the CELLS they carry — that's what collect_light_changes sees.
+    let light_cells: usize = graph
+        .all_ids()
+        .iter()
+        .filter_map(|id| graph.get(*id))
+        .filter(|n| n.executed)
+        .map(|n| match &n.event.payload {
+            EventPayload::LightBatch { changes } => changes.len(),
+            EventPayload::LightSet { .. } => 1,
+            _ => 0,
         })
-    }).count();
+        .sum();
     assert!(
-        light_count > 100,
-        "expected hundreds of LightSet events, got {}", light_count
+        light_cells > 100,
+        "expected hundreds of changed light cells, got {}", light_cells
     );
 }
 
@@ -1285,5 +1304,149 @@ fn elevated_water_source_drains_when_removed() {
         "water should have fully drained, but {} blocks remain: {:?}",
         remaining_water.len(),
         &remaining_water[..remaining_water.len().min(10)],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fluid confluence: interacting water fronts must settle to the SAME final
+// state regardless of execution order. The re-level rule (level relaxes to
+// min-neighbor + 1) makes the fixed point unique; before it, whichever
+// front arrived first kept its level and orderings diverged.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn interacting_water_fronts_are_confluent() {
+    use ultimate_engine::causal::event::EventId;
+
+    // Two sources 8 blocks apart on a flat surface: spread radius 7 each,
+    // so their fronts overlap and contest the cells in between.
+    let sources = [BlockPos::new(12, 5, 16), BlockPos::new(20, 5, 16)];
+
+    let run = |order_fn: &dyn Fn(Vec<EventId>) -> Vec<EventId>| -> Vec<BlockId> {
+        let world = flat_world(3);
+        let mut graph = CausalGraph::new();
+        let rules = ultimate_server::rules::standard();
+        for s in sources {
+            graph.insert_root(Event {
+                payload: EventPayload::BlockSet { pos: s, old: block::AIR, new: block::WATER },
+            });
+        }
+        let total = run_with_order(&world, &mut graph, &rules, order_fn, 200_000);
+        assert!(total > 0);
+        // Snapshot the contested band: all blocks at y=5 in the bounding area.
+        let mut snap = Vec::new();
+        for x in 0..=32i64 {
+            for z in 4..=28i64 {
+                snap.push(world.get_block(BlockPos::new(x, 5, z)));
+            }
+        }
+        snap
+    };
+
+    let natural = run(&|f| f);
+    let reversed = run(&|mut f: Vec<EventId>| { f.reverse(); f });
+    assert_eq!(natural, reversed, "reversed frontier order must converge to the same water field");
+
+    // Deterministic shuffles via a tiny LCG.
+    for seed in [3u64, 7, 11] {
+        let shuffled = run(&move |mut f: Vec<EventId>| {
+            let mut state = seed;
+            for i in (1..f.len()).rev() {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let j = (state >> 33) as usize % (i + 1);
+                f.swap(i, j);
+            }
+            f
+        });
+        assert_eq!(natural, shuffled, "shuffled order (seed {seed}) must converge identically");
+    }
+
+    // Parallel scheduler too.
+    let world_par = flat_world(3);
+    let mut graph_par = CausalGraph::with_pruning();
+    let rules = ultimate_server::rules::standard();
+    let scheduler = Scheduler::new();
+    for s in sources {
+        graph_par.insert_root(Event {
+            payload: EventPayload::BlockSet { pos: s, old: block::AIR, new: block::WATER },
+        });
+    }
+    scheduler.run_until_quiet_parallel(&world_par, &mut graph_par, &rules, 100_000);
+    let mut par_snap = Vec::new();
+    for x in 0..=32i64 {
+        for z in 4..=28i64 {
+            par_snap.push(world_par.get_block(BlockPos::new(x, 5, z)));
+        }
+    }
+    assert_eq!(natural, par_snap, "parallel execution must converge to the same water field");
+}
+
+// ---------------------------------------------------------------------------
+// Pruning: a pruned graph runs real rule cascades to the same world state,
+// while keeping the graph bounded to the wavefront (empty at quiescence).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pruned_cascade_matches_unpruned() {
+    let world_a = flat_world(2);
+    let world_b = flat_world(2);
+    let rules = ultimate_server::rules::standard();
+    let scheduler = Scheduler::new();
+
+    let roots = |graph: &mut CausalGraph| {
+        // Three sand columns + one water source: gravity and fluid cascades.
+        for (x, z) in [(6i64, 6i64), (8, 8), (10, 10)] {
+            for y in [10i64, 11, 12] {
+                graph.insert_root(Event {
+                    payload: EventPayload::BlockSet {
+                        pos: BlockPos::new(x, y, z),
+                        old: block::AIR,
+                        new: block::SAND,
+                    },
+                });
+            }
+        }
+        graph.insert_root(Event {
+            payload: EventPayload::BlockSet {
+                pos: BlockPos::new(20, 8, 20),
+                old: block::AIR,
+                new: block::WATER,
+            },
+        });
+    };
+
+    let mut unpruned = CausalGraph::new();
+    roots(&mut unpruned);
+    let n_unpruned = scheduler.run_until_quiet(&world_a, &mut unpruned, &rules, 1000);
+
+    let mut pruned = CausalGraph::with_pruning();
+    roots(&mut pruned);
+    let n_pruned = scheduler.run_until_quiet(&world_b, &mut pruned, &rules, 1000);
+
+    // Identical event counts and world state.
+    assert_eq!(n_unpruned, n_pruned);
+    for y in 0..=15i64 {
+        for x in 0..32i64 {
+            for z in 0..32i64 {
+                let pos = BlockPos::new(x, y, z);
+                assert_eq!(
+                    world_a.get_block(pos),
+                    world_b.get_block(pos),
+                    "world divergence at {pos:?}"
+                );
+            }
+        }
+    }
+
+    // The unpruned graph retains every node; the pruned one is empty.
+    assert_eq!(unpruned.len() as u64, unpruned.executed_total());
+    assert_eq!(pruned.len(), 0, "pruned graph must be empty at quiescence");
+    assert_eq!(pruned.executed_total(), unpruned.executed_total());
+    assert_eq!(pruned.reaped_total(), pruned.executed_total());
+
+    // The write logs agree, so client broadcasting is unaffected by pruning.
+    assert_eq!(
+        ultimate_server::event_bus::collect_block_changes(unpruned.write_log()),
+        ultimate_server::event_bus::collect_block_changes(pruned.write_log()),
     );
 }

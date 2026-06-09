@@ -70,20 +70,25 @@ pub enum PlayerEvent {
 pub struct PlayerRegistry {
     players: RwLock<HashMap<u64, PlayerInfo>>,
     next_entity_id: AtomicI32,
+    /// Lifecycle events only (join/leave/chat): global, low-rate.
     event_tx: broadcast::Sender<PlayerEvent>,
+    /// Movement goes SPATIAL (Phase 6f): delivered only to connections
+    /// subscribed near the mover — O(nearby), not O(all players).
+    spatial: std::sync::Arc<crate::event_bus::SpatialBus>,
 }
 
 impl PlayerRegistry {
     /// Create a new empty registry. Entity IDs start at 2 (1 is conventionally
     /// the "self" entity on vanilla clients, but we use our own IDs now).
-    pub fn new() -> Self {
-        // Capacity must accommodate high-frequency movement events from all
-        // players. 512 gives ~25 ticks of buffer at 20 players × 1 event/tick.
-        let (event_tx, _) = broadcast::channel(512);
+    pub fn new(spatial: std::sync::Arc<crate::event_bus::SpatialBus>) -> Self {
+        // Lifecycle-only channel: joins/leaves/chat are rare, so a modest
+        // buffer suffices (movement no longer flows through here).
+        let (event_tx, _) = broadcast::channel(4096);
         Self {
             players: RwLock::new(HashMap::new()),
             next_entity_id: AtomicI32::new(1),
             event_tx,
+            spatial,
         }
     }
 
@@ -140,7 +145,7 @@ impl PlayerRegistry {
             info.on_ground = on_ground;
             info.entity_id
         };
-        let _ = self.event_tx.send(PlayerEvent::Moved {
+        self.spatial.publish_move(PlayerEvent::Moved {
             conn_id,
             entity_id,
             x,

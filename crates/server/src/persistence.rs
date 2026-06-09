@@ -121,6 +121,100 @@ struct ChunkNbt {
     sections: Vec<SectionNbt>,
     #[serde(rename = "Status")]
     status: String,
+    /// Generator fingerprint (preset + seed; see
+    /// `worldgen::preset::fingerprint`) stamped at save time.
+    ///
+    /// For **delta** chunks a mismatch is fine — the delta re-applies onto
+    /// freshly regenerated terrain, so edits survive generator upgrades.
+    /// For legacy **full-section** chunks a mismatch (or missing stamp)
+    /// skips the chunk: stale-generator terrain stitched against new
+    /// terrain produces hard seams. Custom tag; vanilla tools ignore it.
+    #[serde(rename = "UmcGenFp", default, skip_serializing_if = "Option::is_none")]
+    gen_fp: Option<i64>,
+    /// Phase 6c delta encoding: block modifications relative to the
+    /// procedurally regenerated baseline, packed one per i64 as
+    /// `(section_y << 32) | (cell_index << 16) | block_id` with
+    /// `cell_index = local_y*256 + z*16 + x`. When present, `sections` is
+    /// empty and loading regenerates the chunk then applies these cells.
+    /// 10-100× smaller than full chunks for lightly-edited terrain, and
+    /// robust to worldgen changes.
+    #[serde(rename = "UmcDelta", default, skip_serializing_if = "Option::is_none")]
+    delta: Option<Vec<i64>>,
+}
+
+// ── Delta store + overlay generator (Phase 6c eviction) ─────────────────────
+
+/// Live in-RAM index of every known chunk delta, shared between
+/// persistence (which populates it on load and save) and the worldgen
+/// overlay (which re-applies deltas whenever a chunk is regenerated —
+/// lazily, after eviction, or at startup). This is what makes eviction
+/// safe: a non-dirty chunk is always `generate(baseline) + delta`.
+pub type DeltaStore = std::sync::Arc<dashmap::DashMap<ChunkPos, std::sync::Arc<[i64]>>>;
+
+pub fn new_delta_store() -> DeltaStore {
+    std::sync::Arc::new(dashmap::DashMap::new())
+}
+
+/// Worldgen wrapper that re-applies stored deltas on every generation.
+/// Installed as THE server worldgen so every `generate_chunk` /
+/// `ensure_generated` path — chunk streaming, eviction re-materialization,
+/// startup pregeneration — produces baseline-plus-edits.
+pub struct DeltaOverlayGen {
+    inner: std::sync::Arc<dyn crate::worldgen::WorldGen>,
+    deltas: DeltaStore,
+}
+
+impl DeltaOverlayGen {
+    pub fn new(inner: std::sync::Arc<dyn crate::worldgen::WorldGen>, deltas: DeltaStore) -> Self {
+        Self { inner, deltas }
+    }
+}
+
+impl crate::worldgen::WorldGen for DeltaOverlayGen {
+    fn generate_chunk(&self, cx: i32, cz: i32, world: &World) -> Chunk {
+        let mut chunk = self.inner.generate_chunk(cx, cz, world);
+        if let Some(delta) = self.deltas.get(&ChunkPos::new(cx, cz)) {
+            for &packed in delta.iter() {
+                let (sy, cell, block) = unpack_delta(packed);
+                chunk.set_block(delta_local_pos(sy, cell), block);
+            }
+        }
+        chunk
+    }
+
+    fn spawn_y(&self, x: i64, z: i64) -> f64 {
+        self.inner.spawn_y(x, z)
+    }
+
+    fn biome_at(&self, cx: i32, cz: i32) -> u32 {
+        self.inner.biome_at(cx, cz)
+    }
+
+    fn biome_at_cell(&self, x: i64, y: i64, z: i64) -> u32 {
+        self.inner.biome_at_cell(x, y, z)
+    }
+}
+
+/// Chunk-local position of a packed delta cell.
+fn delta_local_pos(section_y: i32, cell: usize) -> LocalBlockPos {
+    LocalBlockPos {
+        x: (cell & 15) as u8,
+        y: section_y as i64 * 16 + (cell >> 8) as i64,
+        z: ((cell >> 4) & 15) as u8,
+    }
+}
+
+/// Pack one delta cell. `cell` is the in-section flat index (YZX order).
+fn pack_delta(section_y: i32, cell: usize, block: BlockId) -> i64 {
+    ((section_y as i64) << 32) | ((cell as i64) << 16) | (block.0 as i64)
+}
+
+/// Unpack a delta cell to `(section_y, cell, block)`.
+fn unpack_delta(v: i64) -> (i32, usize, BlockId) {
+    let section_y = (v >> 32) as i32;
+    let cell = ((v >> 16) & 0xFFFF) as usize;
+    let block = BlockId((v & 0xFFFF) as u16);
+    (section_y, cell, block)
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -209,11 +303,25 @@ fn bits_per_entry(palette_len: usize) -> usize {
 
 // ── Save ─────────────────────────────────────────────────────────────────────
 
-/// Save only dirty (modified) chunks to Anvil region files under `<dir>/region/`.
+/// Save only dirty (modified) chunks to Anvil region files under
+/// `<dir>/region/`, **delta-encoded** (Phase 6c): each chunk stores only
+/// the cells that differ from the procedurally regenerated baseline.
 ///
 /// Existing region files are opened and updated in-place; new region files are
-/// created as needed. Returns the number of chunks written.
-pub fn save_world(world: &World, dir: &Path) -> Result<usize> {
+/// created as needed. Every chunk is stamped with `gen_fp` (the current
+/// generator fingerprint). Returns the number of chunks written.
+///
+/// `worldgen` MUST be the **base** generator, never a [`DeltaOverlayGen`]:
+/// the diff has to be computed against the pristine procedural baseline.
+/// Diffing against an overlay would yield edits-since-last-delta, which
+/// would then REPLACE the stored full delta and silently lose history.
+pub fn save_world(
+    world: &World,
+    dir: &Path,
+    gen_fp: u64,
+    worldgen: &dyn crate::worldgen::WorldGen,
+    deltas: Option<&DeltaStore>,
+) -> Result<usize> {
     let dirty = world.take_dirty_chunks();
     if dirty.is_empty() {
         tracing::info!("World save: nothing to save (no dirty chunks)");
@@ -231,8 +339,16 @@ pub fn save_world(world: &World, dir: &Path) -> Result<usize> {
         let Some(chunk_ref) = world.get_chunk(pos) else {
             continue; // Chunk was removed between dirty-mark and save.
         };
-        let nbt = chunk_to_nbt(*pos, &*chunk_ref);
-        drop(chunk_ref); // Release DashMap ref before serialization.
+        let nbt = chunk_to_delta_nbt(*pos, &chunk_ref, gen_fp, worldgen);
+        drop(chunk_ref); // Release DashMap ref before region I/O.
+
+        // Refresh the live delta store: after this save the chunk is
+        // clean AND its regeneration recipe is current → evictable.
+        if let Some(store) = deltas {
+            if let Some(delta) = &nbt.delta {
+                store.insert(*pos, std::sync::Arc::from(delta.as_slice()));
+            }
+        }
         let nbt_bytes = fastnbt::to_bytes(&nbt)
             .with_context(|| format!("serializing chunk ({}, {})", pos.x, pos.z))?;
 
@@ -286,8 +402,61 @@ pub fn save_world(world: &World, dir: &Path) -> Result<usize> {
     Ok(total_chunks)
 }
 
-/// Convert an engine `Chunk` to the Anvil NBT representation.
-fn chunk_to_nbt(pos: ChunkPos, chunk: &Chunk) -> ChunkNbt {
+/// Build the delta NBT for a chunk: regenerate the baseline from the
+/// worldgen pipeline and record only the differing cells.
+///
+/// The baseline is generated standalone (fresh empty world), so spill-in
+/// blocks from neighbouring chunks' features (tree canopies crossing the
+/// border) appear in the delta. That's correct: they re-apply on load
+/// regardless of which neighbours have generated yet.
+fn chunk_to_delta_nbt(
+    pos: ChunkPos,
+    chunk: &Chunk,
+    gen_fp: u64,
+    worldgen: &dyn crate::worldgen::WorldGen,
+) -> ChunkNbt {
+    let baseline = worldgen.generate_chunk(pos.x, pos.z, &World::new());
+
+    // Union of section indices present on either side: a section missing
+    // entirely on one side still diffs cell-by-cell against air.
+    let mut section_indices: Vec<i32> = chunk
+        .sections()
+        .map(|(&i, _)| i)
+        .chain(baseline.sections().map(|(&i, _)| i))
+        .collect();
+    section_indices.sort_unstable();
+    section_indices.dedup();
+
+    let mut delta = Vec::new();
+    for si in section_indices {
+        let live = chunk.section(si);
+        let base = baseline.section(si);
+        for cell in 0..4096usize {
+            let live_block = live.map_or(BlockId::AIR, |s| s.get_by_index(cell));
+            let base_block = base.map_or(BlockId::AIR, |s| s.get_by_index(cell));
+            if live_block != base_block {
+                delta.push(pack_delta(si, cell, live_block));
+            }
+        }
+    }
+
+    ChunkNbt {
+        data_version: DATA_VERSION,
+        x_pos: pos.x,
+        z_pos: pos.z,
+        y_pos: 0,
+        sections: Vec::new(),
+        status: "minecraft:full".into(),
+        gen_fp: Some(gen_fp as i64),
+        delta: Some(delta),
+    }
+}
+
+/// Convert an engine `Chunk` to the full-section Anvil NBT representation.
+/// Legacy format — current saves are delta-encoded; this is kept for
+/// vanilla-tool export and for tests exercising the legacy load path.
+#[cfg_attr(not(test), allow(dead_code))]
+fn chunk_to_nbt(pos: ChunkPos, chunk: &Chunk, gen_fp: u64) -> ChunkNbt {
     let mut sections = Vec::new();
 
     for (&section_idx, section) in chunk.sections() {
@@ -308,14 +477,22 @@ fn chunk_to_nbt(pos: ChunkPos, chunk: &Chunk) -> ChunkNbt {
         y_pos,
         sections,
         status: "minecraft:full".into(),
+        gen_fp: Some(gen_fp as i64),
+        delta: None,
     }
 }
 
 /// Convert a single engine `ChunkSection` to the Anvil NBT section format.
 fn section_to_nbt(section_idx: i32, section: &ChunkSection) -> SectionNbt {
-    let blocks = section.blocks();
+    // Materialize the paletted section once (cheap index reads).
+    let mut blocks = [BlockId::AIR; 4096];
+    for (i, b) in blocks.iter_mut().enumerate() {
+        *b = section.get_by_index(i);
+    }
 
-    // Build palette: map each unique BlockId to a palette index.
+    // Build palette: map each unique BlockId to a palette index. (Built
+    // fresh rather than reusing the section's own palette, which may
+    // contain stale entries for since-overwritten blocks.)
     let mut palette_map: HashMap<BlockId, u16> = HashMap::new();
     let mut palette_entries: Vec<PaletteEntry> = Vec::new();
 
@@ -357,15 +534,31 @@ fn section_to_nbt(section_idx: i32, section: &ChunkSection) -> SectionNbt {
 
 // ── Load ─────────────────────────────────────────────────────────────────────
 
-/// Load saved chunks from Anvil region files and insert them into an existing
-/// world, overwriting any generated chunks with the saved versions.
+/// Load saved chunks from Anvil region files into an existing world.
 ///
-/// This is the primary entry point: generate the base world first, then call
-/// this to overlay player modifications on top. Chunks loaded this way are
-/// **not** marked dirty, so they won't be re-saved unless modified again.
+/// **Delta chunks** (Phase 6c, the current format): the chunk is
+/// generated from the current worldgen if not already present, then the
+/// saved cell diffs are applied on top. A generator-fingerprint mismatch
+/// is *fine* — the edits re-apply onto the new terrain, so block
+/// modifications survive preset/seed changes (logged for visibility).
 ///
+/// **Legacy full-section chunks**: loaded verbatim only when the
+/// fingerprint matches; otherwise skipped (stale-generator terrain
+/// stitched against new terrain produces hard seams — the bug this
+/// pipeline originally shipped with).
+///
+/// Chunks loaded either way are **not** marked dirty.
 /// Returns the number of chunks loaded (0 if no save directory exists).
-pub fn load_into(world: &World, dir: &Path) -> Result<usize> {
+///
+/// When a `deltas` store is supplied, every loaded delta is also recorded
+/// there so later regenerations (lazy loads, post-eviction) re-apply it.
+pub fn load_into(
+    world: &World,
+    dir: &Path,
+    gen_fp: u64,
+    worldgen: &dyn crate::worldgen::WorldGen,
+    deltas: Option<&DeltaStore>,
+) -> Result<usize> {
     let region_dir = dir.join("region");
     if !region_dir.is_dir() {
         return Ok(0);
@@ -377,6 +570,8 @@ pub fn load_into(world: &World, dir: &Path) -> Result<usize> {
     let _ = &*BLOCK_LOOKUP;
 
     let mut total_chunks = 0usize;
+    let mut stale_chunks = 0usize;
+    let mut migrated_chunks = 0usize;
     let mut region_count = 0usize;
 
     for entry in fs::read_dir(&region_dir)? {
@@ -421,6 +616,36 @@ pub fn load_into(world: &World, dir: &Path) -> Result<usize> {
                     })?;
 
                 let chunk_pos = ChunkPos::new(chunk_nbt.x_pos, chunk_nbt.z_pos);
+
+                if let Some(delta) = &chunk_nbt.delta {
+                    // Delta chunk: regenerate baseline (if needed), apply.
+                    if chunk_nbt.gen_fp != Some(gen_fp as i64) {
+                        migrated_chunks += 1;
+                    }
+                    // Record in the live store FIRST so an overlay-backed
+                    // `ensure_generated` already applies it; the manual
+                    // apply below covers already-present chunks and is
+                    // idempotent when both run.
+                    if let Some(store) = deltas {
+                        store.insert(chunk_pos, std::sync::Arc::from(delta.as_slice()));
+                    }
+                    worldgen.ensure_generated(world, chunk_pos.x, chunk_pos.z);
+                    if let Some(mut chunk) = world.get_chunk_mut(&chunk_pos) {
+                        for &packed in delta {
+                            let (sy, cell, block) = unpack_delta(packed);
+                            chunk.set_block(delta_local_pos(sy, cell), block);
+                        }
+                    }
+                    total_chunks += 1;
+                    continue;
+                }
+
+                // Legacy full-section chunk: verbatim load only under the
+                // exact generator that produced it.
+                if chunk_nbt.gen_fp != Some(gen_fp as i64) {
+                    stale_chunks += 1;
+                    continue;
+                }
                 let chunk = nbt_to_chunk(&chunk_nbt);
                 world.insert_chunk(chunk_pos, chunk);
                 total_chunks += 1;
@@ -429,6 +654,21 @@ pub fn load_into(world: &World, dir: &Path) -> Result<usize> {
         region_count += 1;
     }
 
+    if migrated_chunks > 0 {
+        tracing::info!(
+            "Re-applied {} delta chunks saved under an older generator version — \
+             block edits preserved on top of the regenerated terrain",
+            migrated_chunks,
+        );
+    }
+    if stale_chunks > 0 {
+        tracing::warn!(
+            "Skipped {} legacy full-section chunks from an older generator version; \
+             their terrain will regenerate and any block modifications they \
+             contained are discarded (re-save under the current format to migrate)",
+            stale_chunks,
+        );
+    }
     if total_chunks > 0 {
         let elapsed = start.elapsed();
         tracing::info!(
@@ -508,6 +748,52 @@ fn nbt_to_chunk(nbt: &ChunkNbt) -> Chunk {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worldgen::WorldGen;
+
+    /// Generates empty chunks: the delta baseline is "nothing", so every
+    /// non-air cell of a saved chunk lands in the delta — making delta
+    /// round-trips behave exactly like the old full-chunk format.
+    struct EmptyGen;
+    impl WorldGen for EmptyGen {
+        fn generate_chunk(&self, _cx: i32, _cz: i32, _world: &World) -> Chunk {
+            Chunk::new()
+        }
+        fn spawn_y(&self, _x: i64, _z: i64) -> f64 {
+            0.0
+        }
+    }
+
+    /// Fills y=0..4 of every chunk with one block — a stand-in for "a
+    /// generator version" so tests can simulate preset changes.
+    struct FillGen(BlockId);
+    impl WorldGen for FillGen {
+        fn generate_chunk(&self, _cx: i32, _cz: i32, _world: &World) -> Chunk {
+            let mut chunk = Chunk::new();
+            for x in 0..16u8 {
+                for z in 0..16u8 {
+                    for y in 0..4i64 {
+                        chunk.set_block(LocalBlockPos { x, y, z }, self.0);
+                    }
+                }
+            }
+            chunk
+        }
+        fn spawn_y(&self, _x: i64, _z: i64) -> f64 {
+            5.0
+        }
+    }
+
+    #[test]
+    fn test_delta_pack_roundtrip() {
+        for (sy, cell, block) in [
+            (-4i32, 0usize, BlockId::AIR),
+            (0, 4095, BlockId::new(1)),
+            (19, 2048, BlockId::new(0xFFFF)),
+            (-1, 17, BlockId::new(118)),
+        ] {
+            assert_eq!(unpack_delta(pack_delta(sy, cell, block)), (sy, cell, block));
+        }
+    }
 
     #[test]
     fn test_bits_per_entry() {
@@ -575,7 +861,7 @@ mod tests {
         // Save to a temp directory.
         let tmp = std::env::temp_dir().join("ultimate_mc_test_persistence");
         let _ = fs::remove_dir_all(&tmp);
-        let saved = save_world(&world, &tmp).unwrap();
+        let saved = save_world(&world, &tmp, 0xFEED, &EmptyGen, None).unwrap();
         assert_eq!(saved, 1); // only the one dirty chunk
 
         // Verify region file exists.
@@ -583,7 +869,7 @@ mod tests {
 
         // Load back into a fresh world (simulating: generate base, then overlay).
         let loaded = World::new();
-        let n = load_into(&loaded, &tmp).unwrap();
+        let n = load_into(&loaded, &tmp, 0xFEED, &EmptyGen, None).unwrap();
         assert_eq!(n, 1);
         assert_eq!(loaded.chunk_count(), 1);
 
@@ -622,7 +908,7 @@ mod tests {
         assert_eq!(loaded.dirty_count(), 0);
 
         // Saving again should write 0 chunks (nothing dirty).
-        let saved_again = save_world(&loaded, &tmp).unwrap();
+        let saved_again = save_world(&loaded, &tmp, 0xFEED, &EmptyGen, None).unwrap();
         assert_eq!(saved_again, 0);
 
         // Cleanup.
@@ -644,7 +930,7 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
 
         // First save: both chunks written.
-        let saved = save_world(&world, &tmp).unwrap();
+        let saved = save_world(&world, &tmp, 0xFEED, &EmptyGen, None).unwrap();
         assert_eq!(saved, 2);
         assert_eq!(world.dirty_count(), 0);
 
@@ -653,12 +939,12 @@ mod tests {
         assert_eq!(world.dirty_count(), 1);
 
         // Second save: only 1 chunk.
-        let saved = save_world(&world, &tmp).unwrap();
+        let saved = save_world(&world, &tmp, 0xFEED, &EmptyGen, None).unwrap();
         assert_eq!(saved, 1);
 
         // Load into a fresh world and verify both chunks persisted.
         let loaded = World::new();
-        let n = load_into(&loaded, &tmp).unwrap();
+        let n = load_into(&loaded, &tmp, 0xFEED, &EmptyGen, None).unwrap();
         assert_eq!(n, 2);
         assert_eq!(loaded.chunk_count(), 2);
         assert_eq!(loaded.get_block(BlockPos::new(0, 60, 0)), crate::block::STONE);
@@ -694,7 +980,7 @@ mod tests {
 
         let tmp = std::env::temp_dir().join("ultimate_mc_test_overlay");
         let _ = fs::remove_dir_all(&tmp);
-        save_world(&world, &tmp).unwrap();
+        save_world(&world, &tmp, 0xFEED, &EmptyGen, None).unwrap();
 
         // "Restart": generate base world again, then overlay saved chunks.
         let world2 = World::new();
@@ -705,7 +991,7 @@ mod tests {
         }
         world2.take_dirty_chunks(); // clear generation dirt
 
-        load_into(&world2, &tmp).unwrap();
+        load_into(&world2, &tmp, 0xFEED, &EmptyGen, None).unwrap();
 
         // The saved chunk overwrites the generated one -- diamond block is there.
         assert_eq!(world2.get_block(BlockPos::new(5, 61, 5)), diamond);
@@ -714,6 +1000,141 @@ mod tests {
         assert_eq!(world2.get_block(BlockPos::new(0, 60, 0)), crate::block::STONE);
         // Nothing dirty after load.
         assert_eq!(world2.dirty_count(), 0);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_delta_chunks_survive_generator_change() {
+        use ultimate_engine::world::position::BlockPos;
+
+        // THE delta-persistence acceptance test: a block edit saved under
+        // generator A must survive a load under generator B — re-applied
+        // onto B's freshly generated terrain instead of being discarded
+        // (the fingerprint-skip behaviour full chunks had).
+        let gen_a = FillGen(crate::block::STONE);
+        let gen_b = FillGen(crate::block::DIRT);
+
+        // World generated by A, plus one player edit.
+        let world = World::new();
+        gen_a.ensure_generated(&world, 0, 0);
+        let diamond = BlockId(azalea_block::BlockState::from(
+            azalea_registry::builtin::BlockKind::DiamondBlock,
+        ).id());
+        world.set_block(BlockPos::new(5, 10, 5), diamond);
+        assert_eq!(world.dirty_count(), 1);
+
+        let tmp = std::env::temp_dir().join("ultimate_mc_test_delta_migrate");
+        let _ = fs::remove_dir_all(&tmp);
+        save_world(&world, &tmp, 0xAAAA, &gen_a, None).unwrap();
+
+        // "Upgrade the generator": load under B with a different fingerprint.
+        let world2 = World::new();
+        let n = load_into(&world2, &tmp, 0xBBBB, &gen_b, None).unwrap();
+        assert_eq!(n, 1, "delta chunk must load despite the fingerprint change");
+
+        // The edit survived...
+        assert_eq!(world2.get_block(BlockPos::new(5, 10, 5)), diamond);
+        // ...on top of generator B's terrain, not A's.
+        assert_eq!(world2.get_block(BlockPos::new(0, 0, 0)), crate::block::DIRT);
+        assert_eq!(world2.get_block(BlockPos::new(8, 3, 8)), crate::block::DIRT);
+        assert_eq!(world2.dirty_count(), 0, "loads must not dirty");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_delta_is_minimal_against_matching_baseline() {
+        use ultimate_engine::world::position::BlockPos;
+
+        // When the live chunk equals its baseline except for one edit,
+        // the delta must contain exactly that one cell.
+        let generator = FillGen(crate::block::STONE);
+        let world = World::new();
+        generator.ensure_generated(&world, 0, 0);
+        world.set_block(BlockPos::new(7, 2, 7), crate::block::SAND);
+
+        let chunk_ref = world.get_chunk(&ChunkPos::new(0, 0)).unwrap();
+        let nbt = chunk_to_delta_nbt(ChunkPos::new(0, 0), &chunk_ref, 1, &generator);
+        let delta = nbt.delta.expect("delta format");
+        assert_eq!(delta.len(), 1, "one edit → one delta cell, got {}", delta.len());
+        let (sy, cell, block) = unpack_delta(delta[0]);
+        assert_eq!((sy, block), (0, crate::block::SAND));
+        assert_eq!(cell, 2 * 256 + 7 * 16 + 7);
+    }
+
+    #[test]
+    fn test_eviction_roundtrip_through_overlay() {
+        use ultimate_engine::world::position::BlockPos;
+        use crate::worldgen::WorldGen as _;
+
+        // THE eviction acceptance test: save an edited chunk (populating
+        // the delta store), evict it, regenerate through the overlay —
+        // the chunk must come back bit-for-bit, edit included.
+        let base: std::sync::Arc<dyn crate::worldgen::WorldGen> =
+            std::sync::Arc::new(FillGen(crate::block::STONE));
+        let store = new_delta_store();
+        let overlay = DeltaOverlayGen::new(std::sync::Arc::clone(&base), std::sync::Arc::clone(&store));
+
+        let world = World::new();
+        overlay.ensure_generated(&world, 0, 0);
+        let edit_pos = BlockPos::new(9, 12, 9);
+        world.set_block(edit_pos, crate::block::SAND);
+
+        let tmp = std::env::temp_dir().join("ultimate_mc_test_evict_rt");
+        let _ = fs::remove_dir_all(&tmp);
+        // Save diffs against the BASE generator, refreshing the store.
+        save_world(&world, &tmp, 7, &*base, Some(&store)).unwrap();
+        assert!(store.contains_key(&ChunkPos::new(0, 0)), "save must populate the store");
+        assert!(!world.is_dirty(ChunkPos::new(0, 0)), "saved chunk is clean");
+
+        // Evict, then regenerate through the overlay (the lazy-load path).
+        assert!(world.remove_chunk(ChunkPos::new(0, 0)));
+        assert!(!world.has_chunk(ChunkPos::new(0, 0)));
+        overlay.ensure_generated(&world, 0, 0);
+
+        assert_eq!(world.get_block(edit_pos), crate::block::SAND, "edit survives eviction");
+        assert_eq!(world.get_block(BlockPos::new(0, 0, 0)), crate::block::STONE, "terrain intact");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_legacy_full_chunks_skip_on_fingerprint_mismatch() {
+        use ultimate_engine::world::position::BlockPos;
+        use std::io::Seek;
+
+        // Hand-craft a legacy full-section chunk (the pre-6c format) and
+        // verify the loader still applies the old rule: verbatim load on
+        // fingerprint match, skip on mismatch.
+        let world = World::new();
+        world.set_block(BlockPos::new(3, 70, 3), crate::block::STONE);
+        let chunk_ref = world.get_chunk(&ChunkPos::new(0, 0)).unwrap();
+        let legacy = chunk_to_nbt(ChunkPos::new(0, 0), &chunk_ref, 0xAAAA);
+        drop(chunk_ref);
+        assert!(legacy.delta.is_none());
+
+        let tmp = std::env::temp_dir().join("ultimate_mc_test_legacy_fp");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("region")).unwrap();
+        let bytes = fastnbt::to_bytes(&legacy).unwrap();
+        let mut region = fastanvil::Region::new(Cursor::new(Vec::new())).unwrap();
+        region.write_chunk(0, 0, &bytes).unwrap();
+        let mut cursor = region.into_inner().unwrap();
+        let len = cursor.stream_position().unwrap();
+        fs::write(tmp.join("region/r.0.0.mca"), &cursor.into_inner()[..len as usize]).unwrap();
+
+        // Mismatch: skipped entirely.
+        let loaded = World::new();
+        let n = load_into(&loaded, &tmp, 0xBBBB, &EmptyGen, None).unwrap();
+        assert_eq!(n, 0, "legacy chunk with stale fingerprint must be skipped");
+        assert_eq!(loaded.chunk_count(), 0);
+
+        // Match: verbatim load.
+        let loaded = World::new();
+        let n = load_into(&loaded, &tmp, 0xAAAA, &EmptyGen, None).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(loaded.get_block(BlockPos::new(3, 70, 3)), crate::block::STONE);
 
         let _ = fs::remove_dir_all(&tmp);
     }

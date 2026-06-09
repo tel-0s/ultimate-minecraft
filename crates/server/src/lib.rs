@@ -1,9 +1,12 @@
 pub mod block;
+pub mod cluster;
 pub mod config;
 pub mod dashboard;
 pub mod event_bus;
+pub mod eviction;
 pub mod net;
 pub mod persistence;
+pub mod physics;
 pub mod placement;
 pub mod player_registry;
 pub mod rules;

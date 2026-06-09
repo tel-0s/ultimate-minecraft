@@ -67,8 +67,8 @@ causality is the only ordering.
 - [x] Snapshot-scatter-gather parallel scheduler via `rayon::par_iter`
 - [x] Chunk-level spatial partitioning for independence detection
 - [x] Benchmark: 385K events, worlds verified identical (seq ≈ par)
-- [ ] Incremental frontier tracking (see Phase 6a)
-- [ ] Event deduplication (see Phase 6a)
+- [x] Incremental frontier tracking (see Phase 6a)
+- [x] Event deduplication (see Phase 6a)
 
 ## Phase 3 -- Networking & Players (current)
 
@@ -172,9 +172,21 @@ causality is the only ordering.
       all biomes share the same height field). Comes with multi-noise climate.
 
 ### 4c -- Multi-noise climate + per-biome height profiles
-- [ ] Continentalness, erosion, peaks-and-valleys noise fields
-- [ ] Climate-driven density splines (low continentalness → ocean basin,
-      high → mountains) — per-biome height profiles.
+- [x] **`spline` density-function atom**: piecewise-linear interpolation of
+      an input value through a list of `(input, output)` points.
+      Endpoints clamp; unsorted input lists are sorted at build time.
+      Y-independent when the input is, so the heightmap shortcut still
+      applies to spline-driven height fields.
+- [x] **Continentalness + erosion noise** in the default `noise` preset:
+      base height is now a spline of continentalness (most of the range
+      ≈ y=60-85 land, tails to y=35 deep ocean and y=145 peaks); hill
+      relief amplitude is a spline of erosion noise (more variation
+      where erosion is "jagged", flatter where it's "eroded"). The
+      world now has macro-scale continents and mountain ranges driven
+      by climate noise, not just hills + base offset.
+- [ ] Peaks-and-valleys noise (ridge sharpness modulation).
+- [ ] Per-biome density overrides (e.g. plains biome forcibly flattens
+      its terrain regardless of erosion noise).
 - [ ] Expand biome set toward vanilla coverage.
 
 ### 4d -- Caves & ores
@@ -219,10 +231,50 @@ causality is the only ordering.
 - [x] Default `noise` preset ships **biome-varied trees**: oak in
       plains/forest, extra-dense oak + birch in forest, tall spruce on
       snow_block in snowy_plains.
-- [ ] Deferred cross-chunk writes for decorators (trees, structures) so
-      canopies don't clip at chunk borders.
-- [ ] Plants (flowers, grass, kelp, sugarcane, etc.)
+- [x] **Deferred cross-chunk writes** (`worldgen::decorator::PendingWrites`):
+      a shared `DashMap<ChunkPos, Vec<PendingWrite>>` on the pipeline
+      threaded through `DecorationContext`. New `ctx.set_world_block` /
+      `set_world_block_if_air` route writes to:
+      (a) the in-flight chunk if local,
+      (b) `world.set_block` if the target is already loaded,
+      (c) the pending queue if the target chunk doesn't exist yet.
+      Each chunk drains its pending list at the end of generation, so a
+      tree placed in chunk A whose canopy reaches into B picks up
+      regardless of which chunk generates first. Tree canopies now spill
+      cleanly across chunk borders instead of being clipped.
+- [ ] **Live-broadcast cross-chunk writes**: when a decorator mutates a
+      chunk that's already loaded *and* already sent to clients, the
+      write doesn't propagate to those clients (no `BlockUpdate` packet
+      sent). Affects late-pregeneration neighbours of already-streamed
+      chunks. Minor visual quirk; fix by hooking the pipeline into the
+      event bus.
+- [x] **Plants** (flowers + grass MVP): scattered single-block features
+      placed one cell above a configured `surface_block`. `blocks` is a
+      weighted list (duplicates bias the draw). Default `noise` preset
+      ships grass + dandelion / poppy / oxeye_daisy / cornflower in
+      plains, grass + fern + occasional poppy in forest.
+- [x] **Tune flower frequency** to match vanilla (mostly grass with rare
+      flower scatter). Plant schema now supports weighted entries
+      (`{"block": ..., "weight": N}` alongside bare names); default preset
+      runs plains at grass:flowers 36:4 and forest at 12:4:1
+      (grass:fern:poppy).
+- [ ] Kelp, sugarcane, sea grass, etc. — needs adjacency-aware placement
+      (sugarcane wants water; kelp wants ocean column).
 - [ ] Simple structures (villages, dungeons)
+- [x] **Stitched-world bug fixed** (2026-06-09): saved chunks from older
+      generator versions loaded verbatim next to freshly-generated chunks,
+      producing hard chunk-aligned height/biome seams. Two compounding causes:
+      (1) decorator cross-chunk writes used `world.set_block`, marking
+      pristine terrain chunks dirty so *generation itself* got persisted
+      (360 chunks in one test session) — now `world.set_block_untracked`;
+      (2) persistence had no generator versioning — saved chunks now carry a
+      `UmcGenFp` NBT stamp (FNV-1a of canonical preset JSON + seed,
+      `worldgen::preset::fingerprint`) and chunks with a missing/mismatched
+      stamp are skipped at load (terrain regenerates; their block edits are
+      discarded — true diff-based persistence is the Phase 6c
+      delta-encoding item). Diagnostic `examples/diag_continuity.rs`
+      measures border-vs-interior height/biome continuity and proved the
+      generator itself is seam-free.
 
 ## Phase 5 -- Entities & Physics
 
@@ -253,13 +305,20 @@ These are O(N)-to-O(1) improvements that prevent performance from degrading over
       `mark_executed`. `drain_ready()` is amortized O(1) per event. The old
       `frontier()` full-scan is kept for tests/debugging.
 
-- [ ] **Causal graph pruning / garbage collection**
-      Once an event is executed and all its children are also executed, the node can be
-      reaped from the `SlotMap`. Maintain a reference count or check at execution time:
-      when marking a node executed, walk its parents -- if a parent is executed and all
-      its children are now executed, remove the parent. Keeps the graph bounded to the
-      active wavefront rather than growing without limit.
-      *Current cost: unbounded memory growth, proportional to total lifetime event count.*
+- [x] **Causal graph pruning / garbage collection**
+      Opt-in via `CausalGraph::with_pruning()` (used by all production cascade
+      sites; plain `new()` retains nodes for tests/DOT export). An executed node
+      is reaped once all its children have executed: `mark_executed` re-checks
+      the node's parents, and the scheduler calls `graph.finish(id)` after
+      inserting an event's consequents so leaf events reap immediately.
+      Readiness checks treat missing parents as executed (only executed nodes
+      are ever reaped). Memory is bounded to the active wavefront — at
+      quiescence the graph is empty. Companion: an execution-ordered
+      **write log** (`graph.write_log()`) records effective `BlockSet` /
+      `LightSet` payloads so `event_bus::collect_*` no longer scans nodes —
+      this also fixes change-broadcast ordering, which previously depended on
+      SlotMap iteration order. Lifetime counters (`inserted_total`,
+      `executed_total`, `reaped_total`) survive pruning for metrics.
 
 - [x] **Event deduplication / coalescing**
       `CausalGraph::insert` transparently coalesces idempotent events
@@ -280,46 +339,170 @@ These are O(N)-to-O(1) improvements that prevent performance from degrading over
       never produce consequent events. Collapses ~100K events per torch to ~11K
       events of pure bookkeeping cost.
 
-- [ ] **Idempotent rule guards**
-      Rules currently re-evaluate blocks that have already been handled. Add a check
-      in gravity/fluid rules: if the event's `old` state matches the current world
-      state (meaning another event already moved the block), skip. This is complementary
-      to deduplication and prevents redundant cascades at the rule level.
+- [x] **Idempotent rule guards** (stale-precondition skip)
+      `apply_event` only applies a `BlockSet` when the current world state still
+      matches the event's recorded `old` value. A mismatch means a
+      causally-unrelated event already changed the cell — the stale write is
+      skipped entirely (no world write, no consequents, no write-log entry).
+      Prevents redundant cascades *and* a block-duplication bug where two
+      spacelike cascades racing to move different blocks into the same cell
+      would both "succeed". First write wins; the loser's rule re-evaluation
+      never fires because nothing changed.
 
 ### 6b -- Concurrency model (unlock true multi-core scaling)
 
 Replace the current per-connection isolated graphs and DashMap locking with a
-shared-nothing spatial ownership model.
+shared-nothing spatial ownership model. **Strategic constraint: the partition
+boundary is designed as a transport-agnostic message protocol from day one** —
+the boundary between two workers on one socket, two sockets on a NUMA
+machine, and two machines in a cluster (6f) must be the same abstraction.
 
-- [ ] **Shared causal graph**
-      Replace per-connection `CausalGraph` with a single shared graph. All player
-      actions feed into one DAG so cross-player causality is tracked (player A breaks
-      a block supporting player B's sand). Requires concurrent graph insertion --
-      either a lock-free append-only arena or a dedicated graph-owner thread with
-      a channel-based interface.
+#### 6b-0 -- Baseline measurement ✓ (2026-06-09)
 
-- [ ] **Chunk ownership partitioning**
-      Replace `DashMap<ChunkPos, Chunk>` with a static spatial partitioning scheme:
-      assign each chunk to a thread (or core) deterministically. Intra-partition
-      events require zero synchronization -- the owning thread has exclusive access.
-      Cross-boundary reads (e.g., gravity rule checking a block in an adjacent chunk
-      that belongs to a different partition) use lock-free snapshots or message passing.
-      ~90-95% of events are intra-chunk, so synchronization cost is amortized to
-      near zero.
+`cargo run --release --example bench_baseline` — scenarios × {seq, par},
+verifying world-state equality. Instrumentation added to `CausalGraph`:
+`edge_locality()` (same-chunk vs cross-chunk causal edges — cross-chunk
+edges become inter-partition messages under 6b-2) and `peak_len()`
+(wavefront high-water mark under pruning).
 
-- [ ] **Decoupled physics from connection handler**
-      Currently `run_until_quiet()` runs synchronously inside the tokio task that
-      handles packets, blocking that player's I/O during cascades. Decouple: the
-      connection handler inserts root events into a shared submission queue, and a
-      dedicated physics thread pool drains the causal frontier continuously. Completed
-      events are broadcast to relevant connections via a channel.
+Baseline on a 32-logical-core machine (Windows, release):
 
-- [ ] **Batch event submission**
-      Accumulate root events from all players over a short window (~100us-1ms) before
-      draining the frontier. This increases the frontier width (more spacelike-separated
-      events available per step), improving parallel utilization. The batch window is
-      not a tick -- it's a parallelism optimization with no semantic commitment to a
-      fixed rate.
+| scenario     | events  | seq ms | par ms | speedup | ev/s (seq) | locality | peak wave |
+|--------------|---------|--------|--------|---------|------------|----------|-----------|
+| sand-rain    | 242,172 | 84.6   | 76.5   | 1.11×   | 2.86M      | 100.0%   | 61,507    |
+| water-flood  | 59,200  | 21.0   | 20.1   | 1.05×   | 2.81M      | 93.5%    | 25,600    |
+| border-flood | 74,000  | 26.3   | 22.9   | 1.15×   | 2.82M      | 85.0%    | 32,000    |
+| torch-grid   | 66,060  | 68.3   | 25.3   | 2.69×   | 0.97M      | 84.1%    | 66,060    |
+| mixed        | 97,429  | 84.6   | 38.9   | 2.18×   | 1.15M      | 66.8%    | 76,221    |
+
+Aggregate: 538K events, speedup **1.55× on 32 cores (~5% parallel
+efficiency)**, edge locality **90.1%**. Single-action quiescence latency:
+sand 9.8µs, water source 49µs, torch 1.7ms. Propagation velocity: sand
+0.51M blocks/s, water 0.14M, torch light 7.6K (roadmap target:
+10-30M/s/core — a 20-2000× gap, almost all per-event scheduling overhead).
+
+Findings that shape 6b-1/6b-2:
+1. **Cheap-rule workloads don't parallelize at all** (1.05-1.15×): the
+   gather phase (mark_executed + insert on `&mut graph`) is serial and
+   dominates when rule evaluation is light. Amdahl confirmed — the graph
+   mutation path is THE bottleneck, not rule evaluation.
+2. **Locality is rule-dependent**: gravity 100%, fluids 85-94%, but light
+   is the locality hog — a border-adjacent torch's radius-14 BFS field
+   spans up to 4 chunks (realistic mixed load: 66.8%). 6b-2 needs a
+   partition-aware light strategy (halo reads or light-field handoff), not
+   just block-event routing.
+3. **Peak wavefront = rule fanout × drain batch size** (torch-grid
+   materializes 100% of its events in one step). The 6b-1 batch-submission
+   window doubles as the physics memory-bound knob.
+4. **Interacting water fronts are not confluent** (discovered by the
+   harness): two fronts meeting settle at different, both-locally-stable
+   levels depending on arrival order — the fluid rule never lowers
+   existing water. Sequential frontier reorderings already exhibit this;
+   it's a rule-semantics gap (vanilla re-levels to min-neighbor+1), not a
+   scheduler bug. Must be fixed for causal invariance to hold under 6b's
+   continuous shared-graph execution. Until then the harness uses
+   non-interacting feature grids.
+5. Event counts are schedule-dependent (±0.1%) via notify-dedup batching;
+   benign — world state is the invariant, and it verifies.
+
+#### 6b-1 -- Decoupled physics service ✓ (2026-06-09)
+
+`physics.rs`: one dedicated OS thread owns THE shared `CausalGraph`
+(pruning) + `RuleSet` and applies all world writes. Connections and
+simulation layers are pure event sources via `PhysicsHandle::submit_*`
+(unbounded mpsc; never blocks the sender). All changes broadcast as
+`ChangeSource::Physics` bus batches consumed by every client — the
+originator included, so there is exactly one mutation→packet path
+(connections just ack the action sequence immediately). Stair-shape
+rewrites run as a post-cascade hook inside the service. The engine
+gained `take_write_log()` so the long-lived graph drains its log per
+batch.
+
+What this resolved:
+- **Cross-player causality**: all actions feed one DAG (covered by
+  `tests/physics_service.rs`: A's sand falls into the hole B breaks).
+- **Non-blocking player I/O**: cascades no longer run on connection tasks.
+- **Batch submission** (was a separate 6b item): commands arriving while
+  a batch processes are drained together into the next one — an emergent
+  window set by processing time, not a tick.
+
+Known limitations, deliberate until 6b-2/6d:
+- One physics thread is a serialization point; `step_parallel` still
+  fans out rule evaluation inside it, but graph mutation is single-owner.
+  6b-2 splits it into N region owners behind the same handle interface.
+- A monster cascade delays everyone's physics (no priority/interleaving
+  yet — that's 6d's priority-aware draining).
+- Actions are acked before the cascade commits; a stale-dropped action
+  desyncs the acting client until the next chunk reload (rare race,
+  same exposure as the previous inline design).
+
+- [x] **Shared causal graph**
+      Done in 6b-1 via the dedicated graph-owner thread + channel interface
+      (the roadmap's option B). Concurrent insertion (option A) deferred —
+      6b-2's per-partition graphs make it unnecessary.
+
+- [x] **Decoupled physics from connection handler** (6b-1, above)
+
+- [x] **Batch event submission** (6b-1, above — emergent drain window)
+
+#### 6b-2 -- Partitioned causal scheduling ✓ (2026-06-09)
+
+N physics workers each own a disjoint set of **4×4-chunk regions**
+(deterministic SplitMix-hash assignment, `physics.workers` in
+server.yaml, 0 = auto). Each worker has a private pruned `CausalGraph` —
+graph mutation, the bottleneck 6b-0 identified, is now unshared. The
+partition boundary is a **message**: `Scheduler::step_routed` hands each
+consequent to a router; foreign-chunk events are forwarded over the
+owner's channel *after their cause executed*, so happens-before rides the
+transport (the same protocol later runs over sockets for 6f). Global
+quiescence via an in-flight message counter (`PhysicsHandle::pending()`;
+forwards are counted before their consuming batch decrements, so 0 ⇒
+done).
+
+Scaling vs the same workloads at 1 worker (32-core machine,
+`cargo run --release --example bench_partitioned`):
+
+| scenario    | 1w ms | 16w ms | speedup | ev/s @16w | 6b-0 (old sched.) |
+|-------------|-------|--------|---------|-----------|--------------------|
+| sand-rain   | 96.4  | 15.0   | 6.4×    | 16.1M     | 1.11× at 32 cores  |
+| water-flood | 43.5  | 7.9    | 5.5×    | 10.6M     | 1.05×              |
+| mixed       | 92.7  | 16.4   | 5.7×    | 6.3M      | 2.18×              |
+
+Block state verified **identical across all worker counts** — partitioned
+execution is deterministic up to light (see exceptions below).
+
+Correctness work this required:
+- **Fluid confluence** (re-level rule): a flowing cell relaxes to
+  `min(neighbor)+1` on notify (drains when unfed or past the cap), making
+  the fluid fixed point unique — interacting fronts now settle
+  identically under any execution order (`interacting_water_fronts_are_confluent`
+  covers reversed/shuffled/parallel schedules).
+- **Self-stabilization under stale cross-partition reads**: fluid
+  *appearance* also notifies adjacent same-kind fluid. Found by the
+  scaling bench at 16 workers: a boundary cell could drain against a
+  pre-write read of a foreign neighbour and — since spread only targets
+  air — never be revisited. The appearance-notify is emitted after the
+  write commits, so the wrongly-drained cell re-evaluates with the write
+  visible. Cost: ~40% more (cheap, dedup-coalesced) events in
+  fluid-heavy cascades; single-worker water is ~2× slower than the old
+  non-confluent rule. Correctness buys it.
+
+Known limitations / next:
+- Speedup flattens 8→16 workers (36 regions over 24×24 chunks → load
+  imbalance; plus shared-DashMap bandwidth). 6d's adaptive region sizing
+  and work stealing, and 6c's per-partition arenas, attack this.
+- Light BFS still writes across partitions directly (documented
+  ownership exception; races converge since light recomputes from block
+  state). Needs a partition-aware strategy.
+- Stair-shape rewrites may write a foreign chunk at radius 1 (rare,
+  idempotent, direct).
+
+- [x] **Chunk ownership partitioning** (6b-2, above). The original sketch
+      called for replacing the `DashMap` itself; 6b-2 partitions *event
+      execution and graph ownership* while cross-boundary reads still go
+      through the shared `DashMap` — moving chunk storage into per-worker
+      arenas is Phase 6c (locality-aware allocation).
+
 
 ### 6c -- Memory & allocation (reduce per-event overhead, improve cache behavior)
 
@@ -344,55 +527,260 @@ shared-nothing spatial ownership model.
       frontier scans (if incremental frontier isn't yet implemented) or graph pruning
       sweeps.
 
-- [ ] **Delta-encoded chunk storage**
-      Store chunks as deltas from a procedurally generated baseline. For worlds with
-      a terrain generator, most blocks never change from their generated state. Only
-      store the diff. Reduces memory footprint by 10-100x for natural terrain, allowing
-      far more chunks to be loaded simultaneously.
+- [x] **Compact block state representation** ✓ (2026-06-09)
+      `ChunkSection` is now paletted in RAM: unique blocks once + packed
+      indices at 0 (uniform) / 4 / 8 / 16 bits per cell, widening on
+      demand, with an O(1) `non_air` counter (`is_empty` was an O(4096)
+      scan on every air-write). Measured on the noise preset
+      (`cargo run --release --example bench_memory`): **8192 → 2061
+      B/section average, 4.0× reduction** (40.6 → 10.2 KB of block data
+      per chunk); every natural section fits 4-bit indices (max palette
+      14). Throughput unchanged (`bench_partitioned` within noise).
+      Chunk-send fast path: single-entry palette → single-valued wire
+      section with no scan. Palettes only grow (stale entries linger
+      until a future compaction pass); serialization rebuilds exact
+      palettes.
 
-- [ ] **Compact block state representation**
-      Investigate palette-based sections (like MC's own wire format) as the runtime
-      representation, not just the serialization format. For sections with few unique
-      block types (common), a 4-bit palette index halves memory vs. raw `u16` BlockId,
-      doubling the number of sections that fit in cache.
+- [x] **Delta-encoded persistence** ✓ (2026-06-09) — the durable half of
+      delta storage. Dirty chunks save as cell-diffs vs the regenerated
+      procedural baseline (`UmcDelta` packed-i64 NBT array; one edited
+      block = one entry instead of a full chunk). Loading regenerates and
+      re-applies — so **block edits now survive preset/seed changes**
+      (the fingerprint-skip rule applies only to legacy full-section
+      chunks). Save cost: one baseline regeneration per dirty chunk
+      (~ms, on the autosave task).
+- [x] **Delta-encoded runtime storage / chunk eviction** ✓ (2026-06-09):
+      memory is now bounded by ACTIVE area, not explored area. The server
+      worldgen is a `DeltaOverlayGen` (baseline + live `DeltaStore`,
+      populated by load and refreshed by every save), so any chunk whose
+      edits are saved is exactly reproducible. A periodic sweep
+      (`eviction.rs`, `world.eviction_interval_secs`, keep radius
+      `world.keep_radius`, 0 = view_distance + 8) drops non-dirty chunks
+      beyond the keep radius of every player + spawn; the next
+      `ensure_generated` brings them back bit-for-bit
+      (`test_eviction_roundtrip_through_overlay`). Dirty chunks wait for
+      autosave. Known coarseness: an in-flight cascade touching a chunk
+      at eviction reads AIR and self-heals via the stale guard.
 
-### 6d -- Scheduling & work distribution
+- [x] **Hot-path access costs measured & fixed** ✓ (2026-06-09,
+      `bench_access`): the per-read DashMap lookup is 15.5 ns = 59% of a
+      block read; a last-chunk memo recovers 66% even at 76% hit rate —
+      so the strategy is lookup *amortization*, and full per-worker chunk
+      arenas stay deferred until contention (not per-access cost) is
+      measured. Applied: chunk-memoized light BFS (`CachedWorld`),
+      LUT-backed block light properties (azalea `Box<dyn BlockTrait>` +
+      string match per call → one-time 27 KB tables), and **`LightBatch`**
+      (one reporting event per light flood instead of ~1,800 per-cell
+      `LightSet`s — graph bookkeeping was ~95% of a torch placement).
+      Net: torch place 1.7 ms → **371 µs**, light propagation 7.6K → 35K
+      blocks/s, torch-grid scenario 66,060 → 72 events.
 
-- [ ] **Adaptive region sizing**
-      Dynamically adjust spatial partitions based on event density. Dense areas (many
-      players, active redstone, flowing water) get smaller regions with dedicated cores.
-      Sparse areas are merged into larger regions handled by a single core. Rebalance
-      periodically based on event count per partition.
+### 6d -- Scheduling & work distribution ✓ core (2026-06-09)
 
-- [ ] **Priority-aware frontier draining**
-      Not all events are equal. Player-initiated events and their immediate cascades
-      should be prioritized over background physics (distant water spreading, etc.)
-      to minimize perceived latency. Use a priority queue for the frontier, with
-      priority based on causal distance from a player action.
+- [x] **Priority-aware frontier draining**
+      `CausalGraph` has a two-lane ready queue: player actions enter at
+      priority 1, background physics at 0, children inherit the max of
+      their parents (the whole cascade stays in the fast lane), and
+      forwarded cross-partition events keep their lane. Priority only
+      reorders spacelike-separated events — causal order is enforced by
+      parent edges — so outcomes are unchanged, only latency. Combined
+      with **per-step publishing** (workers broadcast changes after every
+      scheduler step instead of at batch quiescence), a player's block
+      break reaches clients while a large background flood is still
+      cascading — proven by
+      `priority_action_publishes_before_background_flood_finishes`.
 
-- [ ] **Work-stealing across partitions**
-      When a core's partition is quiescent (no pending events), it should steal work
-      from a neighboring partition. Use rayon's existing work-stealing pool but with
-      spatial-affinity hints so stolen work is likely to be cache-warm (prefer stealing
-      from adjacent partitions whose chunk data may be in shared L2/L3).
+- [x] **Adaptive region rebalancing + hot-region splitting**
+      Region→worker assignment is now a *table* (default = deterministic
+      hash; overrides installed by a rebalancer thread, snapshot-read by
+      workers each loop iteration). The rebalancer meters per-region write
+      throughput every 50 ms and, with hysteresis (one change per tick +
+      500 ms per-region cooldown): **moves** a hot region from the busiest
+      worker to the idlest, **splits** a region carrying >50% of total
+      load into per-chunk ownership across all workers, and reverts cooled
+      splits. During a handoff both owners may briefly execute events for
+      the same region — the same race class as a partition boundary,
+      tolerated by the stale guard + confluent rules.
+      Measured (32-core, `bench_partitioned` hotspot: sustained load
+      confined to ONE region, 8 workers): static 161 ms → adaptive 101 ms
+      (**1.60× whole-run; the split engages after the first metering
+      tick, roughly doubling post-split throughput 2.8 → 4.6M ev/s**).
+      Config: `physics.rebalance` (default on).
+
+- [x] **Work-stealing across partitions** — subsumed: under exclusive
+      chunk ownership, "stealing" an event would violate write ownership;
+      the ownership-compatible equivalent is *moving the region itself*,
+      which the rebalancer does. Fine-grained intra-batch stealing may
+      return later inside a worker pool per NUMA node.
+
+- [x] **Worker→core pinning** (`physics.pin_workers`, default off):
+      first step toward NUMA-local memory; per-partition arenas pinned to
+      the owning core's memory node remain (6c residue, with eviction).
 
 ### 6e -- Measurement & validation
 
-- [ ] Load testing: 1k, 10k, 100k simulated players
-- [ ] Microbenchmarks: events/sec/core, quiescence latency by cascade type
-- [ ] Causal propagation velocity metric (blocks/sec) as a first-class benchmark
+- [x] Load testing: **1k simulated players** ✓ (2026-06-09;
+      `examples/load_test.rs` — a headless protocol-client swarm:
+      handshake/login/configuration/play, keep-alive replies, optional
+      wander + block-breaking). Results (32-core desktop, release):
+      - **1,000 idle joins**: 1000/1000, 0 errors; join p50 1.1 s / p99
+        4.5 s (a "join" = full delivery of 289 chunks ≈ 12 MB each);
+        289,000 chunks streamed = **11.9 GB at 195 MB/s sustained**;
+        ~5.5 cores; **57 MB RSS total** (≈45 KB/player marginal).
+      - **100 wander+dig**: 46K block updates fanned out, 0 errors,
+        p50 join 149 ms, ~2.5 cores.
+      - **500 wandering**: 0 errors, 6,085 chunks/s (268 MB/s), ~6 cores
+        — but ~380K player-event drops (see finding 3).
+      Findings (each fixed or filed):
+      1. **Async/lock wedge (fixed)**: DashMap read guards held across
+         packet-write awaits in `send_chunk_from_world`/`send_light_updates`
+         + `ensure_sky_light`'s write lock = all tokio workers blocked on
+         locks whose holders couldn't be scheduled. 1,000 joins → total
+         stall, ~0 CPU. Guards now drop before every await.
+      2. **Sky-light thundering herd (fixed)**: hundreds of joiners all
+         passed the lock-free `is_sky_lit` check and queued to rescan the
+         same spawn chunks; now re-checked under the chunk lock and marked
+         before guard release.
+      3. **O(N²) movement fan-out (filed)**: every move broadcasts to
+         every connection (≈1.25M deliveries/s at 500 wanderers); the
+         per-connection player-event channel drops under load (visual
+         entity-position staleness, self-healing). Needs **interest
+         management / AOI filtering** — broadcast only to players in
+         range. Natural companion of 6f's gateway-node split.
+      Bus capacity raised 256 → 8192 (Arc-backed slots; megabytes of
+      worst-case buffer). 10k/100k players need AOI first.
+- [ ] Load testing: 10k, 100k simulated players (blocked on AOI/interest
+      management — see finding 3 above)
+- [x] Microbenchmarks: events/sec/core, quiescence latency by cascade type
+      -- `examples/bench_baseline.rs` (see 6b-0 for current numbers)
+- [x] Causal propagation velocity metric (blocks/sec) as a first-class benchmark
+      -- per-action front-distance / quiescence-time in `bench_baseline`
 - [ ] Formal causal invariance proof for full rule set
-- [ ] Comparison metrics vs. traditional tick-based architecture (vanilla, Paper, Folia)
+- [x] Comparison metrics vs. traditional tick-based architecture
+      ✓ (2026-06-09, vs REAL vanilla 1.21.11 server.jar measured on the
+      same machine — console-driven via `bench_vanilla/*.ps1`, mirrored by
+      `examples/bench_vs_vanilla.rs`):
+      | workload | vanilla (measured) | ours (16 workers) | speedup |
+      |---|---|---|---|
+      | 441 water ponds settle | 1.75 s (rule floor, 20.10 TPS) | 13.6 ms | **128×** |
+      | 10,000 sand, 29-block fall | 2.20 s (44 gt kinematics, 20.05 TPS) | 194 ms | **11×** |
+      | 160,000 sand, 16 layers | ≥2.85 s floor, done <12.3 s (20.07 TPS) | 387 ms | **≥7×** |
+      | single block-break cascade | 50 ms-1.75 s (next tick → rule time) | 9.8-49 µs | **~10⁴-10⁵×** |
+      | water propagation velocity | 4 blocks/s (hard rule cap) | 137K blocks/s | **~34,000×** |
+      Key finding: vanilla held 20 TPS on EVERYTHING up to 160K falling
+      entities — its tick architecture *rations* world change (rules
+      meter cascades across real-time ticks) rather than racing it. So
+      vanilla is rule-bound, not CPU-bound: faster hardware cannot
+      improve its numbers, while more cores directly improve ours. Bulk
+      speedups (7-11×) are CPU-bound on our side and rise with the
+      remaining 6c/6f work; latency/propagation speedups (10⁴-10⁵×) are
+      architectural and already banked.
 - [ ] Memory profiling: per-player footprint, graph growth rate, arena utilization
+- [ ] **Resource-usage comparison vs vanilla** (companion to the speed
+      comparison above): RSS under identical workloads and world sizes,
+      per-loaded-chunk and per-player memory footprint, idle CPU cost
+      (vanilla burns a core ticking an empty world; we should be ~0),
+      startup time. Vanilla side measurable with the same
+      `bench_vanilla/` console-driver approach + process counters.
 - [ ] Flame graphs for event processing hot path
 - [ ] Cross-player causality integration tests
 
-### 6f -- Distribution (future, when single-machine limits are reached)
+### 6f -- Distribution
 
-- [ ] Distributed execution across machines (partition spatial regions across nodes)
-- [ ] Cross-node causal ordering protocol (vector clocks or Lamport timestamps)
-- [ ] Region migration for load balancing
-- [ ] Edge-node architecture: physics nodes + gateway nodes for client connections
+#### 6f-0 -- Two-process prototype ✓ (2026-06-09)
+
+The partition boundary now runs over a socket. `cluster.rs`: manual
+binary codec for events (incl. `LightBatch`), framed TCP link (blocking
+reader/writer threads), and four frame kinds — `Forward` (cross-node
+consequents, sent post-execution so happens-before rides the socket
+exactly as it rode the channel), `Action`, `WriteSync` (each node
+mirrors its executed write log; the peer applies it to a replica world
+and republishes on its bus so ITS clients see remote physics), and
+`Ping`/`Pong` (two-node global quiescence via matched sent/received
+counters with receive-before-count ordering).
+
+What makes it cheap: **deterministic worldgen** means every node
+generates identical baseline terrain locally — chunks are never
+transferred; and **confluent, self-stabilizing rules** (6b-2) make
+replica reads at node borders the same tolerated race class as
+cross-partition reads in one process. One ordering rule matters:
+WriteSync flushes BEFORE Forward within a step, so a forwarded event's
+causal prerequisites are in the peer's replica when it arrives.
+
+Measured (`bench_cluster`, spawns a real `physics_peer` process,
+sand-rain across a 24×24-chunk arena, regions split ~50/50):
+- **World bit-identical to the single-process run** (verified per cell;
+  also `tests/cluster.rs`: cross-node action mirrors back; mixed
+  sand+border-water workload matches single-node on BOTH nodes, 700K+
+  cells, water cascading across the socket mid-flow).
+- Node 0 executed exactly 50% of events; the peer the rest.
+- Protocol overhead on one machine: **within noise** (34.2 ms vs 36.8 ms
+  single-process — the boundary costs nothing for region-local work).
+
+#### 6f-1 -- N-node mesh + migration + interest management ✓ (2026-06-09)
+
+- **N-node mesh** (`ClusterMesh`): one link per peer, formed
+  symmetrically (dial lower ids, accept higher; dialers identify with a
+  `Hello` frame). WriteSync broadcasts to all peers. **N-node global
+  quiescence**: `Pong` reports each node's pending plus its
+  sent/received totals across ALL its links, so a coordinator detects
+  in-flight traffic on links it can't see; quiet ⇔ all pendings 0 ∧
+  Σsent == Σreceived, two stable rounds. Verified: a **3-node mesh over
+  real TCP** converges to the single-node world exactly (water crossing
+  node borders included).
+- **Region migration** — the replica design's payoff: since every node
+  already mirrors every write and regenerates identical terrain, moving
+  a region is a **pure ownership flip** (`Transfer` frame, counted, into
+  every node's override table). Zero state transfer. The propagation
+  window is transient dual-ownership — the same race class as the 6d
+  intra-node rebalancer, absorbed by the stale guard + confluence.
+  Verified: migrate mid-workload; post-migration waves execute on the
+  new owner; all worlds converge. (Single-initiator prototype:
+  concurrent conflicting migrations of one region are not arbitrated.
+  Cross-node auto-rebalancing can now reuse the 6d metering pattern.)
+- **Interest management (entity layer)**: receiver-side AOI filter
+  (skip move packets for players outside view distance + margin) and —
+  the piece that actually mattered — **entity-tracker coalescing**:
+  connections drain move-event bursts and keep only the newest absolute
+  position per entity, bounding per-iteration work at one teleport per
+  visible player regardless of incoming move rate. 500 wandering
+  players: **~380K dropped events → 0**, lossless delivery (the dense
+  crowd now costs real CPU instead of dropped updates — the honest
+  trade). Sender-side spatial pub/sub (only deliver to subscribed
+  regions) remains the gateway-tier upgrade for 10k+.
+
+- [x] Distributed execution across machines (N-node mesh, above)
+- [x] Cross-node causal ordering protocol — no vector clocks needed:
+      consequents ship after their cause executes, FIFO transport
+      carries happens-before, confluent rules absorb replica staleness.
+- [x] Region migration for load balancing (ownership-flip protocol,
+      above; auto-policy pending)
+- [x] **Edge-node architecture + spatial pub/sub** ✓ (2026-06-09 —
+      Phase 6f COMPLETE):
+      - **SpatialBus** (`event_bus.rs`): region-bucketed pub/sub replaces
+        the broadcast firehose for world changes AND entity movement.
+        Connections subscribe to the regions inside their view (+2 chunk
+        margin), rediffed on chunk-border crossings; physics
+        `publish_writes`, cluster `WriteSync` republish, and registry
+        moves all deliver per-region — **O(nearby players) per event,
+        not O(all players)**. Join/leave/chat stay on the global
+        broadcast (tab list is global, low rate).
+        Measured (500 wanderers, 40 s): dense crowd 28.5 cores → spread
+        crowd **11.5 cores while doing 1.5× the chunk streaming**
+        (374K chunks, 411 MB/s) — the entity-delivery plane shrank ~10×;
+        the dense case's remaining cost is irreducible (mutual
+        visibility).
+      - **Gateway nodes**: a gateway is a cluster node with
+        `node_id >= physics_nodes` — it owns zero regions, so its local
+        physics service receives no work; it serves players from its
+        replica world (deterministic worldgen + WriteSync) and submits
+        every action over the mesh. Config: `[cluster]`
+        enabled/node_id/total_nodes/physics_nodes/listen/peers (see
+        `gateway-demo.yaml`). Demo verified end-to-end: 100 protocol
+        clients wandering + digging through a gateway, 45,362 block
+        updates round-tripped client → gateway → Action frame → peer
+        cascade → WriteSync → replica → spatial bus → clients; the peer
+        process reported ALL 10,313 physics events executed there.
 
 ---
 

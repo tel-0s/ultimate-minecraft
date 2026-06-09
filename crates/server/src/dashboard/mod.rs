@@ -127,6 +127,17 @@ pub fn snapshot_graph(graph: &CausalGraph) -> GraphSnapshot {
                 format!("LightNotify ({},{},{})", pos.x, pos.y, pos.z),
                 [pos.x, pos.y, pos.z],
             ),
+            EventPayload::LightBatch { changes } => {
+                let anchor = changes
+                    .first()
+                    .map(|c| c.pos)
+                    .unwrap_or(ultimate_engine::world::position::BlockPos::new(0, 0, 0));
+                (
+                    "light_set".to_string(),
+                    format!("LightBatch ({} cells)", changes.len()),
+                    [anchor.x, anchor.y, anchor.z],
+                )
+            }
         };
 
         nodes.push(GraphNode {

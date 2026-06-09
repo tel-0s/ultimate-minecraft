@@ -1,11 +1,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast;
 use ultimate_engine::world::World;
 use ultimate_server::config::{self, ServerConfig};
 use ultimate_server::dashboard::{self, DashboardState};
-use ultimate_server::event_bus::{self, WorldChangeBatch};
+use ultimate_server::event_bus::{self};
 use ultimate_server::persistence;
 use ultimate_server::player_registry::PlayerRegistry;
 use ultimate_server::worldgen::{self, WorldGen};
@@ -68,10 +67,28 @@ async fn main() {
 
     // ── Generate base world, then overlay saved modifications ──────────
     let world = Arc::new(World::new());
-    let worldgen: Arc<dyn WorldGen> = match worldgen::preset::load(&cfg.world.preset, cfg.world.seed) {
+    // Base generator: pristine procedural pipeline. Persistence diffs
+    // against THIS (never the overlay — see persistence::save_world).
+    let base_worldgen: Arc<dyn WorldGen> = match worldgen::preset::load(&cfg.world.preset, cfg.world.seed) {
         Ok(g) => g,
         Err(e) => {
             tracing::error!("Worldgen preset {:?} failed to load: {:#}", cfg.world.preset, e);
+            return;
+        }
+    };
+    // Live delta store + overlay: every chunk generation re-applies saved
+    // edits, which is what makes eviction / lazy regeneration faithful.
+    let delta_store = persistence::new_delta_store();
+    let worldgen: Arc<dyn WorldGen> = Arc::new(persistence::DeltaOverlayGen::new(
+        Arc::clone(&base_worldgen),
+        Arc::clone(&delta_store),
+    ));
+    // Fingerprint of (preset content, seed): stamped into saved chunks so
+    // stale-generator terrain is detected and regenerated at load.
+    let gen_fp = match worldgen::preset::fingerprint(&cfg.world.preset, cfg.world.seed) {
+        Ok(fp) => fp,
+        Err(e) => {
+            tracing::error!("Worldgen preset {:?} failed to fingerprint: {:#}", cfg.world.preset, e);
             return;
         }
     };
@@ -85,8 +102,9 @@ async fn main() {
         world.chunk_count(),
     );
 
-    // Load saved (player-modified) chunks on top of the generated base.
-    match persistence::load_into(&world, &cfg.world.dir) {
+    // Load saved (player-modified) chunks on top of the generated base,
+    // populating the delta store for future regenerations.
+    match persistence::load_into(&world, &cfg.world.dir, gen_fp, &*worldgen, Some(&delta_store)) {
         Ok(0) => tracing::info!("No saved modifications found"),
         Ok(n) => tracing::info!("Loaded {} modified chunks from {}", n, cfg.world.dir.display()),
         Err(e) => tracing::error!("Failed to load saved chunks: {:#}", e),
@@ -100,19 +118,83 @@ async fn main() {
         dashboard::server::start(dash, dashboard_port).await;
     });
 
-    // World-change event bus.
-    let (bus_tx, _) = broadcast::channel::<WorldChangeBatch>(event_bus::BUS_CAPACITY);
+    // Spatial event bus (Phase 6f): world changes and entity moves are
+    // delivered per-region to nearby subscribers only.
+    let spatial = event_bus::SpatialBus::new();
+
+    // ── Cluster membership (Phase 6f, optional) ──────────────────────────
+    // Join the mesh BEFORE physics starts so region routing is node-aware
+    // from the first event. A gateway (node_id >= physics_nodes) owns no
+    // regions: it serves players from its replica and submits all physics.
+    let mesh = if cfg.cluster.enabled {
+        let listener = match std::net::TcpListener::bind(&cfg.cluster.listen) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("cluster listen {} failed: {e}", cfg.cluster.listen);
+                return;
+            }
+        };
+        let physics_nodes = if cfg.cluster.physics_nodes == 0 {
+            cfg.cluster.total_nodes
+        } else {
+            cfg.cluster.physics_nodes
+        };
+        tracing::info!(
+            "Joining cluster as node {}/{} ({} physics nodes{})...",
+            cfg.cluster.node_id, cfg.cluster.total_nodes, physics_nodes,
+            if cfg.cluster.node_id >= physics_nodes { ", GATEWAY" } else { "" },
+        );
+        match ultimate_server::cluster::ClusterMesh::form_with_physics(
+            cfg.cluster.node_id,
+            cfg.cluster.total_nodes,
+            physics_nodes,
+            &listener,
+            &cfg.cluster.peers,
+        ) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                tracing::error!("cluster mesh formation failed: {e:#}");
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    // ── Physics service ──────────────────────────────────────────────────
+    // Partition workers own the shared causal graphs; connections and
+    // simulation layers submit root events and the spatial bus carries
+    // results to interested connections.
+    let physics = ultimate_server::physics::start(
+        Arc::clone(&world),
+        ultimate_server::rules::standard,
+        Arc::clone(&spatial),
+        Some(Arc::clone(&dashboard)),
+        ultimate_server::physics::PhysicsOptions {
+            workers: cfg.physics.workers,
+            pin_workers: cfg.physics.pin_workers,
+            rebalance: cfg.physics.rebalance,
+            cluster: mesh.as_ref().map(|m| ultimate_server::physics::ClusterCtx {
+                mesh: Arc::clone(m),
+            }),
+        },
+    );
+    if let Some(m) = &mesh {
+        m.attach(Arc::clone(&world), Arc::clone(&spatial), physics.clone());
+    }
 
     // Ambient simulation layers (empty for now).
     let sim_layers: Vec<Box<dyn ultimate_server::simulation::SimulationLayer>> = vec![];
-    ultimate_server::simulation::start(Arc::clone(&world), sim_layers, bus_tx.clone());
+    ultimate_server::simulation::start(Arc::clone(&world), sim_layers, physics.clone());
 
     // Shared player registry for multiplayer visibility.
-    let registry = Arc::new(PlayerRegistry::new());
+    let registry = Arc::new(PlayerRegistry::new(Arc::clone(&spatial)));
 
     // ── Periodic autosave ────────────────────────────────────────────────
     let save_world_ref = Arc::clone(&world);
     let save_dir = cfg.world.dir.clone();
+    let save_worldgen = Arc::clone(&base_worldgen); // diff against the BASE
+    let save_deltas = Arc::clone(&delta_store);
     let autosave = Duration::from_secs(cfg.world.autosave_interval_secs);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(autosave);
@@ -120,21 +202,38 @@ async fn main() {
         loop {
             interval.tick().await;
             tracing::info!("Autosaving...");
-            match persistence::save_world(&save_world_ref, &save_dir) {
+            match persistence::save_world(
+                &save_world_ref, &save_dir, gen_fp, &*save_worldgen, Some(&save_deltas),
+            ) {
                 Ok(n) => tracing::info!("Autosave complete: {} chunks", n),
                 Err(e) => tracing::error!("Autosave failed: {:#}", e),
             }
         }
     });
 
+    // ── Chunk eviction (Phase 6c): memory bounded by active area ────────
+    let keep_radius = if cfg.world.keep_radius == 0 {
+        cfg.network.view_distance + 8
+    } else {
+        cfg.world.keep_radius
+    };
+    ultimate_server::eviction::start(
+        Arc::clone(&world),
+        Arc::clone(&registry),
+        keep_radius,
+        cfg.world.pregenerate_radius,
+        cfg.world.eviction_interval_secs,
+    );
+
     // ── Start listener with graceful shutdown ────────────────────────────
     tracing::info!("Starting Minecraft 1.21.11 server on {}", cfg.network.bind);
 
     tokio::select! {
         result = ultimate_server::net::listener::run(
-            Arc::clone(&world), dashboard, bus_tx, registry,
+            Arc::clone(&world), dashboard, spatial, registry,
             Arc::clone(&worldgen),
             Arc::clone(&cfg),
+            physics,
         ) => {
             if let Err(e) = result {
                 tracing::error!("Server error: {}", e);
@@ -147,7 +246,7 @@ async fn main() {
 
     // ── Save on shutdown ─────────────────────────────────────────────────
     tracing::info!("Saving world before exit...");
-    match persistence::save_world(&world, &cfg.world.dir) {
+    match persistence::save_world(&world, &cfg.world.dir, gen_fp, &*base_worldgen, None) {
         Ok(n) => tracing::info!("Shutdown save complete: {} chunks written", n),
         Err(e) => tracing::error!("Shutdown save failed: {:#}", e),
     }

@@ -6,3 +6,9 @@ world-*/
 # Operator-local server config; auto-created on first run from
 # crates/server/src/config.rs::DEFAULT_CONFIG_YAML.
 /server.yaml
+# Vanilla-comparison bench area: server.jar (54 MB), its world, logs.
+# The driver scripts (*.ps1) ARE tracked — whitelisted below.
+/bench_vanilla/*
+!/bench_vanilla/drive.ps1
+!/bench_vanilla/escalate.ps1
+!/bench_vanilla/mega.ps1

@@ -44,3 +44,5 @@ azalea-inventory = "0.15"
 
 # World generation
 noise = "0.9"
+dashmap = "6"
+core_affinity = "0.8"

@@ -1,26 +1,23 @@
 //! Ambient simulation framework.
 //!
-//! Each [`SimulationLayer`] runs on its own tokio task, periodically generating
-//! root causal events. Those events are run through a fresh [`CausalGraph`] +
-//! scheduler, and the resulting block changes are published to the event bus.
+//! Each [`SimulationLayer`] runs on its own tokio task, periodically
+//! generating root causal events. Since Phase 6b-1 the layers are pure
+//! event *sources*: generated events are submitted to the shared physics
+//! service, which runs the cascade on the server-wide causal graph and
+//! broadcasts the resulting changes on the event bus.
 //!
 //! # Adding a new layer
 //!
 //! 1. Implement [`SimulationLayer`] for your struct.
 //! 2. Push a `Box::new(YourLayer)` into the `layers` vec in `main.rs`.
-//!
-//! The runner handles scheduling, cascade execution, and bus publishing.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::broadcast;
 use ultimate_engine::causal::event::Event;
-use ultimate_engine::causal::graph::CausalGraph;
-use ultimate_engine::causal::scheduler::Scheduler;
 use ultimate_engine::world::World;
 
-use crate::event_bus::{self, ChangeSource, WorldChangeBatch};
+use crate::physics::PhysicsHandle;
 
 /// A pluggable simulation layer that generates root causal events on a timer.
 ///
@@ -41,16 +38,17 @@ pub trait SimulationLayer: Send + Sync + 'static {
 
 /// Spawn one tokio task per simulation layer.
 ///
-/// Each task loops on `layer.interval()`, runs a fresh causal cascade for the
-/// generated events, and publishes the resulting block changes to `bus`.
+/// Each task loops on `layer.interval()` and submits generated events to
+/// the shared physics service; the service runs the cascade and publishes
+/// the resulting changes to the event bus.
 pub fn start(
     world: Arc<World>,
     layers: Vec<Box<dyn SimulationLayer>>,
-    bus: broadcast::Sender<WorldChangeBatch>,
+    physics: PhysicsHandle,
 ) {
     for layer in layers {
         let world = Arc::clone(&world);
-        let bus = bus.clone();
+        let physics = physics.clone();
         tokio::spawn(async move {
             let name = layer.name();
             let mut interval = tokio::time::interval(layer.interval());
@@ -67,32 +65,8 @@ pub fn start(
                     continue;
                 }
 
-                // Fresh graph + scheduler per tick (same pattern as player actions).
-                let mut graph = CausalGraph::new();
-                for event in events {
-                    graph.insert_root(event);
-                }
-
-                let rules = crate::rules::standard();
-                let scheduler = Scheduler::new();
-                let executed = scheduler.run_until_quiet(&world, &mut graph, &rules, 1000);
-
-                let changes = event_bus::collect_block_changes(&graph);
-                let light_changes = event_bus::collect_light_changes(&graph);
-                if !changes.is_empty() || !light_changes.is_empty() {
-                    let num_changes = changes.len();
-                    let batch = WorldChangeBatch {
-                        source: ChangeSource::Simulation(name),
-                        changes: changes.into(),
-                        light_changes: light_changes.into(),
-                    };
-                    let _ = bus.send(batch);
-
-                    tracing::debug!(
-                        "Simulation '{}': {} events executed, {} block changes published",
-                        name, executed, num_changes
-                    );
-                }
+                tracing::debug!("Simulation '{}': submitting {} root events", name, events.len());
+                physics.submit_events(events);
             }
         });
     }

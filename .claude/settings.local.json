@@ -30,7 +30,10 @@
       "WebFetch(domain:wiki.vg)",
       "Bash(gh search code:*)",
       "Bash(python:*)",
-      "Bash(findstr:*)"
+      "Bash(findstr:*)",
+      "Bash(grep -ri \"set_time\\\\|SetTime\\\\|settime\" target/debug/build/azalea-protocol-*/out/)",
+      "Bash(grep -r \"Torch\" target/debug/build/azalea-block-*/out/)",
+      "Bash(cargo doc *)"
     ]
   }
 }

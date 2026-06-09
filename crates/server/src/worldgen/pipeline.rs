@@ -10,15 +10,16 @@
 use std::sync::Arc;
 
 use ultimate_engine::world::block::BlockId;
+use ultimate_engine::world::World;
 use ultimate_engine::world::chunk::Chunk;
-use ultimate_engine::world::position::LocalBlockPos;
+use ultimate_engine::world::position::{ChunkPos, LocalBlockPos};
 
 use crate::block;
 use super::WorldGen;
 use super::biome::Biome;
 use super::carver::Carver;
 use super::climate::BiomeSource;
-use super::decorator::{Decorator, DecorationContext};
+use super::decorator::{Decorator, DecorationContext, PendingWrites};
 use super::density::DensityFunction;
 use super::surface::{SurfaceContext, SurfaceRule};
 
@@ -53,6 +54,12 @@ pub struct DensityPipeline {
     /// World seed, forwarded to decorators so their per-chunk PRNGs
     /// derive from `(seed, cx, cz, decorator_index)`.
     pub seed: u32,
+    /// Cross-chunk pending-writes queue shared across all chunk
+    /// generations from this pipeline. Tree canopies (and future
+    /// multi-chunk features) that fall outside the in-flight chunk and
+    /// whose target chunk isn't loaded yet queue here; drained when the
+    /// target is later generated.
+    pub pending: Arc<PendingWrites>,
     pub sea_level: i64,
     pub min_y: i64,
     pub max_y: i64,
@@ -80,7 +87,7 @@ impl DensityPipeline {
 }
 
 impl WorldGen for DensityPipeline {
-    fn generate_chunk(&self, cx: i32, cz: i32) -> Chunk {
+    fn generate_chunk(&self, cx: i32, cz: i32, world: &World) -> Chunk {
         let mut chunk = Chunk::new();
         let base_x = cx as i64 * 16;
         let base_z = cz as i64 * 16;
@@ -146,7 +153,9 @@ impl WorldGen for DensityPipeline {
         // Decoration passes (ores, plants, trees, structures). Each
         // decorator's PRNG is seeded from `(seed, cx, cz, idx)` and
         // gets access to the biome source + surface grid so it can
-        // filter by biome.
+        // filter by biome. Cross-chunk writes route through
+        // `world`/`pending` so canopies and features that fall outside
+        // the in-flight chunk land in the right place.
         for (idx, decorator) in self.decorators.iter().enumerate() {
             let mut ctx = DecorationContext {
                 chunk: &mut chunk,
@@ -156,8 +165,26 @@ impl WorldGen for DensityPipeline {
                 biome_source: &*self.biome_source,
                 sea_level: self.sea_level,
                 surface_y: &surface_grid,
+                world,
+                pending: &self.pending,
             };
             decorator.decorate(&mut ctx);
+        }
+
+        // Apply any pending writes targeted at THIS chunk that were
+        // queued by earlier-generated neighbours (e.g. a tree in chunk
+        // (cx-1, cz) whose canopy reaches into our chunk). Only writes
+        // to currently-air cells, so we don't smash through terrain
+        // features the surface rule placed (the canopy's
+        // "if-air" guard is per-decorator, but neighbours' writes are
+        // unconditional — re-guard here).
+        let this_pos = ChunkPos::new(cx, cz);
+        if let Some((_, writes)) = self.pending.remove(&this_pos) {
+            for w in writes {
+                if chunk.get_block(w.local) == BlockId::AIR {
+                    chunk.set_block(w.local, w.block);
+                }
+            }
         }
 
         chunk
@@ -197,7 +224,7 @@ pub struct FlatPipeline {
 }
 
 impl WorldGen for FlatPipeline {
-    fn generate_chunk(&self, _cx: i32, _cz: i32) -> Chunk {
+    fn generate_chunk(&self, _cx: i32, _cz: i32, _world: &World) -> Chunk {
         let mut chunk = Chunk::new();
         for lx in 0..16u8 {
             for lz in 0..16u8 {
@@ -266,6 +293,7 @@ mod tests {
             carvers: Vec::new(),
             decorators: Vec::new(),
             seed: 0,
+            pending: Arc::new(PendingWrites::new()),
             sea_level: 63, min_y: -64, max_y: 319, bedrock_y: 0,
             skin_depth: 4,
         }
@@ -281,7 +309,7 @@ mod tests {
     #[test]
     fn density_pipeline_stratifies_via_surface_rule() {
         let pipe = pipe_with(flat_density(70));
-        let chunk = pipe.generate_chunk(0, 0);
+        let chunk = pipe.generate_chunk(0, 0, &World::new());
         // y=0: bedrock floor
         assert_eq!(chunk.get_block(LocalBlockPos { x: 8, y: 0, z: 8 }), block::BEDROCK);
         // y=50: deep stone
@@ -297,7 +325,7 @@ mod tests {
     #[test]
     fn density_pipeline_underwater_fills_with_water() {
         let pipe = pipe_with(flat_density(50));
-        let chunk = pipe.generate_chunk(0, 0);
+        let chunk = pipe.generate_chunk(0, 0, &World::new());
         assert_eq!(chunk.get_block(LocalBlockPos { x: 0, y: 51, z: 0 }), block::WATER);
         assert_eq!(chunk.get_block(LocalBlockPos { x: 0, y: 63, z: 0 }), block::WATER);
         // Above sea level: air.
@@ -355,7 +383,7 @@ mod tests {
             max_y: 30,
         })];
 
-        let chunk = pipe.generate_chunk(0, 0);
+        let chunk = pipe.generate_chunk(0, 0, &World::new());
         // y=0: bedrock survives carving (carvers skip bedrock).
         assert_eq!(chunk.get_block(LocalBlockPos { x: 0, y: 0, z: 0 }), block::BEDROCK);
         // y=5: below carver range, stone stays.
@@ -366,6 +394,104 @@ mod tests {
         assert_eq!(chunk.get_block(LocalBlockPos { x: 0, y: 50, z: 0 }), block::STONE);
         // y=70: still grass at the surface (carver range doesn't reach here).
         assert_eq!(chunk.get_block(LocalBlockPos { x: 0, y: 70, z: 0 }), block::GRASS_BLOCK);
+    }
+
+    #[test]
+    fn cross_chunk_writes_land_in_neighbours() {
+        // A tree planted right at the chunk's corner has canopy cells
+        // that fall into the neighbour chunk. The pending queue should
+        // make those cells survive: when the neighbour chunk is later
+        // generated, its drain step picks them up.
+        use super::super::decorator::{Decorator, DecorationContext, PendingWrites};
+        use ultimate_engine::world::position::{BlockPos, ChunkPos};
+        use ultimate_engine::world::World;
+
+        // A decorator that writes one block 8 cells east of the chunk's
+        // (lx=15, lz=0) column — definitely lands in the (cx+1, cz) neighbour.
+        struct PokeEastDecorator;
+        impl Decorator for PokeEastDecorator {
+            fn decorate(&self, ctx: &mut DecorationContext) {
+                let wx = ctx.cx as i64 * 16 + 23; // 7 blocks into the east neighbour
+                let wz = ctx.cz as i64 * 16 + 0;
+                ctx.set_world_block(BlockPos::new(wx, 80, wz), block::OAK_LOG);
+            }
+        }
+
+        // Build a tall-enough pipeline so y=80 sits above the surface
+        // (surface is 70 in pipe_with). Use a shared pending so both
+        // generate_chunk calls see the same queue.
+        let pending = Arc::new(PendingWrites::new());
+        let mut pipe = pipe_with(flat_density(70));
+        pipe.pending = Arc::clone(&pending);
+        pipe.decorators = vec![Arc::new(PokeEastDecorator)];
+
+        // Generate the source chunk first. Target chunk doesn't exist yet
+        // so the cross-chunk write goes to the pending queue.
+        let world = World::new();
+        let _chunk_a = pipe.generate_chunk(0, 0, &world);
+        assert!(pending.contains_key(&ChunkPos::new(1, 0)),
+            "writing to (cx=1, cz=0) before that chunk exists should populate pending");
+
+        // Now generate the neighbour. Its drain step should pick up the
+        // pending write and place the log at the right cell.
+        let chunk_b = pipe.generate_chunk(1, 0, &world);
+        // Local x for world x=23 in chunk cx=1 is x=23-16=7.
+        assert_eq!(
+            chunk_b.get_block(ultimate_engine::world::position::LocalBlockPos {
+                x: 7, y: 80, z: 0,
+            }),
+            block::OAK_LOG,
+            "neighbour chunk should drain its pending writes during generation",
+        );
+        assert!(!pending.contains_key(&ChunkPos::new(1, 0)),
+            "pending entry should be removed after the target chunk drains it");
+    }
+
+    #[test]
+    fn cross_chunk_writes_route_to_loaded_world() {
+        // If the target chunk is ALREADY in the world (loaded), the
+        // write should go straight there via world.set_block — not the
+        // pending queue.
+        use super::super::decorator::{Decorator, DecorationContext, PendingWrites};
+        use ultimate_engine::world::position::{BlockPos, ChunkPos};
+        use ultimate_engine::world::World;
+        use ultimate_engine::world::chunk::Chunk;
+
+        struct PokeEastDecorator;
+        impl Decorator for PokeEastDecorator {
+            fn decorate(&self, ctx: &mut DecorationContext) {
+                let wx = ctx.cx as i64 * 16 + 23;
+                let wz = ctx.cz as i64 * 16 + 0;
+                ctx.set_world_block(BlockPos::new(wx, 80, wz), block::OAK_LOG);
+            }
+        }
+
+        let pending = Arc::new(PendingWrites::new());
+        let mut pipe = pipe_with(flat_density(70));
+        pipe.pending = Arc::clone(&pending);
+        pipe.decorators = vec![Arc::new(PokeEastDecorator)];
+
+        let world = World::new();
+        // Pre-load chunk (1, 0) so the cross-chunk write goes to world.set_block.
+        world.insert_chunk(ChunkPos::new(1, 0), Chunk::new());
+        let _chunk_a = pipe.generate_chunk(0, 0, &world);
+
+        assert!(!pending.contains_key(&ChunkPos::new(1, 0)),
+            "pending should be empty when target chunk is already loaded");
+        assert_eq!(
+            world.get_block(BlockPos::new(23, 80, 0)),
+            block::OAK_LOG,
+            "write should land directly in the loaded neighbour",
+        );
+        // Regression: generation writes are procedural terrain, NOT player
+        // modifications. A dirty mark here would cause persistence to save
+        // (and freeze) the neighbour's whole terrain at the current
+        // generator version — the source of "stitched chunks" seams after
+        // a preset change.
+        assert_eq!(
+            world.dirty_count(), 0,
+            "cross-chunk generation writes must not mark chunks dirty",
+        );
     }
 
     #[test]
@@ -380,7 +506,7 @@ mod tests {
             ],
             biome: Biome::Plains,
         };
-        let chunk = pipe.generate_chunk(0, 0);
+        let chunk = pipe.generate_chunk(0, 0, &World::new());
         assert_eq!(chunk.get_block(LocalBlockPos { x: 8, y: 0, z: 8 }), block::BEDROCK);
         assert_eq!(chunk.get_block(LocalBlockPos { x: 8, y: 1, z: 8 }), block::STONE);
         assert_eq!(chunk.get_block(LocalBlockPos { x: 8, y: 5, z: 8 }), block::STONE);

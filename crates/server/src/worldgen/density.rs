@@ -70,6 +70,25 @@ pub enum DensityFnSchema {
     Max { argument1: Box<DensityFnSchema>, argument2: Box<DensityFnSchema> },
 
     Clamp { input: Box<DensityFnSchema>, min: f64, max: f64 },
+
+    /// Piecewise-linear spline: sample `input` and linearly interpolate
+    /// between adjacent points in `points`. Inputs outside the range
+    /// clamp to the endpoint outputs. Used to map a low-frequency
+    /// climate noise field (continentalness, erosion, …) to a non-linear
+    /// terrain contribution: e.g., most of the input range maps to
+    /// "land", a small tail to "deep ocean", another to "mountain peak".
+    ///
+    /// Vanilla uses cubic splines; linear is enough for Stage 4c and
+    /// keeps the schema readable.
+    Spline { input: Box<DensityFnSchema>, points: Vec<SplinePoint> },
+}
+
+/// One (input, output) pair on a [`DensityFnSchema::Spline`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SplinePoint {
+    pub input: f64,
+    pub output: f64,
 }
 
 fn default_octaves() -> usize { 4 }
@@ -91,7 +110,7 @@ impl DensityFnSchema {
             | Self::Max { argument1, argument2 } => {
                 argument1.is_y_independent() && argument2.is_y_independent()
             }
-            Self::Clamp { input, .. } => input.is_y_independent(),
+            Self::Clamp { input, .. } | Self::Spline { input, .. } => input.is_y_independent(),
         }
     }
 
@@ -142,6 +161,21 @@ impl DensityFnSchema {
 
             Self::Clamp { input, min, max } =>
                 Arc::new(Clamp { input: input.build(seed), min: *min, max: *max }),
+
+            Self::Spline { input, points } => {
+                // Sort defensively so authors don't have to keep their JSON
+                // strictly monotonic — and so an out-of-order list still
+                // produces sensible output rather than panicking at sample
+                // time. Empty list collapses to constant 0 (no contribution).
+                let mut sorted: Vec<(f64, f64)> = points.iter()
+                    .map(|p| (p.input, p.output))
+                    .collect();
+                sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                Arc::new(Spline {
+                    input: input.build(seed),
+                    points: sorted,
+                })
+            }
         }
     }
 }
@@ -221,6 +255,29 @@ struct Clamp {
 impl DensityFunction for Clamp {
     fn sample(&self, x: i64, y: i64, z: i64) -> f64 {
         self.input.sample(x, y, z).clamp(self.min, self.max)
+    }
+}
+
+struct Spline {
+    input: Arc<dyn DensityFunction>,
+    /// Sorted by `input` ascending. Empty list returns 0.
+    points: Vec<(f64, f64)>,
+}
+impl DensityFunction for Spline {
+    fn sample(&self, x: i64, y: i64, z: i64) -> f64 {
+        if self.points.is_empty() { return 0.0; }
+        let v = self.input.sample(x, y, z);
+        // Clamp at endpoints.
+        if v <= self.points[0].0 { return self.points[0].1; }
+        let last = *self.points.last().unwrap();
+        if v >= last.0 { return last.1; }
+        // Find the segment whose right edge is just above v.
+        let i = self.points.partition_point(|p| p.0 < v);
+        // i is in 1..points.len() since we ruled out the endpoints above.
+        let (x1, y1) = self.points[i - 1];
+        let (x2, y2) = self.points[i];
+        let t = (v - x1) / (x2 - x1);
+        y1 + (y2 - y1) * t
     }
 }
 
@@ -364,6 +421,94 @@ mod tests {
             argument2: Box::new(DensityFnSchema::Constant { value: 80.0 }),
         };
         assert!(reversed.as_heightmap().is_none());
+    }
+
+    #[test]
+    fn spline_interpolates_linearly_between_points() {
+        let schema = DensityFnSchema::Spline {
+            input: Box::new(DensityFnSchema::Constant { value: 0.0 }),
+            points: vec![
+                SplinePoint { input: -1.0, output: -10.0 },
+                SplinePoint { input:  0.0, output:   0.0 },
+                SplinePoint { input:  1.0, output:  20.0 },
+            ],
+        };
+        let f = schema.build(0);
+        // Endpoints exact.
+        assert_eq!(f.sample(0, 0, 0), 0.0); // input=0 → output=0
+        // Halfway between (0, 0) and (1, 20): input=0.5 → output=10.
+        let schema = DensityFnSchema::Spline {
+            input: Box::new(DensityFnSchema::Constant { value: 0.5 }),
+            points: vec![
+                SplinePoint { input: -1.0, output: -10.0 },
+                SplinePoint { input:  0.0, output:   0.0 },
+                SplinePoint { input:  1.0, output:  20.0 },
+            ],
+        };
+        assert!((schema.build(0).sample(0, 0, 0) - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn spline_clamps_outside_range() {
+        let schema = DensityFnSchema::Spline {
+            input: Box::new(DensityFnSchema::Constant { value: 5.0 }),
+            points: vec![
+                SplinePoint { input: -1.0, output: -10.0 },
+                SplinePoint { input:  1.0, output:  20.0 },
+            ],
+        };
+        assert_eq!(schema.build(0).sample(0, 0, 0), 20.0); // way above range → clamp top
+
+        let schema = DensityFnSchema::Spline {
+            input: Box::new(DensityFnSchema::Constant { value: -5.0 }),
+            points: vec![
+                SplinePoint { input: -1.0, output: -10.0 },
+                SplinePoint { input:  1.0, output:  20.0 },
+            ],
+        };
+        assert_eq!(schema.build(0).sample(0, 0, 0), -10.0); // way below → clamp bottom
+    }
+
+    #[test]
+    fn spline_handles_unsorted_input() {
+        // Author writes points out of order; build sorts them and
+        // sampling still works.
+        let schema = DensityFnSchema::Spline {
+            input: Box::new(DensityFnSchema::Constant { value: 0.0 }),
+            points: vec![
+                SplinePoint { input:  1.0, output:  20.0 },
+                SplinePoint { input: -1.0, output: -10.0 },
+                SplinePoint { input:  0.0, output:   0.0 },
+            ],
+        };
+        assert_eq!(schema.build(0).sample(0, 0, 0), 0.0);
+    }
+
+    #[test]
+    fn spline_empty_points_returns_zero() {
+        let schema = DensityFnSchema::Spline {
+            input: Box::new(DensityFnSchema::Constant { value: 42.0 }),
+            points: vec![],
+        };
+        assert_eq!(schema.build(0).sample(0, 0, 0), 0.0);
+    }
+
+    #[test]
+    fn spline_is_y_independent_when_input_is() {
+        let s = DensityFnSchema::Spline {
+            input: Box::new(DensityFnSchema::Noise2d {
+                seed_offset: 0, frequency: 0.001,
+                octaves: 3, persistence: 0.5, lacunarity: 2.0,
+            }),
+            points: vec![SplinePoint { input: 0.0, output: 0.0 }],
+        };
+        assert!(s.is_y_independent());
+
+        let s = DensityFnSchema::Spline {
+            input: Box::new(DensityFnSchema::YIndex),
+            points: vec![SplinePoint { input: 0.0, output: 0.0 }],
+        };
+        assert!(!s.is_y_independent());
     }
 
     #[test]

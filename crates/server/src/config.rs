@@ -20,6 +20,64 @@ pub struct ServerConfig {
     pub network: NetworkConfig,
     pub world: WorldConfig,
     pub dashboard: DashboardConfig,
+    pub physics: PhysicsConfig,
+    pub cluster: ClusterConfig,
+}
+
+/// Multi-node clustering (Phase 6f). Disabled by default (single node).
+///
+/// Nodes `0..physics_nodes` own world regions and execute physics; nodes
+/// with higher ids are **gateways** — they serve player connections from
+/// a replica world while submitting all physics to the owners.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClusterConfig {
+    pub enabled: bool,
+    /// This node's id (0-based).
+    pub node_id: u32,
+    /// Total nodes in the mesh (gateways included).
+    pub total_nodes: u32,
+    /// How many of the lowest ids own regions. 0 = all of them.
+    pub physics_nodes: u32,
+    /// Address this node listens on for higher-id peers.
+    pub listen: String,
+    /// Listen addresses of lower-id peers, indexed by node id.
+    pub peers: Vec<String>,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            node_id: 0,
+            total_nodes: 1,
+            physics_nodes: 0,
+            listen: "0.0.0.0:25600".into(),
+            peers: Vec::new(),
+        }
+    }
+}
+
+/// Physics service (Phases 6b-2/6d: partitioned causal scheduling).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PhysicsConfig {
+    /// Number of partition worker threads, each owning a disjoint set of
+    /// 4×4-chunk regions. `0` = auto (one per logical core, capped at 8).
+    pub workers: usize,
+    /// Pin each worker thread to a distinct CPU core. Reduces scheduler
+    /// migration and is the first step toward NUMA-local memory (6c/6f).
+    pub pin_workers: bool,
+    /// Adaptive load balancing (Phase 6d): a rebalancer thread watches
+    /// per-region event throughput, moves hot regions between workers,
+    /// and splits a dominating region into per-chunk ownership.
+    pub rebalance: bool,
+}
+
+impl Default for PhysicsConfig {
+    fn default() -> Self {
+        Self { workers: 0, pin_workers: false, rebalance: true }
+    }
 }
 
 /// Networking / chunk-streaming knobs.
@@ -69,6 +127,14 @@ pub struct WorldConfig {
     /// `crates/server/src/worldgen/presets/*.json` for examples and
     /// `worldgen::preset` for the schema.
     pub preset: String,
+    /// Chunk eviction (Phase 6c): chunks farther than this many chunks
+    /// (Chebyshev) from every player are dropped from memory — they
+    /// regenerate (baseline + saved delta) when next needed. `0` = auto
+    /// (view_distance + 8). Memory becomes bounded by ACTIVE area.
+    pub keep_radius: i32,
+    /// How often the eviction sweep runs, in seconds. `0` disables
+    /// eviction (memory then grows with explored area).
+    pub eviction_interval_secs: u64,
 }
 
 /// Dashboard (live graph + metrics over HTTP).
@@ -87,6 +153,8 @@ impl Default for ServerConfig {
             network: NetworkConfig::default(),
             world: WorldConfig::default(),
             dashboard: DashboardConfig::default(),
+            physics: PhysicsConfig::default(),
+            cluster: ClusterConfig::default(),
         }
     }
 }
@@ -112,6 +180,8 @@ impl Default for WorldConfig {
             seed: 0xC0FFEE,
             pregenerate_radius: 8,
             preset: "noise".to_string(),
+            keep_radius: 0,
+            eviction_interval_secs: 30,
         }
     }
 }
