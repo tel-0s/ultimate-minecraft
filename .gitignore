@@ -12,3 +12,9 @@ world-*/
 !/bench_vanilla/drive.ps1
 !/bench_vanilla/escalate.ps1
 !/bench_vanilla/mega.ps1
+# Load-test artifacts (logs + samplers)
+10k*.log
+10k*.csv
+3k_*.log
+3k_*.csv
+world-10k/

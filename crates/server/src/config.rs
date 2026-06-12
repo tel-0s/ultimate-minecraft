@@ -97,15 +97,33 @@ pub struct NetworkConfig {
     /// Currently informational (we don't tick yet) but sent in the Login
     /// packet for protocol compliance.
     pub simulation_distance: i32,
-    /// On chunk-boundary crossings, chunks within Chebyshev distance
-    /// `immediate_radius` are sent synchronously before the chunk-cache
-    /// center update. Outer chunks are queued and drained at
-    /// `chunks_per_iter` per main-loop iteration.
+    /// On join and on chunk-boundary crossings, chunks within Chebyshev
+    /// distance `immediate_radius` are sent synchronously before the
+    /// chunk-cache center update. Outer chunks are queued and drained at
+    /// `chunks_per_iter` per main-loop iteration, with keep-alives
+    /// interleaved (so a slow initial load can't silently time the
+    /// client out).
     ///
-    /// If `null`, all new chunks are immediate (matches `view_distance`).
+    /// If `null`, defaults to 2 (clamped to `view_distance`).
     pub immediate_radius: Option<i32>,
     /// Maximum deferred chunks sent per main-loop iteration.
     pub chunks_per_iter: usize,
+    /// Admission control for bulk chunk streaming: at most this many
+    /// connections drain their deferred chunk queues CONCURRENTLY.
+    /// Without a cap, a join storm makes every client trickle at
+    /// bandwidth/N — slow enough that a single chunk packet can take
+    /// longer than the 30s client timeout. With it, clients stream in
+    /// fast waves while the rest idle on keep-alives. `0` = unlimited.
+    pub stream_permits: usize,
+    /// Maximum tab-list entries each client is sent. Presence data is
+    /// inherently O(N²) bytes (every player × every player); at 10k
+    /// players an uncapped tab list is ~12 GB of join-storm traffic that
+    /// chokes the write plane. `0` = unlimited.
+    pub tab_list_cap: usize,
+    /// Maximum player entities spawned on each client. Same O(N²)
+    /// rationale; proper AOI entity lifecycle replaces this with
+    /// Phase 5 entities. `0` = unlimited.
+    pub entity_spawn_cap: usize,
 }
 
 /// World storage and pre-generation.
@@ -168,6 +186,9 @@ impl Default for NetworkConfig {
             simulation_distance: 8,
             immediate_radius: None,
             chunks_per_iter: 5,
+            stream_permits: 256,
+            tab_list_cap: 500,
+            entity_spawn_cap: 200,
         }
     }
 }
@@ -215,13 +236,22 @@ network:
   # Simulation distance: how far ticking entities/redstone propagate.
   # Currently informational; sent in the Login packet.
   simulation_distance: 8
-  # When the player crosses a chunk boundary, chunks within this radius
-  # are sent SYNCHRONOUSLY before the cache-center update; outer chunks
-  # queue and drain at `chunks_per_iter` per main-loop iteration.
-  # null = every new chunk is immediate (matches view_distance).
+  # On join and when the player crosses a chunk boundary, chunks within
+  # this radius are sent SYNCHRONOUSLY before the cache-center update;
+  # outer chunks queue and drain at `chunks_per_iter` per main-loop
+  # iteration (keep-alives interleave, so slow initial loads can't
+  # silently time the client out). null = 2.
   immediate_radius: null
   # Deferred-chunk drain rate, per main-loop iteration.
   chunks_per_iter: 5
+  # At most this many connections bulk-stream chunks concurrently; the
+  # rest wait their turn on keep-alives. Prevents a join storm from
+  # making every client trickle below the client-timeout rate. 0 = off.
+  stream_permits: 256
+  # Presence caps: tab-list entries / player entities sent per client.
+  # Uncapped presence is O(N^2) bytes across all clients. 0 = unlimited.
+  tab_list_cap: 500
+  entity_spawn_cap: 200
 
 world:
   # Directory for saved (player-modified) chunks.

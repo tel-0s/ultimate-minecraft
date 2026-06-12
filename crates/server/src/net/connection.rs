@@ -70,6 +70,50 @@ use crate::worldgen::WorldGen;
 /// Monotonic connection ID counter for identifying change sources.
 static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// Admission control for bulk chunk streaming (`network.stream_permits`):
+/// at most N connections drain their deferred chunk queues at once, so a
+/// join storm streams in fast waves instead of 10k simultaneous trickles
+/// (where one chunk packet can exceed the client's 30s read timeout).
+/// Waiters idle in the main loop with keep-alives flowing.
+static STREAM_PERMITS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::OnceLock::new();
+
+/// Total bytes successfully handed to client sockets (all connections).
+/// Load-test diagnostic: correlate with process RSS to distinguish heap
+/// retention from socket-layer accumulation.
+pub static BYTES_WRITTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// AsyncWrite wrapper counting bytes accepted by the socket.
+pub struct CountingWriter<W> {
+    inner: W,
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CountingWriter<W> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let poll = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &poll {
+            BYTES_WRITTEN.fetch_add(*n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        poll
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// Handle a single client connection through all protocol phases.
 pub async fn handle(
     stream: TcpStream,
@@ -83,7 +127,7 @@ pub async fn handle(
 ) -> Result<()> {
     let (read, write) = stream.into_split();
     let mut read = read;
-    let mut write = write;
+    let mut write = CountingWriter { inner: write };
     let mut buf = Cursor::new(Vec::new());
 
     // No encryption or compression in offline mode.
@@ -625,32 +669,66 @@ where
     // markers — without these, the client receives the data but won't
     // render the chunks (blocks remain interactable but invisible).
     let view_distance = config.network.view_distance;
-    // null in config → all new chunks immediate (matches view_distance).
-    let immediate_radius = config.network.immediate_radius.unwrap_or(view_distance);
+    // null in config → a small inner ring is sent synchronously; everything
+    // else streams through the deferred queue from the main loop, where
+    // keep-alives interleave between chunk batches. Sending the full view
+    // synchronously here meant a client could sit >30s without a single
+    // packet during a join storm and time itself out (10k load test).
+    let immediate_radius = config.network.immediate_radius.unwrap_or(2).min(view_distance);
     let mut loaded_chunks: HashSet<(i32, i32)> = HashSet::new();
+    // Queue for deferred chunk loading -- chunks are sent progressively to
+    // avoid blocking the event loop during the initial load and fast movement.
+    let mut chunk_send_queue: VecDeque<(i32, i32)> = VecDeque::new();
 
-    let batch_start: ClientboundGamePacket = ClientboundChunkBatchStart.into_variant();
-    write_packet(&batch_start, write, compression, cipher_enc).await?;
+    // Bulk-streaming admission (see STREAM_PERMITS). Uncontended, the
+    // permit is granted instantly and joining behaves as before; in a
+    // join storm, permit-less connections defer EVERYTHING to the queue
+    // and stream when their wave comes (keep-alives flowing meanwhile).
+    let stream_sem = STREAM_PERMITS
+        .get_or_init(|| {
+            let n = match config.network.stream_permits {
+                0 => tokio::sync::Semaphore::MAX_PERMITS,
+                n => n,
+            };
+            Arc::new(tokio::sync::Semaphore::new(n))
+        })
+        .clone();
+    let mut stream_permit = Arc::clone(&stream_sem).try_acquire_owned().ok();
 
-    let mut batch_count: u32 = 0;
+    let mut immediate: Vec<(i32, i32)> = Vec::new();
+    let mut deferred: Vec<(i32, i32)> = Vec::new();
     for cx in (chunk_x - view_distance)..=(chunk_x + view_distance) {
         for cz in (chunk_z - view_distance)..=(chunk_z + view_distance) {
-            worldgen.ensure_generated(world, cx, cz);
-            send_chunk_from_world(write, compression, cipher_enc, world, &*worldgen, cx, cz).await?;
+            let inner = (cx - chunk_x).abs().max((cz - chunk_z).abs()) <= immediate_radius;
+            if inner && stream_permit.is_some() {
+                immediate.push((cx, cz));
+            } else {
+                deferred.push((cx, cz));
+            }
             loaded_chunks.insert((cx, cz));
-            batch_count += 1;
         }
     }
 
-    let batch_end: ClientboundGamePacket = ClientboundChunkBatchFinished {
-        batch_size: batch_count,
-    }.into_variant();
-    write_packet(&batch_end, write, compression, cipher_enc).await?;
+    if !immediate.is_empty() {
+        let batch_start: ClientboundGamePacket = ClientboundChunkBatchStart.into_variant();
+        write_packet(&batch_start, write, compression, cipher_enc).await?;
+        for &(cx, cz) in &immediate {
+            worldgen.ensure_generated(world, cx, cz);
+            send_chunk_from_world(write, compression, cipher_enc, world, &*worldgen, cx, cz).await?;
+        }
+        let batch_end: ClientboundGamePacket = ClientboundChunkBatchFinished {
+            batch_size: immediate.len() as u32,
+        }.into_variant();
+        write_packet(&batch_end, write, compression, cipher_enc).await?;
+    }
+
+    // Outer ring (everything, when admission deferred us) streams from the
+    // main loop, nearest first.
+    deferred.sort_by_key(|(cx, cz)| (cx - chunk_x).abs().max((cz - chunk_z).abs()));
+    chunk_send_queue.extend(deferred.iter());
+
     let mut current_chunk_x = chunk_x;
     let mut current_chunk_z = chunk_z;
-    // Queue for deferred chunk loading -- chunks are sent progressively to
-    // avoid blocking the event loop when the player moves fast.
-    let mut chunk_send_queue: VecDeque<(i32, i32)> = VecDeque::new();
 
     tracing::info!("{} joined the game at ({}, {}, {})", player_name, spawn_x, spawn_y, spawn_z);
 
@@ -696,39 +774,75 @@ where
     let mut player_rx = registry.subscribe();
 
     // ── Multiplayer: send existing players to newcomer, then register ───
-    // Step 1: Tell this client about every player already online.
-    let existing_players = registry.snapshot();
-    for p in &existing_players {
-        // Add to tab list
-        let info_packet: ClientboundGamePacket = ClientboundPlayerInfoUpdate {
-            actions: ActionEnumSet {
-                add_player: true,
-                initialize_chat: false,
-                update_game_mode: true,
-                update_listed: true,
-                update_latency: true,
-                update_display_name: false,
-                update_hat: false,
-                update_list_order: false,
-            },
-            entries: vec![PlayerInfoEntry {
-                profile: GameProfile {
-                    uuid: p.uuid,
-                    name: p.name.clone(),
-                    properties: Default::default(),
-                },
-                listed: true,
-                latency: 0,
-                game_mode: GameMode::Creative,
-                display_name: None,
-                list_order: 0,
-                update_hat: false,
-                chat_session: None,
-            }],
-        }.into_variant();
-        write_packet(&info_packet, write, compression, cipher_enc).await?;
+    // Presence caps (`network.tab_list_cap` / `network.entity_spawn_cap`):
+    // uncapped, presence is O(N²) bytes across clients — at 10k players
+    // the join-storm tab/spawn flood alone is ~12 GB and chokes the write
+    // plane. Track WHO this client knows so removals stay consistent.
+    let tab_cap = match config.network.tab_list_cap {
+        0 => usize::MAX,
+        n => n,
+    };
+    let spawn_cap = match config.network.entity_spawn_cap {
+        0 => usize::MAX,
+        n => n,
+    };
+    let mut tab_listed: HashSet<uuid::Uuid> = HashSet::new();
+    let mut spawned_entities: HashSet<i32> = HashSet::new();
 
-        // Spawn their entity at their current position.
+    // Step 1: Tell this client about every player already online (plus
+    // ourselves) in ONE multi-entry tab-list packet — a packet per player
+    // made joining O(N) packets and a join storm O(N²) server-wide.
+    let existing_players = registry.snapshot();
+    let mut tab_entries: Vec<PlayerInfoEntry> = Vec::new();
+    for p in existing_players.iter().take(tab_cap) {
+        tab_listed.insert(p.uuid);
+        tab_entries.push(PlayerInfoEntry {
+            profile: GameProfile {
+                uuid: p.uuid,
+                name: p.name.clone(),
+                properties: Default::default(),
+            },
+            listed: true,
+            latency: 0,
+            game_mode: GameMode::Creative,
+            display_name: None,
+            list_order: 0,
+            update_hat: false,
+            chat_session: None,
+        });
+    }
+    tab_entries.push(PlayerInfoEntry {
+        profile: GameProfile {
+            uuid: player_uuid,
+            name: player_name.to_owned(),
+            properties: Default::default(),
+        },
+        listed: true,
+        latency: 0,
+        game_mode: GameMode::Creative,
+        display_name: None,
+        list_order: 0,
+        update_hat: false,
+        chat_session: None,
+    });
+    let info_packet: ClientboundGamePacket = ClientboundPlayerInfoUpdate {
+        actions: ActionEnumSet {
+            add_player: true,
+            initialize_chat: false,
+            update_game_mode: true,
+            update_listed: true,
+            update_latency: true,
+            update_display_name: false,
+            update_hat: false,
+            update_list_order: false,
+        },
+        entries: tab_entries,
+    }.into_variant();
+    write_packet(&info_packet, write, compression, cipher_enc).await?;
+
+    // Spawn each existing player's entity at their current position.
+    for p in existing_players.iter().take(spawn_cap) {
+        spawned_entities.insert(p.entity_id);
         let spawn_packet: ClientboundGamePacket = ClientboundAddEntity {
             id: MinecraftEntityId(p.entity_id),
             uuid: p.uuid,
@@ -742,35 +856,10 @@ where
         }.into_variant();
         write_packet(&spawn_packet, write, compression, cipher_enc).await?;
     }
-
-    // Step 2: Also add ourselves to our own tab list.
-    let self_info_packet: ClientboundGamePacket = ClientboundPlayerInfoUpdate {
-        actions: ActionEnumSet {
-            add_player: true,
-            initialize_chat: false,
-            update_game_mode: true,
-            update_listed: true,
-            update_latency: true,
-            update_display_name: false,
-            update_hat: false,
-            update_list_order: false,
-        },
-        entries: vec![PlayerInfoEntry {
-            profile: GameProfile {
-                uuid: player_uuid,
-                name: player_name.to_owned(),
-                properties: Default::default(),
-            },
-            listed: true,
-            latency: 0,
-            game_mode: GameMode::Creative,
-            display_name: None,
-            list_order: 0,
-            update_hat: false,
-            chat_session: None,
-        }],
-    }.into_variant();
-    write_packet(&self_info_packet, write, compression, cipher_enc).await?;
+    // Without this, the snapshot (up to one PlayerInfo per online player)
+    // lives in this stack frame for the connection's whole lifetime —
+    // ~0.5 MB × 10k connections was gigabytes in the 10k load test.
+    drop(existing_players);
 
     // Step 3: Register in the shared registry -- this broadcasts PlayerEvent::Joined
     // to all other connections so they can send the tab-list + entity spawn packets.
@@ -801,6 +890,10 @@ where
     // ── Main loop: keep-alive + handle incoming packets + bus ────────────
     let mut keepalive_timer = tokio::time::interval(Duration::from_secs(15));
     let mut keepalive_id: u64 = 0;
+    // Diagnostics: a keep-alive gap above 25s means this client was one
+    // missed packet from a vanilla 30s timeout — log who and how long.
+    let mut last_keepalive_sent: Option<std::time::Instant> = None;
+    let mut stream_wait_started: Option<std::time::Instant> = None;
 
     // Max chunks to send per loop iteration. Keeps the loop responsive while
     // still making rapid progress on the queue.
@@ -808,14 +901,21 @@ where
 
     // Track chunks physically sent to the client. Deferred chunks are added to
     // `loaded_chunks` optimistically before being sent, so this set lets us
-    // detect and re-queue any that slip through the cracks.
-    let mut sent_to_client: HashSet<(i32, i32)> = loaded_chunks.clone();
+    // detect and re-queue any that slip through the cracks. The initial load
+    // also defers its outer ring, so anything still queued is not yet sent.
+    let mut sent_to_client: HashSet<(i32, i32)> = loaded_chunks
+        .iter()
+        .copied()
+        .filter(|pos| !chunk_send_queue.contains(pos))
+        .collect();
 
     loop {
         // ── Eagerly drain chunk queue before waiting for events ──────────
+        // Only while holding a bulk-streaming permit (admission control —
+        // without it we wait for the permit arm in the select below).
         // Wrap each drain pass in a ChunkBatchStart/Finished pair so the
         // client renders the chunks (1.20+ requirement).
-        {
+        if stream_permit.is_some() {
             let mut to_send: Vec<(i32, i32)> = Vec::new();
             while to_send.len() < chunks_per_iter {
                 let Some((cx, cz)) = chunk_send_queue.pop_front() else { break };
@@ -853,12 +953,41 @@ where
             }
         }
 
+        // Done streaming: hand the permit to the next waiting connection.
+        if chunk_send_queue.is_empty() {
+            stream_permit = None;
+        } else if stream_permit.is_none() && stream_wait_started.is_none() {
+            stream_wait_started = Some(std::time::Instant::now());
+        }
+
         tokio::select! {
-            // When chunks are still queued, yield immediately so we cycle back
-            // to the drain at the top of the loop. This keeps chunk loading
-            // progressing rapidly without starving event processing.
-            _ = std::future::ready(()), if !chunk_send_queue.is_empty() => {}
+            // When chunks are queued and we hold the streaming permit, yield
+            // immediately so we cycle back to the drain at the top of the
+            // loop. This keeps chunk loading progressing rapidly without
+            // starving event processing.
+            _ = std::future::ready(()), if stream_permit.is_some() && !chunk_send_queue.is_empty() => {}
+            // Chunks queued but no permit yet: wait for admission. Other
+            // arms (keep-alive, reads, lifecycle) stay live while we wait.
+            permit = Arc::clone(&stream_sem).acquire_owned(), if stream_permit.is_none() && !chunk_send_queue.is_empty() => {
+                stream_permit = permit.ok();
+                if let Some(t0) = stream_wait_started.take() {
+                    let waited = t0.elapsed();
+                    if waited > Duration::from_secs(30) {
+                        tracing::info!("{} admitted to stream after {:.1}s wait ({} chunks queued)",
+                            player_name, waited.as_secs_f64(), chunk_send_queue.len());
+                    }
+                }
+            }
             _ = keepalive_timer.tick() => {
+                let now = std::time::Instant::now();
+                if let Some(prev) = last_keepalive_sent {
+                    let gap = now.duration_since(prev);
+                    if gap > Duration::from_secs(25) {
+                        tracing::warn!("{} keep-alive gap {:.1}s (client times out at 30s)",
+                            player_name, gap.as_secs_f64());
+                    }
+                }
+                last_keepalive_sent = Some(now);
                 keepalive_id += 1;
                 let ka: ClientboundGamePacket = azalea_protocol::packets::game::ClientboundKeepAlive {
                     id: keepalive_id,
@@ -1137,45 +1266,63 @@ where
             }
 
             // ── Player lifecycle: join/leave/chat (movement is spatial now) ──
+            // Bursts are drained and COALESCED: during a join storm every
+            // connection receives every join, so per-event packets made the
+            // storm O(N²) packet writes server-wide. One drain pass emits one
+            // multi-entry tab-list add and one batched remove (same pattern
+            // as entity-move coalescing in the spatial arm).
             result = player_rx.recv() => {
+                let mut events: Vec<PlayerEvent> = Vec::new();
                 match result {
-                    Ok(event) => {
-                        match event {
-                            PlayerEvent::Joined { conn_id: joined_id, entity_id: eid, uuid, name, x, y, z, y_rot, x_rot } => {
-                                // Skip our own join event.
-                                if joined_id == conn_id { continue; }
+                    Ok(event) => events.push(event),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("{} player event bus lagged, skipped {} events", player_name, n);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
+                loop {
+                    use tokio::sync::broadcast::error::TryRecvError;
+                    match player_rx.try_recv() {
+                        Ok(event) => {
+                            events.push(event);
+                            if events.len() >= 8192 { break; }
+                        }
+                        Err(TryRecvError::Lagged(n)) => {
+                            tracing::warn!("{} player event bus lagged, skipped {} events", player_name, n);
+                        }
+                        Err(_) => break, // Empty (or Closed — next recv handles it)
+                    }
+                }
 
-                                // Add to this client's tab list.
-                                let info_pkt: ClientboundGamePacket = ClientboundPlayerInfoUpdate {
-                                    actions: ActionEnumSet {
-                                        add_player: true,
-                                        initialize_chat: false,
-                                        update_game_mode: true,
-                                        update_listed: true,
-                                        update_latency: true,
-                                        update_display_name: false,
-                                        update_hat: false,
-                                        update_list_order: false,
+                let mut join_entries: Vec<PlayerInfoEntry> = Vec::new();
+                let mut spawn_pkts: Vec<ClientboundGamePacket> = Vec::new();
+                let mut left_eids: Vec<MinecraftEntityId> = Vec::new();
+                let mut left_uuids = Vec::new();
+                for event in events {
+                    match event {
+                        PlayerEvent::Joined { conn_id: joined_id, entity_id: eid, uuid, name, x, y, z, y_rot, x_rot } => {
+                            // Skip our own join event.
+                            if joined_id == conn_id { continue; }
+                            if tab_listed.len() < tab_cap && tab_listed.insert(uuid) {
+                                join_entries.push(PlayerInfoEntry {
+                                    profile: GameProfile {
+                                        uuid,
+                                        name,
+                                        properties: Default::default(),
                                     },
-                                    entries: vec![PlayerInfoEntry {
-                                        profile: GameProfile {
-                                            uuid,
-                                            name,
-                                            properties: Default::default(),
-                                        },
-                                        listed: true,
-                                        latency: 0,
-                                        game_mode: GameMode::Creative,
-                                        display_name: None,
-                                        list_order: 0,
-                                        update_hat: false,
-                                        chat_session: None,
-                                    }],
-                                }.into_variant();
-                                write_packet(&info_pkt, write, compression, cipher_enc).await?;
-
-                                // Spawn the new player's entity at their position.
-                                let spawn_pkt: ClientboundGamePacket = ClientboundAddEntity {
+                                    listed: true,
+                                    latency: 0,
+                                    game_mode: GameMode::Creative,
+                                    display_name: None,
+                                    list_order: 0,
+                                    update_hat: false,
+                                    chat_session: None,
+                                });
+                            }
+                            if spawned_entities.len() < spawn_cap && spawned_entities.insert(eid) {
+                                spawn_pkts.push(ClientboundAddEntity {
                                     id: MinecraftEntityId(eid),
                                     uuid,
                                     entity_type: EntityKind::Player,
@@ -1185,45 +1332,65 @@ where
                                     y_rot: degrees_to_byte_angle(y_rot),
                                     y_head_rot: degrees_to_byte_angle(y_rot),
                                     data: 0,
-                                }.into_variant();
-                                write_packet(&spawn_pkt, write, compression, cipher_enc).await?;
-                            }
-                            PlayerEvent::Moved { .. } => {
-                                // Movement is delivered through the spatial
-                                // bus; nothing should arrive here.
-                            }
-                            PlayerEvent::Left { conn_id: left_id, entity_id: eid, uuid } => {
-                                if left_id == conn_id { continue; }
-
-                                // Remove entity.
-                                let remove_pkt: ClientboundGamePacket = ClientboundRemoveEntities {
-                                    entity_ids: vec![MinecraftEntityId(eid)],
-                                }.into_variant();
-                                write_packet(&remove_pkt, write, compression, cipher_enc).await?;
-
-                                // Remove from tab list.
-                                let info_remove: ClientboundGamePacket = ClientboundPlayerInfoRemove {
-                                    profile_ids: vec![uuid],
-                                }.into_variant();
-                                write_packet(&info_remove, write, compression, cipher_enc).await?;
-                            }
-                            PlayerEvent::Chat { name, message, .. } => {
-                                // Send as system chat to all clients (including sender).
-                                let text = format!("<{}> {}", name, message);
-                                let chat_pkt: ClientboundGamePacket = ClientboundSystemChat {
-                                    content: FormattedText::from(text),
-                                    overlay: false,
-                                }.into_variant();
-                                write_packet(&chat_pkt, write, compression, cipher_enc).await?;
+                                }.into_variant());
                             }
                         }
+                        PlayerEvent::Moved { .. } => {
+                            // Movement is delivered through the spatial
+                            // bus; nothing should arrive here.
+                        }
+                        PlayerEvent::Left { conn_id: left_id, entity_id: eid, uuid } => {
+                            if left_id == conn_id { continue; }
+                            // Only retract what this client was actually sent.
+                            if spawned_entities.remove(&eid) {
+                                left_eids.push(MinecraftEntityId(eid));
+                            }
+                            if tab_listed.remove(&uuid) {
+                                left_uuids.push(uuid);
+                            }
+                        }
+                        PlayerEvent::Chat { name, message, .. } => {
+                            // Send as system chat to all clients (including sender).
+                            let text = format!("<{}> {}", name, message);
+                            let chat_pkt: ClientboundGamePacket = ClientboundSystemChat {
+                                content: FormattedText::from(text),
+                                overlay: false,
+                            }.into_variant();
+                            write_packet(&chat_pkt, write, compression, cipher_enc).await?;
+                        }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("{} player event bus lagged, skipped {} events", player_name, n);
+                }
+
+                if !join_entries.is_empty() {
+                    let info_pkt: ClientboundGamePacket = ClientboundPlayerInfoUpdate {
+                        actions: ActionEnumSet {
+                            add_player: true,
+                            initialize_chat: false,
+                            update_game_mode: true,
+                            update_listed: true,
+                            update_latency: true,
+                            update_display_name: false,
+                            update_hat: false,
+                            update_list_order: false,
+                        },
+                        entries: join_entries,
+                    }.into_variant();
+                    write_packet(&info_pkt, write, compression, cipher_enc).await?;
+                    for spawn_pkt in &spawn_pkts {
+                        write_packet(spawn_pkt, write, compression, cipher_enc).await?;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        break;
-                    }
+                }
+                if !left_eids.is_empty() {
+                    let remove_pkt: ClientboundGamePacket = ClientboundRemoveEntities {
+                        entity_ids: left_eids,
+                    }.into_variant();
+                    write_packet(&remove_pkt, write, compression, cipher_enc).await?;
+                }
+                if !left_uuids.is_empty() {
+                    let info_remove: ClientboundGamePacket = ClientboundPlayerInfoRemove {
+                        profile_ids: left_uuids,
+                    }.into_variant();
+                    write_packet(&info_remove, write, compression, cipher_enc).await?;
                 }
             }
         }

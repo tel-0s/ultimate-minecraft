@@ -649,8 +649,39 @@ Known limitations / next:
          range. Natural companion of 6f's gateway-node split.
       Bus capacity raised 256 → 8192 (Arc-backed slots; megabytes of
       worst-case buffer). 10k/100k players need AOI first.
-- [ ] Load testing: 10k, 100k simulated players (blocked on AOI/interest
-      management — see finding 3 above)
+- [x] Load testing: **10k simulated players** ✓ (2026-06-12; 4 swarm
+      processes × 2,500 against one server). Final:
+      **10,000/10,000 joined, 2,890,000/2,890,000 chunks delivered
+      (100%), 126.2 GB streamed at 529 MB/s peak, p50 join 1.3 s /
+      p99 10 s, 2.7 GB peak RSS; 10k idle players ≈ 4% of one core.**
+      Three walls found and fixed (each fix exposed the next):
+      1. **Synchronous join streaming**: the initial 289-chunk send ran
+         before the main loop, so queued clients could sit >30 s with
+         zero packets and time out (vanilla clients kick at 30 s). Fixed:
+         initial load goes through the deferred chunk queue
+         (`immediate_radius` default 2) with keep-alives interleaved;
+         tab-list snapshot collapsed to ONE multi-entry packet;
+         join/leave lifecycle bursts coalesced per drain.
+      2. **Fairness without admission**: with everyone streaming
+         concurrently, per-client throughput fell below one 43 KB chunk
+         packet per 30 s — the client timeout fires on PACKET completion,
+         so *everyone* starved. Fixed: `network.stream_permits` (256), a
+         global admission semaphore — N connections bulk-stream in fast
+         waves while the rest idle safely on keep-alives.
+      3. **Presence is O(N²) bytes**: 10k joiners × ~1.2 MB of tab
+         entries + entity spawns to each of 10k recipients ≈ 12 GB of
+         join-storm presence traffic choked the write plane (13 MB/s,
+         30 GB RSS in parked writes, mass starvation). Fixed:
+         `network.tab_list_cap` (500) + `network.entity_spawn_cap` (200)
+         with per-connection tracking so removals stay consistent —
+         the static sibling of the move-broadcast O(N²) that spatial
+         pub/sub solved in 6f. Proper AOI entity lifecycle supersedes
+         the caps with Phase 5 entities.
+      Residual: ~2% of clients hit tail keep-alive stalls during peak
+      streaming (10k ready tasks × ms-scale batches → tail timer
+      latency); gateway sharding (6f) is the designed answer.
+- [ ] Load testing: 100k simulated players (needs multi-node gateway
+      deployment — single-box residual above)
 - [x] Microbenchmarks: events/sec/core, quiescence latency by cascade type
       -- `examples/bench_baseline.rs` (see 6b-0 for current numbers)
 - [x] Causal propagation velocity metric (blocks/sec) as a first-class benchmark

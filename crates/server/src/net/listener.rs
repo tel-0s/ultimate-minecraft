@@ -21,6 +21,21 @@ pub async fn run(
     let listener = TcpListener::bind(&config.network.bind).await?;
     tracing::info!("Listening on {}", config.network.bind);
 
+    // Telemetry heartbeat: total socket bytes written, to correlate with
+    // process RSS during load tests.
+    tokio::spawn(async {
+        let mut last: u64 = 0;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            let now = super::connection::BYTES_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
+            if now != last {
+                tracing::info!("net: {:.2} GB written total ({:.1} MB/s)",
+                    now as f64 / 1e9, (now - last) as f64 / 10.0 / 1e6);
+                last = now;
+            }
+        }
+    });
+
     loop {
         let (stream, addr) = listener.accept().await?;
         tracing::info!("Connection from {}", addr);
@@ -39,8 +54,15 @@ pub async fn run(
         let worldgen = Arc::clone(&worldgen);
         let config = Arc::clone(&config);
         let physics = physics.clone();
+        let fut = super::connection::handle(stream, world, dashboard, spatial, registry, worldgen, config, physics);
+        {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::info!("connection task future size: {} KB", std::mem::size_of_val(&fut) / 1024);
+            });
+        }
         tokio::spawn(async move {
-            if let Err(e) = super::connection::handle(stream, world, dashboard, spatial, registry, worldgen, config, physics).await {
+            if let Err(e) = fut.await {
                 tracing::warn!("Connection from {} closed: {}", addr, e);
             }
         });
