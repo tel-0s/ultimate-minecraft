@@ -213,7 +213,7 @@ impl Default for Scheduler {
 /// the time the event executes its write is already a no-op.
 fn should_log(payload: &EventPayload, effective: bool) -> bool {
     match payload {
-        EventPayload::BlockSet { .. } => effective,
+        EventPayload::BlockSet { .. } | EventPayload::EntitySet { .. } => effective,
         EventPayload::LightSet { .. } | EventPayload::LightBatch { .. } => true,
         _ => false,
     }
@@ -261,5 +261,18 @@ fn apply_event(world: &World, payload: &EventPayload) -> bool {
         EventPayload::LightNotify { .. } => true,
         // Reporting-only: the light rule's BFS already wrote light storage.
         EventPayload::LightBatch { .. } => true,
+        // Guarded entity transition — same first-write-wins semantics as
+        // BlockSet: a superseded in-flight trajectory segment fails its
+        // guard here and dies without consequents (never forks the entity).
+        EventPayload::EntitySet { id, old, new } => {
+            world.entities().set_entity(*id, old.as_ref(), new.as_ref()) && old != new
+        }
+        // Wakes carry no write; the entity rules re-derive from the store.
+        EventPayload::EntityWake { .. } => true,
+        // `After` never executes directly: the physics router unwraps it
+        // into a timer heap. If one reaches a plain scheduler (tests using
+        // step()/step_parallel with no timer plane), treat it as
+        // ineffective — timed semantics need the physics service.
+        EventPayload::After { .. } => false,
     }
 }

@@ -73,6 +73,7 @@ fn block_action_cascades_and_broadcasts() {
         old: block::AIR,
         new: block::SAND,
         update_stairs: false,
+        drop_item: false,
     });
 
     assert!(
@@ -116,6 +117,7 @@ fn cross_source_actions_share_one_graph() {
         old: block::AIR,
         new: block::SAND,
         update_stairs: false,
+        drop_item: false,
     });
     assert!(
         wait_for(|| world.get_block(BlockPos::new(4, 5, 4)) == block::SAND),
@@ -129,6 +131,7 @@ fn cross_source_actions_share_one_graph() {
         old: block::DIRT,
         new: block::AIR,
         update_stairs: false,
+        drop_item: false,
     });
     assert!(
         wait_for(|| world.get_block(BlockPos::new(4, 4, 4)) == block::SAND),
@@ -157,6 +160,7 @@ fn stale_action_is_dropped() {
         old: block::AIR,
         new: block::SAND,
         update_stairs: false,
+        drop_item: false,
     });
 
     // Submit a sentinel action afterwards; when IT completes we know the
@@ -166,6 +170,7 @@ fn stale_action_is_dropped() {
         old: block::AIR,
         new: BlockId::new(1),
         update_stairs: false,
+        drop_item: false,
     });
     assert!(wait_for(|| world.get_block(BlockPos::new(10, 10, 10)) == BlockId::new(1)));
 
@@ -216,6 +221,7 @@ fn cross_partition_cascade_matches_single_worker() {
             old: block::AIR,
             new: block::WATER,
             update_stairs: false,
+            drop_item: false,
         });
         assert!(wait_quiet(&handle), "{workers}-worker service should quiesce");
         let mut snap = Vec::new();
@@ -256,6 +262,7 @@ fn pending_counter_reaches_zero_after_burst() {
             old: block::AIR,
             new: block::SAND,
             update_stairs: false,
+            drop_item: false,
         });
     }
     assert!(wait_quiet(&handle), "burst should fully drain to pending == 0");
@@ -305,6 +312,7 @@ fn priority_action_publishes_before_background_flood_finishes() {
         old: block::DIRT,
         new: block::AIR,
         update_stairs: false,
+        drop_item: false,
     });
 
     assert!(wait_quiet(&handle));

@@ -42,6 +42,7 @@ use anyhow::{anyhow, Result};
 
 use ultimate_engine::causal::event::{Event, EventPayload, LightCell, LightType};
 use ultimate_engine::world::block::BlockId;
+use ultimate_engine::world::entity::{EntityId, EntityKind, EntityState, Vec3};
 use ultimate_engine::world::position::{BlockPos, ChunkPos};
 use ultimate_engine::world::World;
 
@@ -161,6 +162,37 @@ fn encode_payload(buf: &mut Vec<u8>, p: &EventPayload) {
                 buf.push(c.new);
             }
         }
+        EventPayload::EntitySet { id, old, new } => {
+            buf.push(5);
+            buf.extend_from_slice(&id.0.to_le_bytes());
+            put_opt_entity_state(buf, old);
+            put_opt_entity_state(buf, new);
+        }
+        EventPayload::EntityWake { id, at } => {
+            buf.push(6);
+            buf.extend_from_slice(&id.0.to_le_bytes());
+            put_pos(buf, *at);
+        }
+        EventPayload::After { at, inner } => {
+            buf.push(7);
+            buf.extend_from_slice(&at.to_le_bytes());
+            encode_payload(buf, inner);
+        }
+    }
+}
+
+fn put_opt_entity_state(buf: &mut Vec<u8>, s: &Option<EntityState>) {
+    match s {
+        None => buf.push(0),
+        Some(s) => {
+            buf.push(1);
+            put_u16(buf, s.kind.0);
+            for v in [s.pos.x, s.pos.y, s.pos.z, s.vel.x, s.vel.y, s.vel.z] {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            buf.extend_from_slice(&s.stamp.to_le_bytes());
+            buf.extend_from_slice(&s.aux.to_le_bytes());
+        }
     }
 }
 
@@ -192,8 +224,37 @@ fn decode_payload(r: &mut Reader) -> Result<EventPayload> {
             }
             EventPayload::LightBatch { changes: cells.into() }
         }
+        5 => EventPayload::EntitySet {
+            id: EntityId(r.u64()?),
+            old: read_opt_entity_state(r)?,
+            new: read_opt_entity_state(r)?,
+        },
+        6 => EventPayload::EntityWake {
+            id: EntityId(r.u64()?),
+            at: r.pos()?,
+        },
+        7 => EventPayload::After {
+            at: r.u64()?,
+            inner: Box::new(decode_payload(r)?),
+        },
         other => return Err(anyhow!("bad payload tag {other}")),
     })
+}
+
+fn read_opt_entity_state(r: &mut Reader) -> Result<Option<EntityState>> {
+    if r.u8()? == 0 {
+        return Ok(None);
+    }
+    let kind = EntityKind(r.u16()?);
+    let mut f = || -> Result<f64> { Ok(f64::from_le_bytes(r.u64()?.to_le_bytes())) };
+    let (px, py, pz, vx, vy, vz) = (f()?, f()?, f()?, f()?, f()?, f()?);
+    Ok(Some(EntityState {
+        kind,
+        pos: Vec3::new(px, py, pz),
+        vel: Vec3::new(vx, vy, vz),
+        stamp: r.u64()?,
+        aux: r.u64()?,
+    }))
 }
 
 // ── Frames ──────────────────────────────────────────────────────────────────
@@ -240,6 +301,7 @@ fn encode_frame(frame: &OutFrame) -> Vec<u8> {
             put_u16(&mut body, a.old.0);
             put_u16(&mut body, a.new.0);
             body.push(a.update_stairs as u8);
+            body.push(a.drop_item as u8);
         }
         OutFrame::WriteSync(payloads) => {
             body.push(KIND_WRITE_SYNC);
@@ -461,6 +523,7 @@ impl ClusterLink {
                     old: BlockId(r.u16()?),
                     new: BlockId(r.u16()?),
                     update_stairs: r.u8()? != 0,
+                    drop_item: r.u8()? != 0,
                 };
                 physics.submit_action_local(action);
                 self.received.fetch_add(1, Ordering::SeqCst);
@@ -477,6 +540,7 @@ impl ClusterLink {
                 let changes = event_bus::collect_block_changes(&payloads);
                 let light_changes = event_bus::collect_light_changes(&payloads);
                 bus.publish_world(ChangeSource::Physics, changes, light_changes);
+                bus.publish_entities(event_bus::collect_entity_changes(&payloads));
                 self.received.fetch_add(1, Ordering::SeqCst);
             }
             KIND_PING => {
@@ -791,7 +855,16 @@ fn apply_replica_writes(world: &World, payloads: &[EventPayload]) {
                     }
                 }
             }
-            EventPayload::BlockNotify { .. } | EventPayload::LightNotify { .. } => {}
+            // Authoritative entity outcome from the owner — verbatim, like
+            // block writes (the replica's guard state may lag; it must not
+            // reject the owner's decision).
+            EventPayload::EntitySet { id, new, .. } => {
+                world.entities().set_entity_unchecked(*id, new.as_ref());
+            }
+            EventPayload::BlockNotify { .. }
+            | EventPayload::LightNotify { .. }
+            | EventPayload::EntityWake { .. }
+            | EventPayload::After { .. } => {}
         }
     }
 }

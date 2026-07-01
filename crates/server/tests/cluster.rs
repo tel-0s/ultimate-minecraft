@@ -212,6 +212,7 @@ fn action_crosses_nodes_and_mirrors_back() {
         old: block::AIR,
         new: block::SAND,
         update_stairs: false,
+        drop_item: false,
     });
     assert!(wait_quiet(&nodes[0]));
 

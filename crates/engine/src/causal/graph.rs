@@ -379,10 +379,14 @@ impl CausalGraph {
         match payload {
             EventPayload::BlockSet { .. }
             | EventPayload::LightSet { .. }
-            | EventPayload::LightBatch { .. } => {
+            | EventPayload::LightBatch { .. }
+            | EventPayload::EntitySet { .. } => {
                 self.write_log.push(payload.clone());
             }
-            EventPayload::BlockNotify { .. } | EventPayload::LightNotify { .. } => {}
+            EventPayload::BlockNotify { .. }
+            | EventPayload::LightNotify { .. }
+            | EventPayload::EntityWake { .. }
+            | EventPayload::After { .. } => {}
         }
     }
 
@@ -495,6 +499,25 @@ impl CausalGraph {
                 EventPayload::LightBatch { changes } => (
                     format!("LightBatch ({} cells)", changes.len()),
                     "#cce5ff",
+                ),
+                EventPayload::EntitySet { id, old, new } => (
+                    format!(
+                        "Entity {} {}",
+                        id.0,
+                        match (old, new) {
+                            (None, Some(_)) => "spawn",
+                            (Some(_), None) => "despawn",
+                            _ => "move",
+                        }
+                    ),
+                    "#f8d7da",
+                ),
+                EventPayload::EntityWake { id, .. } => {
+                    (format!("Wake entity {}", id.0), "#fde2c5")
+                }
+                EventPayload::After { at, inner } => (
+                    format!("After {}ns: {:?}", at, std::mem::discriminant(inner.as_ref())),
+                    "#e7d6f5",
                 ),
             };
             let fill = if node.executed { color } else { "#f8f9fa" };

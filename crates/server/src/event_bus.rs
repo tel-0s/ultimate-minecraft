@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use ultimate_engine::causal::event::{EventPayload, LightType};
 use ultimate_engine::world::block::BlockId;
+use ultimate_engine::world::entity::{EntityId, EntityState};
 use ultimate_engine::world::position::BlockPos;
 
 /// Recommended capacity for the broadcast channel.
@@ -69,6 +70,36 @@ pub enum SpatialMsg {
     World(WorldChangeBatch),
     /// A player movement (always `PlayerEvent::Moved`).
     Move(crate::player_registry::PlayerEvent),
+    /// Entity lifecycle/motion changes in the bucket's region (Phase 5).
+    Entities(Vec<EntityChange>),
+}
+
+/// One entity transition extracted from the physics write log.
+#[derive(Debug, Clone, Copy)]
+pub enum EntityChange {
+    Spawn { id: EntityId, state: EntityState },
+    /// A trajectory segment endpoint: clients teleport-correct and adopt
+    /// the new velocity for extrapolation.
+    Move { id: EntityId, state: EntityState },
+    Despawn { id: EntityId, last: EntityState },
+}
+
+impl EntityChange {
+    pub fn state(&self) -> &EntityState {
+        match self {
+            EntityChange::Spawn { state, .. }
+            | EntityChange::Move { state, .. }
+            | EntityChange::Despawn { last: state, .. } => state,
+        }
+    }
+
+    pub fn id(&self) -> EntityId {
+        match self {
+            EntityChange::Spawn { id, .. }
+            | EntityChange::Move { id, .. }
+            | EntityChange::Despawn { id, .. } => *id,
+        }
+    }
 }
 
 /// Region-bucketed pub/sub: publishers deliver to the subscribers of the
@@ -173,6 +204,28 @@ impl SpatialBus {
         let msg = Arc::new(SpatialMsg::Move(event));
         self.deliver(region, &msg);
     }
+
+    /// Publish entity changes (Phase 5), split per region like world
+    /// changes. Despawns route by the entity's LAST position so the
+    /// clients that could see it learn it's gone.
+    pub fn publish_entities(&self, changes: Vec<EntityChange>) {
+        if changes.is_empty() {
+            return;
+        }
+        let mut per_region: std::collections::HashMap<Region, Vec<EntityChange>> =
+            std::collections::HashMap::new();
+        for c in changes {
+            let p = c.state().pos;
+            per_region
+                .entry(region_of_block(p.x as i64, p.z as i64))
+                .or_default()
+                .push(c);
+        }
+        for (region, batch) in per_region {
+            let msg = Arc::new(SpatialMsg::Entities(batch));
+            self.deliver(region, &msg);
+        }
+    }
 }
 
 /// A connection's spatial subscription. Re-point it with
@@ -190,7 +243,10 @@ impl SpatialSubscriber {
     /// given center chunk (`view_distance` + 2 chunks of margin), and
     /// unsubscribe from regions that left it. Cheap: region sets are
     /// small (~dozens) and only diffs touch the bucket maps.
-    pub fn set_view(&mut self, center_cx: i32, center_cz: i32, view_distance: i32) {
+    /// Returns the regions that are NEWLY subscribed — the caller should
+    /// backfill their current entities to the client (a resting entity
+    /// emits no events, so a newcomer would otherwise never see it).
+    pub fn set_view(&mut self, center_cx: i32, center_cz: i32, view_distance: i32) -> Vec<Region> {
         let margin = view_distance + 2;
         let (rx0, rx1) = ((center_cx - margin) >> 2, (center_cx + margin) >> 2);
         let (rz0, rz1) = ((center_cz - margin) >> 2, (center_cz + margin) >> 2);
@@ -206,14 +262,27 @@ impl SpatialSubscriber {
                 bucket.remove(&self.id);
             }
         }
+        let mut added = Vec::new();
         for region in wanted.difference(&self.regions) {
             self.bus
                 .buckets
                 .entry(*region)
                 .or_default()
                 .insert(self.id, self.tx.clone());
+            added.push(*region);
         }
         self.regions = wanted;
+        added
+    }
+
+    /// The chunk positions covered by a region (4×4 chunks).
+    pub fn chunks_of_region(region: Region) -> impl Iterator<Item = ultimate_engine::world::position::ChunkPos>
+    {
+        (0..4).flat_map(move |dx| {
+            (0..4).map(move |dz| {
+                ultimate_engine::world::position::ChunkPos::new(region.0 * 4 + dx, region.1 * 4 + dz)
+            })
+        })
     }
 }
 
@@ -238,6 +307,22 @@ pub fn collect_block_changes(write_log: &[EventPayload]) -> Vec<(BlockPos, Block
         .iter()
         .filter_map(|payload| match payload {
             EventPayload::BlockSet { pos, new, .. } => Some((*pos, *new)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Extract entity transitions from the write log (Phase 5).
+pub fn collect_entity_changes(write_log: &[EventPayload]) -> Vec<EntityChange> {
+    write_log
+        .iter()
+        .filter_map(|payload| match payload {
+            EventPayload::EntitySet { id, old, new } => match (old, new) {
+                (None, Some(s)) => Some(EntityChange::Spawn { id: *id, state: *s }),
+                (Some(_), Some(s)) => Some(EntityChange::Move { id: *id, state: *s }),
+                (Some(s), None) => Some(EntityChange::Despawn { id: *id, last: *s }),
+                (None, None) => None,
+            },
             _ => None,
         })
         .collect()

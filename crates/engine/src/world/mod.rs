@@ -1,18 +1,29 @@
 pub mod block;
 pub mod chunk;
+pub mod entity;
 pub mod position;
 
 use block::BlockId;
 use chunk::Chunk;
 use dashmap::{DashMap, DashSet};
+use entity::EntityStore;
 use position::{BlockPos, ChunkPos};
 
 /// The entire block world. Thread-safe, lock-sharded by chunk.
 ///
-/// This is the spatial substrate -- the fixed 3D lattice. Time and causality
-/// live in `causal::Graph`, not here.
+/// This is the spatial substrate -- the fixed 3D lattice plus the mobile
+/// entities anchored to it (Phase 5). Time and causality live in
+/// `causal::Graph`, not here.
 pub struct World {
     chunks: DashMap<ChunkPos, Chunk>,
+    /// Mobile causal actors (Phase 5), chunk-indexed.
+    entities: EntityStore,
+    /// Engine clock (Phase 5). Environmental time observable at event
+    /// execution — a pacing floor for timed events, never a barrier.
+    /// Lives on World so rules can re-stamp entity trajectories without
+    /// changing the `RuleFn(&World, &EventPayload)` signature. Tests swap
+    /// in a `ManualClock`.
+    clock: std::sync::RwLock<std::sync::Arc<dyn crate::causal::clock::Clock>>,
     /// Chunks that have been modified since the last save.
     dirty: DashSet<ChunkPos>,
     /// Chunks whose sky light has already been initialized.
@@ -23,9 +34,32 @@ impl World {
     pub fn new() -> Self {
         Self {
             chunks: DashMap::new(),
+            entities: EntityStore::new(),
+            clock: std::sync::RwLock::new(std::sync::Arc::new(
+                crate::causal::clock::MonotonicClock::new(),
+            )),
             dirty: DashSet::new(),
             sky_lit: DashSet::new(),
         }
+    }
+
+    /// The entity store — entities are world state exactly as blocks are,
+    /// which is why `RuleFn(&World, &EventPayload)` needs no new parameter.
+    pub fn entities(&self) -> &EntityStore {
+        &self.entities
+    }
+
+    pub fn set_clock(&self, clock: std::sync::Arc<dyn crate::causal::clock::Clock>) {
+        *self.clock.write().expect("clock lock") = clock;
+    }
+
+    pub fn clock(&self) -> std::sync::Arc<dyn crate::causal::clock::Clock> {
+        self.clock.read().expect("clock lock").clone()
+    }
+
+    /// Engine time now (convenience for rules).
+    pub fn now(&self) -> entity::Nanos {
+        self.clock.read().expect("clock lock").now()
     }
 
     /// Read a block at an absolute position. Returns AIR for unloaded chunks.

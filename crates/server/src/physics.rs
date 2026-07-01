@@ -134,6 +134,11 @@ pub struct BlockAction {
     pub new: BlockId,
     /// Recompute adjacent stair shapes after the cascade settles.
     pub update_stairs: bool,
+    /// Spawn a dropped-item entity if (and only if) this action's write
+    /// takes effect (Phase 5). Exactly-once: the spawn is triggered by the
+    /// action's `BlockSet` appearing in the write log — a stale-guarded
+    /// duplicate break never logs, so it never drops.
+    pub drop_item: bool,
 }
 
 enum WorkerMsg {
@@ -144,6 +149,95 @@ enum WorkerMsg {
     /// Inserted as roots: the causal parents live (executed) in the
     /// sender's graph; the channel carries the happens-before edge.
     Forward(Vec<(Event, u8)>),
+    /// Wake the worker so it re-checks its timer heap. Used after a
+    /// `ManualClock` jump in tests; a no-op otherwise.
+    Kick,
+}
+
+/// A timed event parked in a worker's heap until its deadline
+/// (Phase 5, `EventPayload::After`). Ordered by `(at, seq)` — `seq`
+/// preserves emission order among same-deadline events.
+struct Timed {
+    at: u64,
+    seq: u64,
+    event: Event,
+    prio: u8,
+}
+
+impl PartialEq for Timed {
+    fn eq(&self, other: &Self) -> bool {
+        (self.at, self.seq) == (other.at, other.seq)
+    }
+}
+impl Eq for Timed {}
+impl PartialOrd for Timed {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Timed {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.at, self.seq).cmp(&(other.at, other.seq))
+    }
+}
+
+/// The worker's timer plane: parks `After` events until due, then inserts
+/// their inner payloads as graph roots (the delay IS the happens-before
+/// edge — the cause executed before the `After` was even emitted).
+/// The causal graph itself stays pure-causal.
+struct TimerPlane {
+    heap: std::collections::BinaryHeap<std::cmp::Reverse<Timed>>,
+    seq: u64,
+    clock: Arc<dyn ultimate_engine::causal::clock::Clock>,
+    pending_timed: Arc<AtomicI64>,
+}
+
+impl TimerPlane {
+    fn new(clock: Arc<dyn ultimate_engine::causal::clock::Clock>, pending_timed: Arc<AtomicI64>) -> Self {
+        Self { heap: std::collections::BinaryHeap::new(), seq: 0, clock, pending_timed }
+    }
+
+    /// Insert a root event, unwrapping any `After` layers: due payloads go
+    /// straight into the graph, future ones park in the heap.
+    fn admit(&mut self, event: Event, prio: u8, graph: &mut CausalGraph) {
+        match event.payload {
+            EventPayload::After { at, inner } => {
+                if at <= self.clock.now() {
+                    // Recurse: `inner` may itself be timed.
+                    self.admit(Event { payload: *inner }, prio, graph);
+                } else {
+                    self.heap.push(std::cmp::Reverse(Timed {
+                        at,
+                        seq: self.seq,
+                        event: Event { payload: *inner },
+                        prio,
+                    }));
+                    self.seq += 1;
+                    self.pending_timed.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            _ => {
+                graph.insert_root_with_priority(event, prio);
+            }
+        }
+    }
+
+    /// Move every due timer into the graph. Returns how many fired.
+    fn fire_due(&mut self, graph: &mut CausalGraph) -> usize {
+        let now = self.clock.now();
+        let mut fired = 0;
+        while self.heap.peek().is_some_and(|t| t.0.at <= now) {
+            let t = self.heap.pop().expect("peeked").0;
+            self.pending_timed.fetch_sub(1, Ordering::SeqCst);
+            self.admit(t.event, t.prio, graph);
+            fired += 1;
+        }
+        fired
+    }
+
+    fn next_deadline(&self) -> Option<u64> {
+        self.heap.peek().map(|t| t.0.at)
+    }
 }
 
 // ── Region assignment ───────────────────────────────────────────────────────
@@ -218,6 +312,10 @@ pub struct PhysicsHandle {
     txs: Vec<mpsc::Sender<WorkerMsg>>,
     assignment: Arc<Assignment>,
     pending: Arc<AtomicI64>,
+    /// Events parked in worker timer heaps (Phase 5). Deliberately NOT
+    /// part of `pending()`: a 5-minute despawn timer must not hold the
+    /// world "non-quiescent".
+    pending_timed: Arc<AtomicI64>,
     executed: Arc<AtomicU64>,
     cluster: Option<ClusterCtx>,
 }
@@ -303,9 +401,24 @@ impl PhysicsHandle {
         }
     }
 
-    /// In-flight message count; 0 means globally quiescent.
+    /// In-flight message count; 0 means globally quiescent (timed events
+    /// parked in heaps are excluded — see `pending_timed`).
     pub fn pending(&self) -> i64 {
         self.pending.load(Ordering::SeqCst)
+    }
+
+    /// Events parked in timer heaps, waiting on their deadlines.
+    pub fn pending_timed(&self) -> i64 {
+        self.pending_timed.load(Ordering::SeqCst)
+    }
+
+    /// Wake every worker to re-check its timer heap. Call after advancing
+    /// a `ManualClock` in tests; production monotonic clocks never need it
+    /// (workers sleep exactly to their next deadline).
+    pub fn kick(&self) {
+        for worker in 0..self.txs.len() {
+            self.send(worker, WorkerMsg::Kick);
+        }
     }
 
     /// Total events executed across all workers since startup.
@@ -338,6 +451,7 @@ pub fn start(
     let assignment = Arc::new(Assignment::new());
     let region_loads: Arc<DashMap<Region, u64>> = Arc::new(DashMap::new());
     let pending = Arc::new(AtomicI64::new(0));
+    let pending_timed = Arc::new(AtomicI64::new(0));
     let executed = Arc::new(AtomicU64::new(0));
 
     let mut txs = Vec::with_capacity(workers);
@@ -365,6 +479,7 @@ pub fn start(
             bus: Arc::clone(&bus),
             dashboard: dashboard.clone(),
             pending: Arc::clone(&pending),
+            pending_timed: Arc::clone(&pending_timed),
             executed: Arc::clone(&executed),
             cluster: opts.cluster.clone(),
         };
@@ -398,7 +513,7 @@ pub fn start(
         opts.cluster.as_ref().map(|c| format!("{}/{}", c.mesh.node_id, c.mesh.total_nodes))
             .unwrap_or_else(|| "single".into()),
     );
-    PhysicsHandle { txs, assignment, pending, executed, cluster: opts.cluster }
+    PhysicsHandle { txs, assignment, pending, pending_timed, executed, cluster: opts.cluster }
 }
 
 // ── Worker ──────────────────────────────────────────────────────────────────
@@ -413,6 +528,7 @@ struct WorkerCtx {
     bus: Arc<SpatialBus>,
     dashboard: Option<Arc<DashboardState>>,
     pending: Arc<AtomicI64>,
+    pending_timed: Arc<AtomicI64>,
     executed: Arc<AtomicU64>,
     cluster: Option<ClusterCtx>,
 }
@@ -426,27 +542,62 @@ fn worker_loop(ctx: WorkerCtx, rx: mpsc::Receiver<WorkerMsg>) {
     // each step, same post-execution ordering as local forwards —
     // happens-before rides the socket.
     let mut remote_outbox: Vec<(u32, Event, u8)> = Vec::new();
+    // Timed events this worker owns (Phase 5). `After` consequents that
+    // stay local park here; the wait below sleeps exactly to the next
+    // deadline.
+    let mut timers = TimerPlane::new(ctx.world.clock(), Arc::clone(&ctx.pending_timed));
+    let mut timed_outbox: Vec<(Event, u8)> = Vec::new();
 
-    while let Ok(first) = rx.recv() {
+    loop {
+        // Wait for work: a message, or the next timer deadline.
+        let first = match timers.next_deadline() {
+            Some(at) => {
+                let now = timers.clock.now();
+                if at <= now {
+                    None // timers due — run a batch with no message
+                } else {
+                    match rx.recv_timeout(Duration::from_nanos(at - now)) {
+                        Ok(m) => Some(m),
+                        Err(mpsc::RecvTimeoutError::Timeout) => None,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            }
+            None => match rx.recv() {
+                Ok(m) => Some(m),
+                Err(_) => break,
+            },
+        };
+
         let mut consumed: i64 = 0;
         let mut stair_hooks: Vec<BlockPos> = Vec::new();
+        // Break actions that should drop an item IF their write takes
+        // effect. Matched against the write log (which only ever contains
+        // the one effective write for a contested cell) — exactly-once.
+        let mut drop_watch: Vec<(BlockPos, BlockId)> = Vec::new();
+        let mut spawned: Vec<Event> = Vec::new();
         let executed_before = graph.executed_total();
         let started = Instant::now();
 
-        ingest(&mut graph, first, &mut stair_hooks);
-        consumed += 1;
+        if let Some(msg) = first {
+            ingest(&mut graph, msg, &mut stair_hooks, &mut drop_watch, &mut timers);
+            consumed += 1;
+        }
+        timers.fire_due(&mut graph);
 
         // Run to local quiescence: drain the inbox between steps, refresh
         // the assignment snapshot, and PUBLISH AFTER EVERY STEP so player
         // cascades reach clients while long background cascades continue.
         loop {
             while let Ok(msg) = rx.try_recv() {
-                ingest(&mut graph, msg, &mut stair_hooks);
+                ingest(&mut graph, msg, &mut stair_hooks, &mut drop_watch, &mut timers);
                 consumed += 1;
             }
+            timers.fire_due(&mut graph);
 
             let table = ctx.assignment.snapshot();
             let cluster = &ctx.cluster;
+            let worker_id = ctx.id;
             let n = scheduler.step_routed(&ctx.world, &mut graph, &ctx.rules, &mut |event, prio| {
                 if let Some(c) = cluster {
                     let node = c.mesh.owner(event.chunk());
@@ -456,13 +607,22 @@ fn worker_loop(ctx: WorkerCtx, rx: mpsc::Receiver<WorkerMsg>) {
                     }
                 }
                 let target = owner_of(event.chunk(), &table, workers);
-                if target == ctx.id {
-                    true
-                } else {
+                if target != worker_id {
                     outbox.push((target, event.clone(), prio));
-                    false
+                    return false;
                 }
+                // Local timed consequent: park it after this step (the
+                // graph never holds `After` nodes; admitted as a root at
+                // its deadline — the cause has already executed).
+                if matches!(event.payload, EventPayload::After { .. }) {
+                    timed_outbox.push((event.clone(), prio));
+                    return false;
+                }
+                true
             });
+            for (event, prio) in timed_outbox.drain(..) {
+                timers.admit(event, prio, &mut graph);
+            }
 
             // Flush routed consequents, grouped per target worker. The +1
             // happens before our batch's decrement, so the pending counter
@@ -488,7 +648,14 @@ fn worker_loop(ctx: WorkerCtx, rx: mpsc::Receiver<WorkerMsg>) {
             // prerequisites before the Forward below arrives — the
             // cross-node analogue of "consequents ship after their cause's
             // write is visible".
-            publish_writes(&ctx, &mut graph, &mut Vec::new());
+            publish_writes(&ctx, &mut graph, &mut Vec::new(), &mut drop_watch, &mut spawned);
+            // Item drops proven effective by the write log: spawn them on
+            // the player lane. (Their chunk is the broken block's chunk,
+            // which this worker owns — a mid-cascade rebalance is the same
+            // tolerated race class as a region handoff.)
+            for event in spawned.drain(..) {
+                timers.admit(event, PRIO_PLAYER, &mut graph);
+            }
 
             // Ship cross-NODE consequents (their causes executed above),
             // grouped per destination node.
@@ -505,9 +672,13 @@ fn worker_loop(ctx: WorkerCtx, rx: mpsc::Receiver<WorkerMsg>) {
             }
 
             if n == 0 {
+                // Timers may have come due mid-batch (long step).
+                if timers.fire_due(&mut graph) > 0 {
+                    continue;
+                }
                 match rx.try_recv() {
                     Ok(msg) => {
-                        ingest(&mut graph, msg, &mut stair_hooks);
+                        ingest(&mut graph, msg, &mut stair_hooks, &mut drop_watch, &mut timers);
                         consumed += 1;
                     }
                     Err(_) => break,
@@ -516,6 +687,9 @@ fn worker_loop(ctx: WorkerCtx, rx: mpsc::Receiver<WorkerMsg>) {
         }
 
         // Post-batch: stair rewrites (read the settled world), final publish.
+        // (Every effective BlockSet was already published-and-drop-matched
+        // by the per-step publishes above, so the watch here is ephemeral —
+        // unconsumed entries mean the break's guard failed: no item.)
         let mut extra_changes: Vec<(BlockPos, BlockId)> = Vec::new();
         for pos in stair_hooks {
             for (npos, new_id) in crate::placement::update_adjacent_stair_shapes(&ctx.world, pos) {
@@ -523,7 +697,7 @@ fn worker_loop(ctx: WorkerCtx, rx: mpsc::Receiver<WorkerMsg>) {
                 extra_changes.push((npos, new_id));
             }
         }
-        publish_writes(&ctx, &mut graph, &mut extra_changes);
+        publish_writes(&ctx, &mut graph, &mut extra_changes, &mut drop_watch, &mut Vec::new());
 
         let executed_delta = graph.executed_total() - executed_before;
         let elapsed = started.elapsed();
@@ -548,11 +722,30 @@ fn worker_loop(ctx: WorkerCtx, rx: mpsc::Receiver<WorkerMsg>) {
 
 /// Drain the graph's write log; publish it (plus any `extra` block
 /// changes) to the bus and attribute the writes to their regions for the
-/// rebalancer's load metering.
-fn publish_writes(ctx: &WorkerCtx, graph: &mut CausalGraph, extra: &mut Vec<(BlockPos, BlockId)>) {
+/// rebalancer's load metering. Effective break-writes matching an entry in
+/// `drop_watch` produce dropped-item spawn events into `spawned`
+/// (exactly-once: only one write for a contested cell ever logs).
+fn publish_writes(
+    ctx: &WorkerCtx,
+    graph: &mut CausalGraph,
+    extra: &mut Vec<(BlockPos, BlockId)>,
+    drop_watch: &mut Vec<(BlockPos, BlockId)>,
+    spawned: &mut Vec<Event>,
+) {
     let log = graph.take_write_log();
     if log.is_empty() && extra.is_empty() {
         return;
+    }
+
+    if !drop_watch.is_empty() {
+        for payload in &log {
+            if let EventPayload::BlockSet { pos, old, .. } = payload {
+                if let Some(i) = drop_watch.iter().position(|(p, o)| p == pos && o == old) {
+                    drop_watch.swap_remove(i);
+                    spawned.extend(crate::rules::entity::spawn_item_events(&ctx.world, *pos, *old));
+                }
+            }
+        }
     }
 
     // Region load attribution (writes are a good proxy for work).
@@ -576,6 +769,7 @@ fn publish_writes(ctx: &WorkerCtx, graph: &mut CausalGraph, extra: &mut Vec<(Blo
 
     let mut changes = event_bus::collect_block_changes(&log);
     let light_changes = event_bus::collect_light_changes(&log);
+    ctx.bus.publish_entities(event_bus::collect_entity_changes(&log));
     let extra_payloads: Vec<EventPayload> = extra
         .iter()
         .map(|&(pos, new)| EventPayload::BlockSet { pos, old: new, new })
@@ -596,7 +790,13 @@ fn publish_writes(ctx: &WorkerCtx, graph: &mut CausalGraph, extra: &mut Vec<(Blo
     }
 }
 
-fn ingest(graph: &mut CausalGraph, msg: WorkerMsg, stair_hooks: &mut Vec<BlockPos>) {
+fn ingest(
+    graph: &mut CausalGraph,
+    msg: WorkerMsg,
+    stair_hooks: &mut Vec<BlockPos>,
+    drop_watch: &mut Vec<(BlockPos, BlockId)>,
+    timers: &mut TimerPlane,
+) {
     match msg {
         WorkerMsg::Action(a) => {
             // Player actions ride the priority lane; the notify fan-out
@@ -614,17 +814,21 @@ fn ingest(graph: &mut CausalGraph, msg: WorkerMsg, stair_hooks: &mut Vec<BlockPo
             if a.update_stairs {
                 stair_hooks.push(a.pos);
             }
+            if a.drop_item {
+                drop_watch.push((a.pos, a.old));
+            }
         }
         WorkerMsg::Events(events) => {
             for event in events {
-                graph.insert_root(event);
+                timers.admit(event, 0, graph);
             }
         }
         WorkerMsg::Forward(events) => {
             for (event, prio) in events {
-                graph.insert_root_with_priority(event, prio);
+                timers.admit(event, prio, graph);
             }
         }
+        WorkerMsg::Kick => {} // fire_due runs right after every ingest
     }
 }
 

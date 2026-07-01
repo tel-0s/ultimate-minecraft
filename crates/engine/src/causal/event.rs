@@ -1,4 +1,5 @@
 use crate::world::block::BlockId;
+use crate::world::entity::{EntityId, EntityState, Nanos};
 use crate::world::position::{BlockPos, ChunkPos};
 use slotmap::new_key_type;
 
@@ -60,22 +61,65 @@ pub enum EventPayload {
 
     /// A position's light should be recalculated (a neighbor's light changed).
     LightNotify { pos: BlockPos },
+
+    /// An entity state transition (Phase 5) — the entity analog of
+    /// `BlockSet`. `old: None` = spawn, `new: None` = despawn. Stale-guarded
+    /// (applies only if the store still matches `old`) and write-logged, so
+    /// replicas/gateways/clients learn entity changes through the same
+    /// machinery as block changes.
+    EntitySet {
+        id: EntityId,
+        old: Option<EntityState>,
+        new: Option<EntityState>,
+    },
+
+    /// "Re-evaluate this entity now" — the entity analog of `BlockNotify`:
+    /// idempotent, dedup-coalesced, safe to deliver spuriously or late.
+    /// `at` is a routing hint (the entity's block position at emission).
+    EntityWake { id: EntityId, at: BlockPos },
+
+    /// A timed event (Phase 5): `inner` must not execute before engine time
+    /// `at`. The causal graph itself stays pure-causal — the physics
+    /// worker's router unwraps `After` into its timer heap and inserts
+    /// `inner` as a root when due (the delay IS the happens-before edge,
+    /// riding wall-clock instead of a channel). Wrapping the payload rather
+    /// than adding a field to `Event` keeps every existing construction
+    /// site and the cluster codec's frame format unchanged.
+    After { at: Nanos, inner: Box<EventPayload> },
 }
 
 impl Event {
     pub fn positions(&self) -> Vec<BlockPos> {
-        match &self.payload {
+        self.payload.positions()
+    }
+
+    /// The chunk this event primarily affects (used for parallel grouping).
+    pub fn chunk(&self) -> ChunkPos {
+        self.payload.chunk()
+    }
+}
+
+impl EventPayload {
+    pub fn positions(&self) -> Vec<BlockPos> {
+        match self {
             EventPayload::BlockSet { pos, .. }
             | EventPayload::BlockNotify { pos }
             | EventPayload::LightSet { pos, .. }
             | EventPayload::LightNotify { pos } => vec![*pos],
             EventPayload::LightBatch { changes } => changes.iter().map(|c| c.pos).collect(),
+            EventPayload::EntitySet { old, new, .. } => new
+                .as_ref()
+                .or(old.as_ref())
+                .map(|s| vec![s.pos.block_pos()])
+                .unwrap_or_default(),
+            EventPayload::EntityWake { at, .. } => vec![*at],
+            EventPayload::After { inner, .. } => inner.positions(),
         }
     }
 
-    /// The chunk this event primarily affects (used for parallel grouping).
+    /// The chunk this payload primarily affects (routing / parallel grouping).
     pub fn chunk(&self) -> ChunkPos {
-        match &self.payload {
+        match self {
             EventPayload::BlockSet { pos, .. }
             | EventPayload::BlockNotify { pos }
             | EventPayload::LightSet { pos, .. }
@@ -85,6 +129,15 @@ impl Event {
                 .first()
                 .map(|c| c.pos.chunk())
                 .unwrap_or(ChunkPos::new(0, 0)),
+            // An EntitySet is anchored where the entity ENDS UP (its new
+            // owner executes it; the store guard tolerates the transition).
+            EventPayload::EntitySet { old, new, .. } => new
+                .as_ref()
+                .or(old.as_ref())
+                .map(|s| s.chunk())
+                .unwrap_or(ChunkPos::new(0, 0)),
+            EventPayload::EntityWake { at, .. } => at.chunk(),
+            EventPayload::After { inner, .. } => inner.chunk(),
         }
     }
 }
@@ -97,6 +150,7 @@ impl Event {
 pub enum DedupKey {
     BlockNotify(BlockPos),
     LightNotify(BlockPos),
+    EntityWake(EntityId),
 }
 
 impl EventPayload {
@@ -108,9 +162,14 @@ impl EventPayload {
         match self {
             EventPayload::BlockNotify { pos } => Some(DedupKey::BlockNotify(*pos)),
             EventPayload::LightNotify { pos } => Some(DedupKey::LightNotify(*pos)),
+            EventPayload::EntityWake { id, .. } => Some(DedupKey::EntityWake(*id)),
             EventPayload::BlockSet { .. }
             | EventPayload::LightSet { .. }
-            | EventPayload::LightBatch { .. } => None,
+            | EventPayload::LightBatch { .. }
+            | EventPayload::EntitySet { .. }
+            // Timed events never coalesce (their identity includes `at`;
+            // two despawn timers for different entities share nothing).
+            | EventPayload::After { .. } => None,
         }
     }
 }

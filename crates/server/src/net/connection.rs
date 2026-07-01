@@ -768,8 +768,17 @@ where
     // Spatial subscription (Phase 6f): world changes and entity moves are
     // delivered only for regions near this player; re-pointed on chunk
     // border crossings.
+    // Item entities this client has been sent (Phase 5) — the client's
+    // ground truth for spawn/teleport/remove packet correctness.
+    let mut spawned_items: HashSet<u64> = HashSet::new();
+
     let (mut spatial_sub, mut spatial_rx) = spatial.subscribe();
-    spatial_sub.set_view(chunk_x, chunk_z, config.network.view_distance);
+    let initial_regions = spatial_sub.set_view(chunk_x, chunk_z, config.network.view_distance);
+    // Backfill entities already at rest in view — they emit no events, so
+    // a newcomer would otherwise never see them.
+    backfill_region_entities(
+        write, compression, cipher_enc, world, &initial_regions, &mut spawned_items,
+    ).await?;
     // Subscribe to player lifecycle events (join/leave/chat — global).
     let mut player_rx = registry.subscribe();
 
@@ -1016,6 +1025,7 @@ where
                                         old: world.get_block(epos),
                                         new: BlockId::AIR,
                                         update_stairs: true,
+                                        drop_item: true,
                                     });
 
                                     // Acknowledge the sequence immediately; the
@@ -1076,6 +1086,7 @@ where
                                     old,
                                     new: new_id,
                                     update_stairs: true,
+                                    drop_item: false,
                                 });
 
                                 // Acknowledge immediately; authoritative updates
@@ -1125,7 +1136,14 @@ where
                                     &mut loaded_chunks, &mut sent_to_client,
                                     &mut chunk_send_queue,
                                 ).await?;
-                                spatial_sub.set_view(current_chunk_x, current_chunk_z, view_distance);
+                                let added = spatial_sub.set_view(current_chunk_x, current_chunk_z, view_distance);
+                                backfill_region_entities(
+                                    write, compression, cipher_enc, world, &added, &mut spawned_items,
+                                ).await?;
+                                try_item_pickup(
+                                    write, compression, cipher_enc, world, physics,
+                                    entity_id, player_x, player_y, player_z,
+                                ).await?;
                             }
                             ServerboundGamePacket::MovePlayerPosRot(pkt) => {
                                 player_x = pkt.pos.x;
@@ -1145,7 +1163,14 @@ where
                                     &mut loaded_chunks, &mut sent_to_client,
                                     &mut chunk_send_queue,
                                 ).await?;
-                                spatial_sub.set_view(current_chunk_x, current_chunk_z, view_distance);
+                                let added = spatial_sub.set_view(current_chunk_x, current_chunk_z, view_distance);
+                                backfill_region_entities(
+                                    write, compression, cipher_enc, world, &added, &mut spawned_items,
+                                ).await?;
+                                try_item_pickup(
+                                    write, compression, cipher_enc, world, physics,
+                                    entity_id, player_x, player_y, player_z,
+                                ).await?;
                             }
                             ServerboundGamePacket::MovePlayerRot(pkt) => {
                                 player_y_rot = pkt.look_direction.y_rot();
@@ -1229,6 +1254,59 @@ where
                         event_bus::SpatialMsg::Move(ev) => {
                             if let PlayerEvent::Moved { entity_id, .. } = ev {
                                 latest_move.insert(*entity_id, ev.clone());
+                            }
+                        }
+                        // ── Item entities (Phase 5) ──────────────────────
+                        event_bus::SpatialMsg::Entities(changes) => {
+                            for c in changes {
+                                match c {
+                                    event_bus::EntityChange::Spawn { id, state } => {
+                                        if state.kind == crate::rules::entity::KIND_ITEM
+                                            && spawned_items.insert(id.0)
+                                        {
+                                            send_item_spawn(write, compression, cipher_enc, *id, state).await?;
+                                        }
+                                    }
+                                    event_bus::EntityChange::Move { id, state } => {
+                                        if !spawned_items.contains(&id.0) {
+                                            // Entered our view mid-flight (or
+                                            // crossed in from another region):
+                                            // late-spawn it.
+                                            if state.kind == crate::rules::entity::KIND_ITEM
+                                                && spawned_items.insert(id.0)
+                                            {
+                                                send_item_spawn(write, compression, cipher_enc, *id, state).await?;
+                                            }
+                                            continue;
+                                        }
+                                        let tp: ClientboundGamePacket = ClientboundTeleportEntity {
+                                            id: item_wire_id(*id),
+                                            change: PositionMoveRotation {
+                                                pos: Vec3 { x: state.pos.x, y: state.pos.y, z: state.pos.z },
+                                                // Velocity: clients extrapolate
+                                                // between segment endpoints
+                                                // (blocks/tick on the wire).
+                                                delta: Vec3 {
+                                                    x: state.vel.x / 20.0,
+                                                    y: state.vel.y / 20.0,
+                                                    z: state.vel.z / 20.0,
+                                                },
+                                                look_direction: LookDirection::new(0.0, 0.0),
+                                            },
+                                            relative: RelativeMovements::default(),
+                                            on_ground: state.vel.y == 0.0,
+                                        }.into_variant();
+                                        write_packet(&tp, write, compression, cipher_enc).await?;
+                                    }
+                                    event_bus::EntityChange::Despawn { id, .. } => {
+                                        if spawned_items.remove(&id.0) {
+                                            let rm: ClientboundGamePacket = ClientboundRemoveEntities {
+                                                entity_ids: vec![item_wire_id(*id)],
+                                            }.into_variant();
+                                            write_packet(&rm, write, compression, cipher_enc).await?;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1433,6 +1511,148 @@ fn engine_block_to_mc(id: ultimate_engine::world::block::BlockId) -> azalea_bloc
     // For now, treat BlockId as a direct MC block state ID.
     // BlockId(0) = air, others map through azalea.
     azalea_block::BlockState::try_from(id.0 as u32).unwrap_or(azalea_block::BlockState::AIR)
+}
+
+// ── Item entities on the wire (Phase 5) ─────────────────────────────────
+
+/// Wire entity id for an engine entity — offset into a high range so it
+/// can never collide with player entity ids from the registry.
+fn item_wire_id(id: ultimate_engine::world::entity::EntityId) -> MinecraftEntityId {
+    MinecraftEntityId(0x4000_0000 | (id.0 as i32 & 0x3FFF_FFFF))
+}
+
+fn item_uuid(id: ultimate_engine::world::entity::EntityId) -> uuid::Uuid {
+    // Stable, deterministic, and disjoint from player uuids.
+    uuid::Uuid::from_u64_pair(0x554D_435F_4954_454D, id.0) // "UMC_ITEM"
+}
+
+/// The MC item rendered for a dropped block (name-based mapping; falls
+/// back to stone for blocks without a same-named item).
+fn dropped_item_kind(block: ultimate_engine::world::block::BlockId) -> azalea_registry::builtin::ItemKind {
+    crate::block::name(block)
+        .parse()
+        .unwrap_or(azalea_registry::builtin::ItemKind::Stone)
+}
+
+/// Spawn a dropped-item entity on the client: AddEntity + the item-stack
+/// metadata that makes it render.
+async fn send_item_spawn<W: AsyncWrite + Unpin + Send>(
+    write: &mut W,
+    compression: Option<u32>,
+    cipher: &mut Option<azalea_crypto::Aes128CfbEnc>,
+    id: ultimate_engine::world::entity::EntityId,
+    state: &ultimate_engine::world::entity::EntityState,
+) -> Result<()> {
+    use azalea_entity::{EntityDataItem, EntityDataValue, EntityMetadataItems};
+    use azalea_inventory::ItemStack;
+
+    let wire = item_wire_id(id);
+    let add: ClientboundGamePacket = ClientboundAddEntity {
+        id: wire,
+        uuid: item_uuid(id),
+        entity_type: EntityKind::Item,
+        position: Vec3 { x: state.pos.x, y: state.pos.y, z: state.pos.z },
+        movement: LpVec3::Zero,
+        x_rot: 0,
+        y_rot: 0,
+        y_head_rot: 0,
+        data: 0,
+    }.into_variant();
+    write_packet(&add, write, compression, cipher).await?;
+
+    let stack = ItemStack::Present(azalea_inventory::ItemStackData {
+        kind: dropped_item_kind(crate::rules::entity::aux_block(state.aux)),
+        count: 1,
+        component_patch: Default::default(),
+    });
+    let meta: ClientboundGamePacket = azalea_protocol::packets::game::ClientboundSetEntityData {
+        id: wire,
+        packed_items: EntityMetadataItems(vec![EntityDataItem {
+            index: 8, // Item entity: the displayed stack
+            value: EntityDataValue::ItemStack(stack),
+        }]),
+    }.into_variant();
+    write_packet(&meta, write, compression, cipher).await?;
+    Ok(())
+}
+
+/// Send spawn packets for every item entity resting in the given regions
+/// that this client hasn't been sent yet. Called when the spatial view
+/// gains regions (join, chunk-border crossing): resting entities emit no
+/// events, so subscription alone would never reveal them.
+async fn backfill_region_entities<W: AsyncWrite + Unpin + Send>(
+    write: &mut W,
+    compression: Option<u32>,
+    cipher: &mut Option<azalea_crypto::Aes128CfbEnc>,
+    world: &World,
+    regions: &[event_bus::Region],
+    spawned_items: &mut HashSet<u64>,
+) -> Result<()> {
+    for region in regions {
+        for chunk in event_bus::SpatialSubscriber::chunks_of_region(*region) {
+            for id in world.entities().in_chunk(chunk) {
+                let Some(state) = world.entities().get(id) else { continue };
+                if state.kind == crate::rules::entity::KIND_ITEM && spawned_items.insert(id.0) {
+                    send_item_spawn(write, compression, cipher, id, &state).await?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pick up nearby items: submit a guarded despawn for each item within
+/// reach (first player wins at the entity store's stale guard — no dupes)
+/// and play the collect animation optimistically. The authoritative
+/// despawn comes back through the spatial bus for everyone.
+async fn try_item_pickup<W: AsyncWrite + Unpin + Send>(
+    write: &mut W,
+    compression: Option<u32>,
+    cipher: &mut Option<azalea_crypto::Aes128CfbEnc>,
+    world: &World,
+    physics: &crate::physics::PhysicsHandle,
+    player_eid: i32,
+    px: f64,
+    py: f64,
+    pz: f64,
+) -> Result<()> {
+    use ultimate_engine::causal::event::{Event, EventPayload};
+    use ultimate_engine::world::position::{BlockPos as EnginePos, ChunkPos};
+
+    let pc = EnginePos::new(px as i64, py as i64, pz as i64).chunk();
+    let now = world.now();
+    for dx in -1..=1 {
+        for dz in -1..=1 {
+            for id in world.entities().in_chunk(ChunkPos::new(pc.x + dx, pc.z + dz)) {
+                let Some(s) = world.entities().get(id) else { continue };
+                if s.kind != crate::rules::entity::KIND_ITEM {
+                    continue;
+                }
+                // Vanilla-style pickup delay after spawning.
+                let spawn_at = crate::rules::entity::aux_despawn_at(s.aux)
+                    .saturating_sub(crate::rules::entity::DESPAWN_AFTER);
+                if now < spawn_at + 500_000_000 {
+                    continue;
+                }
+                if (s.pos.x - px).abs() <= 1.5
+                    && (s.pos.z - pz).abs() <= 1.5
+                    && (s.pos.y - py).abs() <= 1.75
+                {
+                    physics.submit_events(vec![Event {
+                        payload: EventPayload::EntitySet { id, old: Some(s), new: None },
+                    }]);
+                    let take: ClientboundGamePacket =
+                        azalea_protocol::packets::game::ClientboundTakeItemEntity {
+                            item_id: item_wire_id(id).0 as u32,
+                            player_id: MinecraftEntityId(player_eid),
+                            amount: 1,
+                        }.into_variant();
+                    write_packet(&take, write, compression, cipher).await?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // ── Dynamic chunk loading ────────────────────────────────────────────────

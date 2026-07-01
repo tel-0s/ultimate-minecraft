@@ -151,7 +151,11 @@ async fn main() {
             &listener,
             &cfg.cluster.peers,
         ) {
-            Ok(m) => Some(m),
+            Ok(m) => {
+                // Entity ids are minted per node; salt so nodes never collide.
+                world.entities().set_id_salt(cfg.cluster.node_id as u16);
+                Some(m)
+            }
             Err(e) => {
                 tracing::error!("cluster mesh formation failed: {e:#}");
                 return;

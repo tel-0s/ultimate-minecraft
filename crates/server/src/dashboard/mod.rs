@@ -138,6 +138,36 @@ pub fn snapshot_graph(graph: &CausalGraph) -> GraphSnapshot {
                     [anchor.x, anchor.y, anchor.z],
                 )
             }
+            EventPayload::EntitySet { id, old, new } => {
+                let anchor = new
+                    .as_ref()
+                    .or(old.as_ref())
+                    .map(|s| s.pos.block_pos())
+                    .unwrap_or(ultimate_engine::world::position::BlockPos::new(0, 0, 0));
+                let verb = match (old, new) {
+                    (None, Some(_)) => "spawn",
+                    (Some(_), None) => "despawn",
+                    _ => "move",
+                };
+                (
+                    "entity_set".to_string(),
+                    format!("Entity {} {}", id.0, verb),
+                    [anchor.x, anchor.y, anchor.z],
+                )
+            }
+            EventPayload::EntityWake { id, at } => (
+                "entity_wake".to_string(),
+                format!("Wake entity {}", id.0),
+                [at.x, at.y, at.z],
+            ),
+            EventPayload::After { at, inner } => (
+                "after".to_string(),
+                format!("After {} ms", at / 1_000_000),
+                {
+                    let p = inner.chunk();
+                    [(p.x as i64) * 16, 0, (p.z as i64) * 16]
+                },
+            ),
         };
 
         nodes.push(GraphNode {

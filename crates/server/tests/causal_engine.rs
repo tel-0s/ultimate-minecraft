@@ -88,6 +88,12 @@ where
                 EventPayload::LightNotify { .. } => true,
                 // Reporting-only: the light rule already wrote storage.
                 EventPayload::LightBatch { .. } => true,
+                // Phase 5 entity payloads: mirror the engine scheduler.
+                EventPayload::EntitySet { id, old, new } => {
+                    world.entities().set_entity(*id, old.as_ref(), new.as_ref()) && old != new
+                }
+                EventPayload::EntityWake { .. } => true,
+                EventPayload::After { .. } => false,
             };
             graph.mark_executed(id);
             total += 1;

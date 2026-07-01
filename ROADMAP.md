@@ -279,12 +279,37 @@ causality is the only ordering.
 ## Phase 5 -- Entities & Physics
 
 > Moving objects integrated into the causal graph.
+> **Design: [docs/phase5-entities.md](docs/phase5-entities.md)** (2026-07-01).
+> Core abstraction: entity state is a parametric trajectory (pos, vel, stamp);
+> events fire only at causally-relevant times (collision, region edge,
+> extrapolation cap, timers, external wake). A ballistic entity ≈ 2 events
+> total; a resting entity costs zero until the world changes under it.
+> Engine gains: EntityStore on World (chunk-indexed), `EntitySet`/`EntityWake`
+> payloads (stale-guarded / dedup-coalesced — so WriteSync, migration, and
+> routing work unchanged), timed events (`Event.not_before` + worker timer
+> heaps + injectable Clock).
 
-- [ ] Entity as a causal actor: position updates are events with spatial dependencies
-- [ ] AABB collision detection against block grid
-- [ ] Gravity, jumping, basic kinematics
-- [ ] Entity-entity interaction as causally-ordered events
-- [ ] Mob spawning rules, basic mob AI
+- [x] Entity as a causal actor ✓ (2026-07-01, dropped-item MVP): spawn on
+      break (exactly-once via write-log matching), ballistic trajectory
+      segments, rest-sleep (**a resting item executes ZERO events** —
+      verified over 60 virtual seconds), wake-on-block-change, 5-minute
+      despawn timer, client projection (spawn/metadata/teleport/remove +
+      view backfill), guarded pickup with collect animation. Engine:
+      `EntityStore` on `World`, `EntitySet`/`EntityWake`/`After` payloads,
+      worker timer plane, injectable `Clock` (tests run lifecycles in
+      virtual time). 5 new integration tests; trajectories bit-identical
+      across worker counts.
+- [ ] AABB collision detection against block grid (MVP uses substep
+      trajectory sampling at planning time; true swept-AABB next)
+- [ ] Gravity, jumping, basic kinematics (items done; per-kind dispatch
+      as kinds grow)
+- [x] Entity-entity interaction as causally-ordered events ✓ (pickup:
+      guarded + idempotent, first-write-wins — contested pickup despawns
+      exactly once under test)
+- [ ] FallingBlock entity (vanilla sand parity; rules-option-gated to preserve benches)
+- [ ] Players unified into EntityStore (replaces `entity_spawn_cap` with true AOI)
+- [ ] Mob spawning rules, basic mob AI (think = timed self-chained EntityWake;
+      AI cadence is a per-mob rate, not a global tick)
 
 ## Phase 6 -- Scale & Optimization
 
