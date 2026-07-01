@@ -306,7 +306,22 @@ causality is the only ordering.
 - [x] Entity-entity interaction as causally-ordered events ✓ (pickup:
       guarded + idempotent, first-write-wins — contested pickup despawns
       exactly once under test)
-- [ ] FallingBlock entity (vanilla sand parity; rules-option-gated to preserve benches)
+- [x] FallingBlock entity ✓ (2026-07-01): unsupported sand detaches into
+      a visible falling entity and re-lands as a block — final block
+      state PROVEN identical to instant gravity (test), pacing real.
+      `physics.falling_block_entities` (default on) selects
+      `rules::standard_with_falling_blocks`; `standard()` keeps instant
+      gravity for benches/invariance tests. Conversion atomicity:
+      materialize-first, despawn-on-effective-write, bump-up-on-blocked
+      (sand conserved exactly at 160k, 16-deep stacks). Per-column entity
+      index (per-chunk scans dominated the cascade at density).
+      **bench_entities (160k falling entities, the vanilla 6e workload):
+      5.5 s wall vs vanilla's <12.3 s CPU-saturated — and our wall is
+      mostly the physics' own fall time (~1.7 s) + stacking choreography,
+      ~33 events/entity total, CPU idle between deadlines. Sparse 10k:
+      1.77 s ≈ pure fall time, 9 events/entity (vanilla: 2.20 s floor).**
+      Open: conversion vs rebalancer dual-ownership (~0.2% dupes with
+      rebalancing on; bench runs rebalance-off; see design doc §8.7).
 - [ ] Players unified into EntityStore (replaces `entity_spawn_cap` with true AOI)
 - [ ] Mob spawning rules, basic mob AI (think = timed self-chained EntityWake;
       AI cadence is a per-mob rate, not a global tick)

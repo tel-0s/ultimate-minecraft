@@ -200,6 +200,116 @@ fn contested_pickup_despawns_exactly_once() {
     assert_eq!(despawns, 1, "exactly one authoritative despawn on the bus");
 }
 
+// ── FallingBlock: vanilla sand parity via entities ───────────────────────
+
+fn start_falling(world: &Arc<World>, workers: usize) -> PhysicsHandle {
+    physics::start(
+        Arc::clone(world),
+        ultimate_server::rules::standard_with_falling_blocks,
+        ultimate_server::event_bus::SpatialBus::new(),
+        None,
+        physics::PhysicsOptions { workers, rebalance: false, ..Default::default() },
+    )
+}
+
+#[test]
+fn sand_detaches_falls_and_relands_as_block() {
+    let (world, clock) = flat_world_manual_clock(2);
+    let handle = start_falling(&world, 4);
+
+    // Place sand high in the air: it detaches into an entity immediately.
+    handle.submit_action(BlockAction {
+        pos: BlockPos::new(8, 10, 8),
+        old: block::AIR,
+        new: block::SAND,
+        update_stairs: false,
+        drop_item: false,
+    });
+    quiesce(&handle);
+    assert_eq!(world.get_block(BlockPos::new(8, 10, 8)), block::AIR, "block detached");
+    assert_eq!(world.entities().len(), 1, "falling entity exists");
+
+    // ~5 blocks of fall at g=20 ≈ 0.7 s; give it a virtual second, then
+    // the landing conversion.
+    advance_and_settle(&clock, &handle, 1500);
+    assert!(world.entities().is_empty(), "entity converted back to a block");
+    assert_eq!(
+        world.get_block(BlockPos::new(8, 5, 8)),
+        block::SAND,
+        "sand re-landed exactly where instant gravity would put it"
+    );
+}
+
+#[test]
+fn stacked_sands_reland_as_a_stack() {
+    let (world, clock) = flat_world_manual_clock(2);
+    let handle = start_falling(&world, 4);
+
+    // A floating 3-sand pillar: all three detach; the mid-flight entities
+    // above must re-plan when the ones below re-land (wake-on-block-change
+    // while MOVING — the re-plan keeps the original timeline and its
+    // earlier-deadline segment wins at the guard).
+    for y in [10, 11, 12] {
+        handle.submit_action(BlockAction {
+            pos: BlockPos::new(8, y, 8),
+            old: block::AIR,
+            new: block::SAND,
+            update_stairs: false,
+            drop_item: false,
+        });
+    }
+    quiesce(&handle);
+
+    // Settle in small steps so wakes and re-plans interleave realistically.
+    for _ in 0..30 {
+        advance_and_settle(&clock, &handle, 100);
+    }
+
+    assert!(world.entities().is_empty(), "all sand re-landed");
+    for y in [5, 6, 7] {
+        assert_eq!(
+            world.get_block(BlockPos::new(8, y, 8)),
+            block::SAND,
+            "stack layer at y={y}"
+        );
+    }
+    assert_eq!(world.get_block(BlockPos::new(8, 8, 8)), block::AIR);
+}
+
+#[test]
+fn falling_matches_instant_gravity_final_state() {
+    // The same scattered sand drop under both rule sets must produce the
+    // same final block state — entity gravity changes pacing, not physics.
+    let run = |falling: bool| {
+        let (world, clock) = flat_world_manual_clock(2);
+        let handle = if falling { start_falling(&world, 4) } else { start(&world, 4) };
+        for (x, z, y) in [(3i64, 3i64, 9i64), (8, 8, 12), (12, 5, 7), (20, 20, 15)] {
+            handle.submit_action(BlockAction {
+                pos: BlockPos::new(x, y, z),
+                old: block::AIR,
+                new: block::SAND,
+                update_stairs: false,
+                drop_item: false,
+            });
+        }
+        quiesce(&handle);
+        for _ in 0..30 {
+            advance_and_settle(&clock, &handle, 100);
+        }
+        assert!(world.entities().is_empty());
+        let mut landed = Vec::new();
+        for (x, z, _) in [(3i64, 3i64, 0i64), (8, 8, 0), (12, 5, 0), (20, 20, 0)] {
+            for y in 0..20 {
+                if world.get_block(BlockPos::new(x, y, z)) == block::SAND {
+                    landed.push((x, y, z));
+                }
+            }
+        }
+        landed
+    };
+    assert_eq!(run(true), run(false), "entity and instant gravity must agree");
+}
+
 // ── Determinism across worker counts ─────────────────────────────────────
 
 #[test]

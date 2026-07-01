@@ -292,6 +292,22 @@ Then, in order:
    `BlockSet` appearing in the WRITE LOG — the log only ever contains the
    one effective write for a contested cell. `BlockAction.drop_item` +
    per-batch drop-watch in the worker.
+6. **Conversion atomicity** (new, solved for FallingBlock at 160k scale):
+   entity→block conversion spans two stores, so it CANNOT be one event
+   pair — every combination of (despawn, block-write) emitted together
+   loses or duplicates sand under contention. The stable shape:
+   **materialize first, despawn as a consequent of the effective block
+   write** (the write-log/rule-eval chain is the atomicity primitive),
+   with blocked landings BUMPING one cell up as immediate-lane rest
+   states. Sand is then conserved on every path — verified exactly at
+   160k with 16-deep co-column stacking.
+7. **OPEN — conversion vs region-handoff dual ownership**: the 6d
+   rebalancer's transient dual-ownership window can reorder a landing's
+   despawn against a wake-bump across two workers (~0.2% duplication at
+   160k with rebalancing on). Block rules tolerate dual windows by
+   confluence; cross-store conversions don't yet. Options: quiesce-region
+   handoff for entity-resident regions, or make conversion single-event
+   (engine-level combined payload). Decide with players-in-EntityStore.
 
 ## 9. MVP results (2026-07-01)
 

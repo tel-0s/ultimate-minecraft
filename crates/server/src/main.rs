@@ -169,9 +169,14 @@ async fn main() {
     // Partition workers own the shared causal graphs; connections and
     // simulation layers submit root events and the spatial bus carries
     // results to interested connections.
+    let rules_factory = if cfg.physics.falling_block_entities {
+        ultimate_server::rules::standard_with_falling_blocks
+    } else {
+        ultimate_server::rules::standard
+    };
     let physics = ultimate_server::physics::start(
         Arc::clone(&world),
-        ultimate_server::rules::standard,
+        rules_factory,
         Arc::clone(&spatial),
         Some(Arc::clone(&dashboard)),
         ultimate_server::physics::PhysicsOptions {

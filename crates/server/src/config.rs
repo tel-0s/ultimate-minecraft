@@ -72,11 +72,20 @@ pub struct PhysicsConfig {
     /// per-region event throughput, moves hot regions between workers,
     /// and splits a dominating region into per-chunk ownership.
     pub rebalance: bool,
+    /// Phase 5: unsupported sand/gravel detaches into a falling-block
+    /// ENTITY (visible, causally-paced trajectory) instead of teleporting
+    /// down instantly. Final block state is identical either way.
+    pub falling_block_entities: bool,
 }
 
 impl Default for PhysicsConfig {
     fn default() -> Self {
-        Self { workers: 0, pin_workers: false, rebalance: true }
+        Self {
+            workers: 0,
+            pin_workers: false,
+            rebalance: true,
+            falling_block_entities: true,
+        }
     }
 }
 

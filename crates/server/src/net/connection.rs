@@ -1261,10 +1261,10 @@ where
                             for c in changes {
                                 match c {
                                     event_bus::EntityChange::Spawn { id, state } => {
-                                        if state.kind == crate::rules::entity::KIND_ITEM
+                                        if is_client_entity(state.kind)
                                             && spawned_items.insert(id.0)
                                         {
-                                            send_item_spawn(write, compression, cipher_enc, *id, state).await?;
+                                            send_entity_spawn(write, compression, cipher_enc, *id, state).await?;
                                         }
                                     }
                                     event_bus::EntityChange::Move { id, state } => {
@@ -1272,10 +1272,10 @@ where
                                             // Entered our view mid-flight (or
                                             // crossed in from another region):
                                             // late-spawn it.
-                                            if state.kind == crate::rules::entity::KIND_ITEM
+                                            if is_client_entity(state.kind)
                                                 && spawned_items.insert(id.0)
                                             {
-                                                send_item_spawn(write, compression, cipher_enc, *id, state).await?;
+                                                send_entity_spawn(write, compression, cipher_enc, *id, state).await?;
                                             }
                                             continue;
                                         }
@@ -1534,9 +1534,15 @@ fn dropped_item_kind(block: ultimate_engine::world::block::BlockId) -> azalea_re
         .unwrap_or(azalea_registry::builtin::ItemKind::Stone)
 }
 
-/// Spawn a dropped-item entity on the client: AddEntity + the item-stack
-/// metadata that makes it render.
-async fn send_item_spawn<W: AsyncWrite + Unpin + Send>(
+/// Is this an engine entity kind we project to clients?
+fn is_client_entity(kind: ultimate_engine::world::entity::EntityKind) -> bool {
+    kind == crate::rules::entity::KIND_ITEM || kind == crate::rules::entity::KIND_FALLING_BLOCK
+}
+
+/// Spawn an engine entity on the client. Items get AddEntity + the
+/// item-stack metadata that makes them render; falling blocks render from
+/// AddEntity alone (`data` = the block state id).
+async fn send_entity_spawn<W: AsyncWrite + Unpin + Send>(
     write: &mut W,
     compression: Option<u32>,
     cipher: &mut Option<azalea_crypto::Aes128CfbEnc>,
@@ -1546,33 +1552,40 @@ async fn send_item_spawn<W: AsyncWrite + Unpin + Send>(
     use azalea_entity::{EntityDataItem, EntityDataValue, EntityMetadataItems};
     use azalea_inventory::ItemStack;
 
+    let falling = state.kind == crate::rules::entity::KIND_FALLING_BLOCK;
     let wire = item_wire_id(id);
     let add: ClientboundGamePacket = ClientboundAddEntity {
         id: wire,
         uuid: item_uuid(id),
-        entity_type: EntityKind::Item,
+        entity_type: if falling { EntityKind::FallingBlock } else { EntityKind::Item },
         position: Vec3 { x: state.pos.x, y: state.pos.y, z: state.pos.z },
         movement: LpVec3::Zero,
         x_rot: 0,
         y_rot: 0,
         y_head_rot: 0,
-        data: 0,
+        data: if falling {
+            u32::from(engine_block_to_mc(crate::rules::entity::aux_block(state.aux))) as i32
+        } else {
+            0
+        },
     }.into_variant();
     write_packet(&add, write, compression, cipher).await?;
 
-    let stack = ItemStack::Present(azalea_inventory::ItemStackData {
-        kind: dropped_item_kind(crate::rules::entity::aux_block(state.aux)),
-        count: 1,
-        component_patch: Default::default(),
-    });
-    let meta: ClientboundGamePacket = azalea_protocol::packets::game::ClientboundSetEntityData {
-        id: wire,
-        packed_items: EntityMetadataItems(vec![EntityDataItem {
-            index: 8, // Item entity: the displayed stack
-            value: EntityDataValue::ItemStack(stack),
-        }]),
-    }.into_variant();
-    write_packet(&meta, write, compression, cipher).await?;
+    if !falling {
+        let stack = ItemStack::Present(azalea_inventory::ItemStackData {
+            kind: dropped_item_kind(crate::rules::entity::aux_block(state.aux)),
+            count: 1,
+            component_patch: Default::default(),
+        });
+        let meta: ClientboundGamePacket = azalea_protocol::packets::game::ClientboundSetEntityData {
+            id: wire,
+            packed_items: EntityMetadataItems(vec![EntityDataItem {
+                index: 8, // Item entity: the displayed stack
+                value: EntityDataValue::ItemStack(stack),
+            }]),
+        }.into_variant();
+        write_packet(&meta, write, compression, cipher).await?;
+    }
     Ok(())
 }
 
@@ -1592,8 +1605,8 @@ async fn backfill_region_entities<W: AsyncWrite + Unpin + Send>(
         for chunk in event_bus::SpatialSubscriber::chunks_of_region(*region) {
             for id in world.entities().in_chunk(chunk) {
                 let Some(state) = world.entities().get(id) else { continue };
-                if state.kind == crate::rules::entity::KIND_ITEM && spawned_items.insert(id.0) {
-                    send_item_spawn(write, compression, cipher, id, &state).await?;
+                if is_client_entity(state.kind) && spawned_items.insert(id.0) {
+                    send_entity_spawn(write, compression, cipher, id, &state).await?;
                 }
             }
         }
