@@ -160,6 +160,14 @@ pub fn snapshot_graph(graph: &CausalGraph) -> GraphSnapshot {
                 format!("Wake entity {}", id.0),
                 [at.x, at.y, at.z],
             ),
+            EventPayload::EntityMaterialize { id, old, block } => {
+                let p = old.pos.block_pos();
+                (
+                    "entity_set".to_string(),
+                    format!("Materialize entity {} → {}", id.0, crate::block::name(*block)),
+                    [p.x, p.y, p.z],
+                )
+            }
             EventPayload::After { at, inner } => (
                 "after".to_string(),
                 format!("After {} ms", at / 1_000_000),

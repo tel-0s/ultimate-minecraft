@@ -295,37 +295,29 @@ pub fn falling_block_gravity(world: &World, payload: &EventPayload) -> Vec<Event
 /// duplicated sand plus a zombie entity replanning forever (found by
 /// bench_entities at 160k, invisible at 3 sands).
 pub fn falling_block_kinematics(world: &World, payload: &EventPayload) -> Vec<Event> {
-    // A gravity block just materialized in the world (usually a landed
-    // conversion): despawn exactly ONE resident falling-block entity of
-    // that block type — the one whose landing this write IS. This is the
-    // sand-conservation keystone: the entity dies only causally AFTER its
-    // block write took effect, so every failure path (write lost the cell
-    // race, co-resident lost the claim) leaves a live entity that the
-    // same BlockSet's wake then bumps upward. MUST be registered before
-    // `entity_block_wake` so the despawn beats the bump to the guard.
-    // (Known quirk: a player placing sand INTO a cell where a
-    // falling-block entity is resting absorbs the entity.)
-    if let EventPayload::BlockSet { pos, new, .. } = payload {
-        if crate::block::has_gravity(*new) {
-            let mut resident: Option<(ultimate_engine::world::entity::EntityId, EntityState)> = None;
-            for other in world.entities().in_column(pos.x, pos.z) {
-                let Some(o) = world.entities().get(other) else { continue };
-                if o.kind == KIND_FALLING_BLOCK
-                    && is_still(&o)
-                    && o.pos.block_pos() == *pos
-                    && aux_block(o.aux) == *new
-                    && resident.map_or(true, |(rid, _)| other < rid)
-                {
-                    resident = Some((other, o));
-                }
+    // A materialize just APPLIED (atomically: guarded despawn + block
+    // placement at the first replaceable cell scanning up — see
+    // scheduler::apply_event). Emit the follow-up notifies for the
+    // placement RUN: the synthesized BlockSet in the write log reaches
+    // replicas/clients but does not evaluate rules, so fluids/gravity/
+    // entity wakes around the placed cell fire from here. We can't know
+    // which cell apply chose, so we over-notify the whole contended run
+    // (old cell up through the post-apply solid stretch) — idempotent
+    // and short (its length IS the contention depth).
+    if let EventPayload::EntityMaterialize { old, .. } = payload {
+        let base = old.pos.block_pos();
+        let mut events = Vec::new();
+        let mut y = base.y;
+        loop {
+            let cell = BlockPos::new(base.x, y, base.z);
+            events.extend(super::helpers::notify_neighbors(cell));
+            events.extend(wakes_near(world, cell));
+            if crate::block::is_replaceable(world.get_block(cell)) || y > base.y + 64 {
+                break;
             }
-            if let Some((rid, rstate)) = resident {
-                return vec![Event {
-                    payload: EventPayload::EntitySet { id: rid, old: Some(rstate), new: None },
-                }];
-            }
+            y += 1;
         }
-        return Vec::new();
+        return events;
     }
 
     let Some((id, woken)) = kinematics_subject(payload) else {
@@ -339,54 +331,29 @@ pub fn falling_block_kinematics(world: &World, payload: &EventPayload) -> Vec<Ev
     }
 
     if is_still(&cur) && supported(world, cur.pos) {
-        let cell = cur.pos.block_pos();
-        // Cell already solid (a neighbor's stack claimed it first): climb
-        // one cell and re-check. Each hop is one guarded event;
-        // convergence is bounded by stack height.
-        if !crate::block::is_replaceable(world.get_block(cell)) {
-            return vec![Event {
-                payload: EventPayload::EntitySet { id, old: Some(cur), new: Some(bumped_up(world, &cur)) },
-            }];
-        }
-        // Landed: write the block. The entity stays alive until that
-        // write APPLIES (the BlockSet arm above then despawns it); if the
-        // write dies at the world guard, the winner's BlockSet wakes us
-        // and we bump. Sand is conserved on every path.
-        let mut events = vec![super::helpers::block_set(cell, world.get_block(cell), aux_block(cur.aux))];
-        events.extend(super::helpers::notify_neighbors(cell));
-        return events;
+        // Landed: ONE atomic conversion event. Contention (stolen cells,
+        // co-landing stacks, region-handoff dual ownership) is resolved
+        // inside its apply — the entity guard is the commit point and
+        // the upward scan is the climb. No bumps, no resident scans.
+        return vec![Event {
+            payload: EventPayload::EntityMaterialize {
+                id,
+                old: cur,
+                block: aux_block(cur.aux),
+            },
+        }];
     }
 
     vec![plan_next(world, id, cur, woken)]
 }
 
-/// One cell up from a blocked landing — a REST state atop the stolen cell
-/// (which is solid, so support is definitional). Rest states re-enter the
-/// landing branch on application, so climbs chain through the immediate
-/// lane with NO timers: a bump is bookkeeping, not physics, and must not
-/// pay the 25 ms segment quantum per hop (at 16-layer density that
-/// quantization alone made stacks grow slower than vanilla).
-fn bumped_up(world: &World, s: &EntityState) -> EntityState {
-    let cell = s.pos.block_pos();
-    EntityState {
-        pos: Vec3::new(s.pos.x, (cell.y + 1) as f64 + 0.01, s.pos.z),
-        vel: Vec3::ZERO,
-        stamp: world.now(),
-        ..*s
-    }
-}
-
 // ── Wake-on-block-change ─────────────────────────────────────────────────
 
-/// When a block changes, wake nearby entities so they re-verify support /
-/// clearance. Column-granular (±1 block column): waking a still-supported
-/// entity is a cheap no-op (it re-sleeps), and `EntityWake`
-/// dedup-coalesces in the graph. (This was chunk-granular first — at 160k
-/// entities a whole-chunk scan per BlockSet dominated the entire cascade.)
-pub fn entity_block_wake(world: &World, payload: &EventPayload) -> Vec<Event> {
-    let EventPayload::BlockSet { pos, .. } = payload else {
-        return Vec::new();
-    };
+/// Wake events for entities whose support or path the change at `pos`
+/// could affect: ±1 block column, at-or-above the cell. Waking a
+/// still-supported entity is a cheap no-op (it re-sleeps), and
+/// `EntityWake` dedup-coalesces in the graph.
+fn wakes_near(world: &World, pos: BlockPos) -> Vec<Event> {
     let mut events = Vec::new();
     for dx in -1..=1 {
         for dz in -1..=1 {
@@ -396,7 +363,6 @@ pub fn entity_block_wake(world: &World, payload: &EventPayload) -> Vec<Event> {
                 if s.kind == KIND_PLAYER {
                     continue;
                 }
-                // At-or-above the changed cell (support or path affected).
                 if s.pos.y >= pos.y as f64 - 1.0 {
                     events.push(Event {
                         payload: EventPayload::EntityWake { id, at: s.pos.block_pos() },
@@ -406,4 +372,15 @@ pub fn entity_block_wake(world: &World, payload: &EventPayload) -> Vec<Event> {
         }
     }
     events
+}
+
+/// When a block changes, wake nearby entities so they re-verify support /
+/// clearance. Column-granular (±1 block column). (This was chunk-granular
+/// first — at 160k entities a whole-chunk scan per BlockSet dominated the
+/// entire cascade.)
+pub fn entity_block_wake(world: &World, payload: &EventPayload) -> Vec<Event> {
+    let EventPayload::BlockSet { pos, .. } = payload else {
+        return Vec::new();
+    };
+    wakes_near(world, *pos)
 }

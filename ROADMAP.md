@@ -315,13 +315,16 @@ causality is the only ordering.
       materialize-first, despawn-on-effective-write, bump-up-on-blocked
       (sand conserved exactly at 160k, 16-deep stacks). Per-column entity
       index (per-chunk scans dominated the cascade at density).
-      **bench_entities (160k falling entities, the vanilla 6e workload):
-      5.5 s wall vs vanilla's <12.3 s CPU-saturated — and our wall is
-      mostly the physics' own fall time (~1.7 s) + stacking choreography,
-      ~33 events/entity total, CPU idle between deadlines. Sparse 10k:
-      1.77 s ≈ pure fall time, 9 events/entity (vanilla: 2.20 s floor).**
-      Open: conversion vs rebalancer dual-ownership (~0.2% dupes with
-      rebalancing on; bench runs rebalance-off; see design doc §8.7).
+      **bench_entities (160k falling entities, the vanilla 6e workload,
+      REBALANCER ON): 4.5 s wall vs vanilla's <12.3 s CPU-saturated —
+      wall is mostly the physics' own fall time (~1.7 s), 13.3
+      events/entity, CPU idle between deadlines, sand conserved exactly
+      across repeated runs. Sparse 10k: 1.77 s ≈ pure fall time,
+      9 events/entity (vanilla: 2.20 s floor).** Conversion is the
+      engine's one cross-store atom (`EntityMaterialize`: guarded despawn
+      = commit point + in-apply upward placement scan + synthesized
+      write-log entries) — closes the dual-ownership hole AND deleted the
+      bump/resident choreography (design doc §8.6–8.7).
 - [x] Players unified into EntityStore ✓ (2026-07-01, position authority):
       each connection mirrors its player as a `KIND_PLAYER` entity
       (high-bit id namespace; rotations packed in aux) — guarded spawn at

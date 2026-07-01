@@ -292,22 +292,31 @@ Then, in order:
    `BlockSet` appearing in the WRITE LOG — the log only ever contains the
    one effective write for a contested cell. `BlockAction.drop_item` +
    per-batch drop-watch in the worker.
-6. **Conversion atomicity** (new, solved for FallingBlock at 160k scale):
-   entity→block conversion spans two stores, so it CANNOT be one event
-   pair — every combination of (despawn, block-write) emitted together
-   loses or duplicates sand under contention. The stable shape:
-   **materialize first, despawn as a consequent of the effective block
-   write** (the write-log/rule-eval chain is the atomicity primitive),
-   with blocked landings BUMPING one cell up as immediate-lane rest
-   states. Sand is then conserved on every path — verified exactly at
-   160k with 16-deep co-column stacking.
-7. **OPEN — conversion vs region-handoff dual ownership**: the 6d
-   rebalancer's transient dual-ownership window can reorder a landing's
-   despawn against a wake-bump across two workers (~0.2% duplication at
-   160k with rebalancing on). Block rules tolerate dual windows by
-   confluence; cross-store conversions don't yet. Options: quiesce-region
-   handoff for entity-resident regions, or make conversion single-event
-   (engine-level combined payload). Decide with players-in-EntityStore.
+6. **Conversion atomicity — RESOLVED via `EntityMaterialize`** (after two
+   generations of multi-event designs failed at scale): entity→block
+   conversion spans two stores, and NO composition of separately-guarded
+   despawn + block-write events conserves matter under contention —
+   emit-both duplicates (despawn loses its guard race, block lands
+   anyway), despawn-first loses (co-resting entities both pass the
+   free-cell check), materialize-first + bump-on-wake loses FIFO ordering
+   under dual ownership. The answer is the engine's only cross-store
+   transaction: `EventPayload::EntityMaterialize { id, old, block }`,
+   whose APPLY does guarded-despawn (the entity entry lock is a
+   process-wide commit point) then places the block at the first
+   replaceable cell scanning UP — co-landing stacking resolves inside the
+   same atom, and the vertical scan keeps placement in the same
+   chunk/owner. Apply SYNTHESIZES concrete `EntitySet`/`BlockSet` write-
+   log entries (replicas/clients replay outcomes, not intents); the
+   materialize rule over-notifies the contended run for fluids/wakes.
+   The game's replaceability predicate installs on `World` at
+   `physics::start` (fn pointer, like the clock).
+7. **Conversion vs region-handoff dual ownership — RESOLVED by §6**: the
+   commit point is a store lock, not worker-local ordering, so
+   dual-ownership windows cannot split the transition. Standing proof:
+   bench_entities runs REBALANCE-ON — 160,000/160,000 conserved across
+   repeated runs (previously ~0.2% duplication), and the atomic form also
+   deleted the bump/resident machinery: ~33 → 13.3 events/entity,
+   5.5 s → 4.5 s wall.
 
 ## 9. MVP results (2026-07-01)
 

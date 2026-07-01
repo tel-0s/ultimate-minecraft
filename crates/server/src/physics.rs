@@ -448,6 +448,11 @@ pub fn start(
         opts.workers
     };
 
+    // The atomic materialize apply (engine) needs the game's notion of
+    // "displaceable" (fluids, air) — install it once here, the chokepoint
+    // every server/peer/test/bench passes through.
+    world.set_replaceable_fn(crate::block::is_replaceable);
+
     let assignment = Arc::new(Assignment::new());
     let region_loads: Arc<DashMap<Region, u64>> = Arc::new(DashMap::new());
     let pending = Arc::new(AtomicI64::new(0));

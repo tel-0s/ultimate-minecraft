@@ -93,6 +93,10 @@ where
                     world.entities().set_entity(*id, old.as_ref(), new.as_ref()) && old != new
                 }
                 EventPayload::EntityWake { .. } => true,
+                // This harness predates entities; the compound conversion
+                // needs the real scheduler's apply (synthesized log). No
+                // scenario here emits it (instant-gravity rule set).
+                EventPayload::EntityMaterialize { .. } => false,
                 EventPayload::After { .. } => false,
             };
             graph.mark_executed(id);

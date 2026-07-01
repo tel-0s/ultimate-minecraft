@@ -386,6 +386,8 @@ impl CausalGraph {
             EventPayload::BlockNotify { .. }
             | EventPayload::LightNotify { .. }
             | EventPayload::EntityWake { .. }
+            // Compound: its APPLY synthesizes the concrete log entries.
+            | EventPayload::EntityMaterialize { .. }
             | EventPayload::After { .. } => {}
         }
     }
@@ -515,6 +517,10 @@ impl CausalGraph {
                 EventPayload::EntityWake { id, .. } => {
                     (format!("Wake entity {}", id.0), "#fde2c5")
                 }
+                EventPayload::EntityMaterialize { id, block, .. } => (
+                    format!("Materialize entity {} -> {:?}", id.0, block),
+                    "#d1c4e9",
+                ),
                 EventPayload::After { at, inner } => (
                     format!("After {}ns: {:?}", at, std::mem::discriminant(inner.as_ref())),
                     "#e7d6f5",

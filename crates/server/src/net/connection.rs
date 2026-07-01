@@ -1577,12 +1577,18 @@ fn item_uuid(id: ultimate_engine::world::entity::EntityId) -> uuid::Uuid {
     uuid::Uuid::from_u64_pair(0x554D_435F_4954_454D, id.0) // "UMC_ITEM"
 }
 
-/// The MC item rendered for a dropped block (name-based mapping; falls
-/// back to stone for blocks without a same-named item).
+/// The MC item rendered for a dropped block. Resolves the real block
+/// name for ANY state via azalea's block trait (crate::block::name only
+/// covers a handful of constants and returns "block#N" otherwise, which
+/// silently fell back to stone for most drops). Blocks without a
+/// same-named item still fall back to stone.
 fn dropped_item_kind(block: ultimate_engine::world::block::BlockId) -> azalea_registry::builtin::ItemKind {
-    crate::block::name(block)
-        .parse()
-        .unwrap_or(azalea_registry::builtin::ItemKind::Stone)
+    use azalea_block::{BlockState, BlockTrait};
+    let Ok(state) = BlockState::try_from(block.0 as u32) else {
+        return azalea_registry::builtin::ItemKind::Stone;
+    };
+    let b: Box<dyn BlockTrait> = Box::<dyn BlockTrait>::from(state);
+    b.id().parse().unwrap_or(azalea_registry::builtin::ItemKind::Stone)
 }
 
 /// Is this an engine entity kind we project to clients?
@@ -1610,7 +1616,13 @@ async fn send_entity_spawn<W: AsyncWrite + Unpin + Send>(
         uuid: item_uuid(id),
         entity_type: if falling { EntityKind::FallingBlock } else { EntityKind::Item },
         position: Vec3 { x: state.pos.x, y: state.pos.y, z: state.pos.z },
-        movement: LpVec3::Zero,
+        // Initial velocity (blocks/tick on the wire): the client animates
+        // the pop arc / fall locally between our segment corrections.
+        movement: LpVec3::from_vec3(Vec3 {
+            x: state.vel.x / 20.0,
+            y: state.vel.y / 20.0,
+            z: state.vel.z / 20.0,
+        }),
         x_rot: 0,
         y_rot: 0,
         y_head_rot: 0,

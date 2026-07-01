@@ -78,6 +78,25 @@ pub enum EventPayload {
     /// `at` is a routing hint (the entity's block position at emission).
     EntityWake { id: EntityId, at: BlockPos },
 
+    /// ATOMIC entity→block conversion: despawn the entity (guarded on
+    /// `old`) and place `block` at the first replaceable cell scanning UP
+    /// from the entity's cell — all inside one `apply_event`. This is the
+    /// only cross-store transaction in the engine, and it exists because
+    /// no composition of separately-guarded despawn + block-write events
+    /// conserves matter under contention or region-handoff dual
+    /// ownership: the entity entry lock arbitrates the transition
+    /// process-wide, and the block write happens only after winning it.
+    /// The upward scan resolves co-landing contention (stacking) inside
+    /// the same atom. Apply synthesizes concrete `EntitySet`/`BlockSet`
+    /// write-log entries so replicas and clients see exact outcomes.
+    /// The scan is vertical, so placement stays in the payload's chunk —
+    /// ownership routing is unaffected.
+    EntityMaterialize {
+        id: EntityId,
+        old: EntityState,
+        block: BlockId,
+    },
+
     /// A timed event (Phase 5): `inner` must not execute before engine time
     /// `at`. The causal graph itself stays pure-causal — the physics
     /// worker's router unwraps `After` into its timer heap and inserts
@@ -113,6 +132,7 @@ impl EventPayload {
                 .map(|s| vec![s.pos.block_pos()])
                 .unwrap_or_default(),
             EventPayload::EntityWake { at, .. } => vec![*at],
+            EventPayload::EntityMaterialize { old, .. } => vec![old.pos.block_pos()],
             EventPayload::After { inner, .. } => inner.positions(),
         }
     }
@@ -137,6 +157,7 @@ impl EventPayload {
                 .map(|s| s.chunk())
                 .unwrap_or(ChunkPos::new(0, 0)),
             EventPayload::EntityWake { at, .. } => at.chunk(),
+            EventPayload::EntityMaterialize { old, .. } => old.chunk(),
             EventPayload::After { inner, .. } => inner.chunk(),
         }
     }
@@ -167,6 +188,7 @@ impl EventPayload {
             | EventPayload::LightSet { .. }
             | EventPayload::LightBatch { .. }
             | EventPayload::EntitySet { .. }
+            | EventPayload::EntityMaterialize { .. }
             // Timed events never coalesce (their identity includes `at`;
             // two despawn timers for different entities share nothing).
             | EventPayload::After { .. } => None,

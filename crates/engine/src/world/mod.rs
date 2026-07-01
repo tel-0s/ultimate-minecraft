@@ -24,6 +24,9 @@ pub struct World {
     /// changing the `RuleFn(&World, &EventPayload)` signature. Tests swap
     /// in a `ManualClock`.
     clock: std::sync::RwLock<std::sync::Arc<dyn crate::causal::clock::Clock>>,
+    /// Game-installed replaceability predicate (stored as a raw fn
+    /// pointer; null = AIR-only default). See [`Self::set_replaceable_fn`].
+    replaceable: std::sync::atomic::AtomicPtr<()>,
     /// Chunks that have been modified since the last save.
     dirty: DashSet<ChunkPos>,
     /// Chunks whose sky light has already been initialized.
@@ -38,6 +41,7 @@ impl World {
             clock: std::sync::RwLock::new(std::sync::Arc::new(
                 crate::causal::clock::MonotonicClock::new(),
             )),
+            replaceable: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             dirty: DashSet::new(),
             sky_lit: DashSet::new(),
         }
@@ -51,6 +55,27 @@ impl World {
 
     pub fn set_clock(&self, clock: std::sync::Arc<dyn crate::causal::clock::Clock>) {
         *self.clock.write().expect("clock lock") = clock;
+    }
+
+    /// Install the game's "can a block be displaced" predicate (fluids,
+    /// air, tall grass...). Used by the atomic materialize apply; the
+    /// engine itself only knows AIR. Set once at startup.
+    pub fn set_replaceable_fn(&self, f: fn(BlockId) -> bool) {
+        self.replaceable
+            .store(f as *mut (), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Is this block displaceable by a materializing entity?
+    pub fn is_replaceable(&self, id: BlockId) -> bool {
+        let p = self.replaceable.load(std::sync::atomic::Ordering::Relaxed);
+        if p.is_null() {
+            id == BlockId::AIR
+        } else {
+            // SAFETY: only ever stored from `set_replaceable_fn` with a
+            // `fn(BlockId) -> bool` pointer; fn pointers are 'static.
+            let f: fn(BlockId) -> bool = unsafe { std::mem::transmute(p) };
+            f(id)
+        }
     }
 
     pub fn clock(&self) -> std::sync::Arc<dyn crate::causal::clock::Clock> {

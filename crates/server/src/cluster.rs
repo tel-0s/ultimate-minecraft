@@ -178,6 +178,12 @@ fn encode_payload(buf: &mut Vec<u8>, p: &EventPayload) {
             buf.extend_from_slice(&at.to_le_bytes());
             encode_payload(buf, inner);
         }
+        EventPayload::EntityMaterialize { id, old, block } => {
+            buf.push(8);
+            buf.extend_from_slice(&id.0.to_le_bytes());
+            put_opt_entity_state(buf, &Some(*old));
+            put_u16(buf, block.0);
+        }
     }
 }
 
@@ -236,6 +242,11 @@ fn decode_payload(r: &mut Reader) -> Result<EventPayload> {
         7 => EventPayload::After {
             at: r.u64()?,
             inner: Box::new(decode_payload(r)?),
+        },
+        8 => EventPayload::EntityMaterialize {
+            id: EntityId(r.u64()?),
+            old: read_opt_entity_state(r)?.ok_or_else(|| anyhow!("materialize without state"))?,
+            block: BlockId(r.u16()?),
         },
         other => return Err(anyhow!("bad payload tag {other}")),
     })
@@ -864,6 +875,9 @@ fn apply_replica_writes(world: &World, payloads: &[EventPayload]) {
             EventPayload::BlockNotify { .. }
             | EventPayload::LightNotify { .. }
             | EventPayload::EntityWake { .. }
+            // Never write-synced: its apply synthesizes concrete
+            // EntitySet/BlockSet entries which sync instead.
+            | EventPayload::EntityMaterialize { .. }
             | EventPayload::After { .. } => {}
         }
     }

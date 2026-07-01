@@ -54,13 +54,12 @@ fn main() {
         ultimate_server::rules::standard_with_falling_blocks,
         ultimate_server::event_bus::SpatialBus::new(),
         None,
-        // Rebalancing OFF: the 6d rebalancer's transient dual-ownership
-        // windows can reorder a landing's despawn against a wake-bump
-        // across two workers, duplicating ~0.2% of conversions. Entity
-        // conversion atomicity under region handoff is an open item
-        // (docs/phase5-entities.md §8); block rules tolerate dual windows
-        // by confluence, cross-store conversions don't yet.
-        PhysicsOptions { workers: 0, rebalance: false, ..Default::default() },
+        // Rebalancing ON — deliberately. Conversion is now the atomic
+        // EntityMaterialize apply (entity guard = commit point, placement
+        // inside the same apply), so region-handoff dual-ownership
+        // windows can no longer duplicate or lose sand. This bench run
+        // is the standing proof.
+        PhysicsOptions { workers: 0, rebalance: true, ..Default::default() },
     );
 
     // Spawn N falling-block entities in the air, mirroring the vanilla
