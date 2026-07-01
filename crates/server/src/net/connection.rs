@@ -1077,9 +1077,33 @@ where
                                 }
                             }
 
-                            // ── Block placing ───────────────────────────
+                            // ── Block placing / interaction ─────────────
                             ServerboundGamePacket::UseItemOn(place) => {
                                 let hit = &place.block_hit;
+
+                                // Right-clicking an interactive block uses
+                                // it instead of placing (levers, Phase-5.5
+                                // redstone MVP).
+                                let clicked = ultimate_engine::world::position::BlockPos::new(
+                                    hit.block_pos.x as i64,
+                                    hit.block_pos.y as i64,
+                                    hit.block_pos.z as i64,
+                                );
+                                let clicked_id = world.get_block(clicked);
+                                if let Some(toggled) = crate::rules::redstone::toggle_lever(clicked_id) {
+                                    physics.submit_action(BlockAction {
+                                        pos: clicked,
+                                        old: clicked_id,
+                                        new: toggled,
+                                        update_stairs: false,
+                                        drop_item: false,
+                                    });
+                                    let ack: ClientboundGamePacket = ClientboundBlockChangedAck {
+                                        seq: place.seq,
+                                    }.into_variant();
+                                    write_packet(&ack, write, compression, cipher_enc).await?;
+                                    continue;
+                                }
                                 // Calculate target position (adjacent to clicked face)
                                 let target = match hit.direction {
                                     Direction::Down  => azalea_core::position::BlockPos::new(hit.block_pos.x, hit.block_pos.y - 1, hit.block_pos.z),
@@ -1548,6 +1572,7 @@ fn item_to_block_kind(item: azalea_registry::builtin::ItemKind) -> Option<azalea
     match item {
         ItemKind::WaterBucket => return Some(BlockKind::Water),
         ItemKind::LavaBucket => return Some(BlockKind::Lava),
+        ItemKind::Redstone => return Some(BlockKind::RedstoneWire),
         _ => {}
     }
 

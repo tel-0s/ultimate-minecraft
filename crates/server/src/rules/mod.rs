@@ -2,6 +2,7 @@ pub mod block_updates;
 pub mod entity;
 pub mod helpers;
 pub mod light;
+pub mod redstone;
 
 use ultimate_engine::rules::RuleSet;
 
@@ -17,6 +18,7 @@ pub fn standard() -> RuleSet {
     rules.add(light::light_propagation);
     rules.add(entity::item_kinematics);
     rules.add(entity::entity_block_wake);
+    rules.add(redstone::redstone);
     rules
 }
 
@@ -34,5 +36,6 @@ pub fn standard_with_falling_blocks() -> RuleSet {
     rules.add(entity::item_kinematics);
     rules.add(entity::falling_block_kinematics);
     rules.add(entity::entity_block_wake);
+    rules.add(redstone::redstone);
     rules
 }

@@ -868,6 +868,30 @@ sand-rain across a 24×24-chunk arena, regions split ~50/50):
         cascade → WriteSync → replica → spatial bus → clients; the peer
         process reported ALL 10,313 physics events executed there.
 
+## Phase 7 -- Gameplay (wishlist-driven)
+
+> With the scale foundation and entity substrate complete, gameplay
+> features land as rules on existing rails.
+
+- [x] **Redstone MVP** ✓ (2026-07-01, from docs/WISHLIST.md): lever
+      (right-click toggle), wire, lamp, torch. Wire power is solved as a
+      **synchronous multi-source BFS over the connected component inside
+      one rule evaluation** — the same medicine as the light engine, and
+      necessary: per-event neighbor relaxation (`max(neighbor)−1`) is the
+      distance-vector count-to-infinity problem and settles on nonzero
+      ghost fixpoints when a source dies (observed: a drained wire run
+      stuck at [11,12,11,10,9]). Torches invert with a 100 ms `After`
+      delay — **a redstone tick is a LOCAL timed event, not a global
+      tick**; signal propagation runs at causal speed (µs per component
+      re-solve), not one cell per game tick. Tests: attenuation 15→11
+      along a run, full drain to 0, lamp tracking, torch inversion lag,
+      six-flip oscillation in virtual time.
+      Post-MVP: wire climbing (up/down connections — enables true torch
+      clocks), repeaters/comparators, buttons/pressure plates, pistons.
+- [ ] Localized weather simulation (wishlist)
+- [ ] Graph rewrite rule markup language (wishlist; worldgen JSON presets
+      are the precedent)
+
 ---
 
 ## Design Principles
