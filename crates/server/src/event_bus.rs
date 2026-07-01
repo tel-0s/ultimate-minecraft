@@ -312,17 +312,27 @@ pub fn collect_block_changes(write_log: &[EventPayload]) -> Vec<(BlockPos, Block
         .collect()
 }
 
-/// Extract entity transitions from the write log (Phase 5).
+/// Extract entity transitions from the write log (Phase 5). Player
+/// entities are excluded: their movement reaches clients through the
+/// registry's `PlayerEvent::Moved` path (which carries name/rotation
+/// semantics); duplicating them here would double every move delivery.
+/// Replicas still receive player `EntitySet`s — those ride `WriteSync`
+/// payloads, not this bus.
 pub fn collect_entity_changes(write_log: &[EventPayload]) -> Vec<EntityChange> {
     write_log
         .iter()
         .filter_map(|payload| match payload {
-            EventPayload::EntitySet { id, old, new } => match (old, new) {
-                (None, Some(s)) => Some(EntityChange::Spawn { id: *id, state: *s }),
-                (Some(_), Some(s)) => Some(EntityChange::Move { id: *id, state: *s }),
-                (Some(s), None) => Some(EntityChange::Despawn { id: *id, last: *s }),
-                (None, None) => None,
-            },
+            EventPayload::EntitySet { id, old, new } => {
+                if new.or(*old).is_some_and(|s| s.kind == crate::rules::entity::KIND_PLAYER) {
+                    return None;
+                }
+                match (old, new) {
+                    (None, Some(s)) => Some(EntityChange::Spawn { id: *id, state: *s }),
+                    (Some(_), Some(s)) => Some(EntityChange::Move { id: *id, state: *s }),
+                    (Some(s), None) => Some(EntityChange::Despawn { id: *id, last: *s }),
+                    (None, None) => None,
+                }
+            }
             _ => None,
         })
         .collect()

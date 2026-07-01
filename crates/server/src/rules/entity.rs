@@ -20,7 +20,14 @@ use ultimate_engine::world::World;
 
 use crate::block;
 
-/// Dropped item. (0 is reserved for players, mirrored in later work.)
+/// A player (Phase 5 unification): position authority lives in the
+/// EntityStore — rules see players as ordinary spatial actors, and
+/// replicas track them through WriteSync. Identity (name/uuid/tab) and
+/// the movement RENDER path stay with `PlayerRegistry`; player entities
+/// are externally driven (their connection is the only writer), so no
+/// kinematics rule matches them and wakes skip them.
+pub const KIND_PLAYER: EntityKind = EntityKind(0);
+/// Dropped item.
 pub const KIND_ITEM: EntityKind = EntityKind(1);
 /// A detached falling block (vanilla sand/gravel parity). `aux` = the
 /// block id; on landing it converts back into a block (or a dropped item
@@ -52,6 +59,36 @@ pub fn aux_despawn_at(aux: u64) -> Nanos {
 
 pub fn aux_block(aux: u64) -> BlockId {
     BlockId((aux & 0xFFFF) as u16)
+}
+
+// ── Player entities ──────────────────────────────────────────────────────
+
+/// EntityStore id for a player, derived from the registry's i32 entity
+/// id in a high-bit namespace so it can never collide with allocated ids
+/// (items, falling blocks — counter-based, node-salted in bits 48..63).
+pub fn player_entity_id(registry_eid: i32) -> ultimate_engine::world::entity::EntityId {
+    ultimate_engine::world::entity::EntityId(0x8000_0000_0000_0000 | registry_eid as u32 as u64)
+}
+
+/// Player `aux` packs the view rotations (engine state is game-agnostic;
+/// rotations matter only to renderers and future AI rules).
+pub fn player_aux(y_rot: f32, x_rot: f32) -> u64 {
+    ((y_rot.to_bits() as u64) << 32) | x_rot.to_bits() as u64
+}
+
+pub fn player_state(
+    pos: Vec3,
+    y_rot: f32,
+    x_rot: f32,
+    stamp: Nanos,
+) -> EntityState {
+    EntityState {
+        kind: KIND_PLAYER,
+        pos,
+        vel: Vec3::ZERO,
+        stamp,
+        aux: player_aux(y_rot, x_rot),
+    }
 }
 
 // ── Spawning ─────────────────────────────────────────────────────────────
@@ -355,6 +392,10 @@ pub fn entity_block_wake(world: &World, payload: &EventPayload) -> Vec<Event> {
         for dz in -1..=1 {
             for id in world.entities().in_column(pos.x + dx, pos.z + dz) {
                 let Some(s) = world.entities().get(id) else { continue };
+                // Players are externally driven — never woken.
+                if s.kind == KIND_PLAYER {
+                    continue;
+                }
                 // At-or-above the changed cell (support or path affected).
                 if s.pos.y >= pos.y as f64 - 1.0 {
                     events.push(Event {

@@ -753,17 +753,38 @@ where
     // RAII guard so deregister always runs, even if a `?` early-exits the
     // function (e.g. client TCP drop). Without this the player stays in
     // `registry.snapshot()` forever, showing as "online" in the multiplayer
-    // ping screen until the server restarts.
+    // ping screen until the server restarts. Also despawns the player's
+    // EntityStore mirror (safe to read-then-guard: this connection was its
+    // only writer, and it is gone).
     struct DeregisterGuard<'a> {
         registry: &'a PlayerRegistry,
         conn_id: u64,
+        world: &'a World,
+        physics: crate::physics::PhysicsHandle,
+        player_eid: i32,
     }
     impl Drop for DeregisterGuard<'_> {
         fn drop(&mut self) {
             self.registry.deregister(self.conn_id);
+            let pid = crate::rules::entity::player_entity_id(self.player_eid);
+            if let Some(cur) = self.world.entities().get(pid) {
+                self.physics.submit_events(vec![ultimate_engine::causal::event::Event {
+                    payload: ultimate_engine::causal::event::EventPayload::EntitySet {
+                        id: pid,
+                        old: Some(cur),
+                        new: None,
+                    },
+                }]);
+            }
         }
     }
-    let _deregister_guard = DeregisterGuard { registry, conn_id };
+    let _deregister_guard = DeregisterGuard {
+        registry,
+        conn_id,
+        world,
+        physics: physics.clone(),
+        player_eid: entity_id,
+    };
 
     // Spatial subscription (Phase 6f): world changes and entity moves are
     // delivered only for regions near this player; re-pointed on chunk
@@ -869,6 +890,24 @@ where
     // lives in this stack frame for the connection's whole lifetime —
     // ~0.5 MB × 10k connections was gigabytes in the 10k load test.
     drop(existing_players);
+
+    // Player mirror in the EntityStore (Phase 5 unification): position
+    // authority for RULES and cluster replicas. The registry keeps
+    // identity and the movement render path. Guarded spawn through
+    // physics so it write-logs (replicas learn it via WriteSync).
+    let player_pid = crate::rules::entity::player_entity_id(entity_id);
+    physics.submit_events(vec![ultimate_engine::causal::event::Event {
+        payload: ultimate_engine::causal::event::EventPayload::EntitySet {
+            id: player_pid,
+            old: None,
+            new: Some(crate::rules::entity::player_state(
+                ultimate_engine::world::entity::Vec3::new(spawn_x, spawn_y, spawn_z),
+                0.0,
+                0.0,
+                world.now(),
+            )),
+        },
+    }]);
 
     // Step 3: Register in the shared registry -- this broadcasts PlayerEvent::Joined
     // to all other connections so they can send the tab-list + entity spawn packets.
@@ -1128,6 +1167,10 @@ where
                                     conn_id, player_x, player_y, player_z,
                                     player_y_rot, player_x_rot, pkt.flags.on_ground,
                                 );
+                                mirror_player_entity(
+                                    world, physics, player_pid,
+                                    player_x, player_y, player_z, player_y_rot, player_x_rot,
+                                );
                                 update_loaded_chunks(
                                     write, compression, cipher_enc, world,
                                     &*worldgen,
@@ -1155,6 +1198,10 @@ where
                                     conn_id, player_x, player_y, player_z,
                                     player_y_rot, player_x_rot, pkt.flags.on_ground,
                                 );
+                                mirror_player_entity(
+                                    world, physics, player_pid,
+                                    player_x, player_y, player_z, player_y_rot, player_x_rot,
+                                );
                                 update_loaded_chunks(
                                     write, compression, cipher_enc, world,
                                     &*worldgen,
@@ -1178,6 +1225,10 @@ where
                                 registry.update_position(
                                     conn_id, player_x, player_y, player_z,
                                     player_y_rot, player_x_rot, pkt.flags.on_ground,
+                                );
+                                mirror_player_entity(
+                                    world, physics, player_pid,
+                                    player_x, player_y, player_z, player_y_rot, player_x_rot,
                                 );
                             }
 
@@ -1612,6 +1663,34 @@ async fn backfill_region_entities<W: AsyncWrite + Unpin + Send>(
         }
     }
     Ok(())
+}
+
+/// Mirror a player's position/rotation into the EntityStore (Phase 5).
+/// Guarded on the CURRENT store state read here — each update is
+/// independent, so a guard-dropped update (e.g. racing a cross-worker
+/// spawn) self-heals at the next move packet instead of desyncing a
+/// local cache chain. No-op until the spawn mirror has applied.
+fn mirror_player_entity(
+    world: &World,
+    physics: &crate::physics::PhysicsHandle,
+    pid: ultimate_engine::world::entity::EntityId,
+    x: f64,
+    y: f64,
+    z: f64,
+    y_rot: f32,
+    x_rot: f32,
+) {
+    use ultimate_engine::causal::event::{Event, EventPayload};
+    let Some(cur) = world.entities().get(pid) else { return };
+    let new_state = crate::rules::entity::player_state(
+        ultimate_engine::world::entity::Vec3::new(x, y, z),
+        y_rot,
+        x_rot,
+        world.now(),
+    );
+    physics.submit_events(vec![Event {
+        payload: EventPayload::EntitySet { id: pid, old: Some(cur), new: Some(new_state) },
+    }]);
 }
 
 /// Pick up nearby items: submit a guarded despawn for each item within

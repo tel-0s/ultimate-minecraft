@@ -223,6 +223,51 @@ fn action_crosses_nodes_and_mirrors_back() {
 }
 
 #[test]
+fn player_positions_replicate_across_nodes() {
+    // Phase 5 unification payoff: a player entity mirrored into physics
+    // on its gateway/owner node reaches every peer's replica store via
+    // WriteSync — the substrate for cross-node AOI, pickup, and AI
+    // awareness of players connected elsewhere.
+    let nodes = form_cluster(2, 2);
+
+    // Put the player in a chunk OWNED BY NODE 1, submitted from node 0
+    // (the "gateway" pattern: the entity event forwards to its owner).
+    let target = chunk_owned_by(1, 2);
+    let pos = ultimate_engine::world::entity::Vec3::new(
+        target.x as f64 * 16.0 + 8.5,
+        5.0,
+        target.z as f64 * 16.0 + 8.5,
+    );
+    let pid = ultimate_server::rules::entity::player_entity_id(42);
+    let s0 = ultimate_server::rules::entity::player_state(pos, 0.0, 0.0, nodes[0].world.now());
+    nodes[0].physics.submit_events(vec![Event {
+        payload: EventPayload::EntitySet { id: pid, old: None, new: Some(s0) },
+    }]);
+    assert!(wait_quiet(&nodes[0]));
+
+    for (i, n) in nodes.iter().enumerate() {
+        let s = n.world.entities().get(pid).unwrap_or_else(|| panic!("node {i} missing player"));
+        assert_eq!(s.pos, pos, "node {i} has the player's position");
+    }
+
+    // Move it (guarded on the OWNER's current state) and check both again.
+    let cur = nodes[1].world.entities().get(pid).expect("owner state");
+    let pos2 = ultimate_engine::world::entity::Vec3::new(pos.x + 3.0, 5.0, pos.z);
+    let s1 = ultimate_server::rules::entity::player_state(pos2, 90.0, 0.0, nodes[1].world.now());
+    nodes[0].physics.submit_events(vec![Event {
+        payload: EventPayload::EntitySet { id: pid, old: Some(cur), new: Some(s1) },
+    }]);
+    assert!(wait_quiet(&nodes[0]));
+    for (i, n) in nodes.iter().enumerate() {
+        assert_eq!(
+            n.world.entities().get(pid).map(|s| s.pos),
+            Some(pos2),
+            "node {i} tracked the move"
+        );
+    }
+}
+
+#[test]
 fn two_node_world_matches_single_node_run() {
     match_single_node(2);
 }

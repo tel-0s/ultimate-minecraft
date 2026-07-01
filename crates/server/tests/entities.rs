@@ -330,6 +330,70 @@ fn item_trajectory_is_identical_across_worker_counts() {
     assert_eq!(outcomes[0].stamp, outcomes[1].stamp);
 }
 
+// ── Players in the EntityStore (Phase 5 unification) ─────────────────────
+
+#[test]
+fn player_mirror_lives_in_store_but_stays_off_the_bus() {
+    let (world, _clock) = flat_world_manual_clock(2);
+    let bus = ultimate_server::event_bus::SpatialBus::new();
+    let (mut sub, mut rx) = bus.subscribe();
+    sub.set_view(0, 0, 4);
+    let handle = physics::start(
+        Arc::clone(&world),
+        ultimate_server::rules::standard,
+        Arc::clone(&bus),
+        None,
+        physics::PhysicsOptions { workers: 4, rebalance: false, ..Default::default() },
+    );
+
+    let pid = ultimate_server::rules::entity::player_entity_id(7);
+    let s0 = ultimate_server::rules::entity::player_state(
+        ultimate_engine::world::entity::Vec3::new(8.5, 5.0, 8.5),
+        90.0,
+        10.0,
+        world.now(),
+    );
+    handle.submit_events(vec![Event {
+        payload: EventPayload::EntitySet { id: pid, old: None, new: Some(s0) },
+    }]);
+    assert!(wait_for(|| world.entities().get(pid).is_some()), "player mirrored");
+
+    // Move: guarded on the store-current state, like the connection does.
+    let cur = world.entities().get(pid).unwrap();
+    let s1 = ultimate_server::rules::entity::player_state(
+        ultimate_engine::world::entity::Vec3::new(20.5, 5.0, 20.5),
+        180.0,
+        0.0,
+        world.now(),
+    );
+    handle.submit_events(vec![Event {
+        payload: EventPayload::EntitySet { id: pid, old: Some(cur), new: Some(s1) },
+    }]);
+    assert!(
+        wait_for(|| world.entities().get(pid).map(|s| s.pos.x) == Some(20.5)),
+        "player position updates in the store"
+    );
+    // Rules can find the player spatially.
+    assert!(world.entities().in_column(20, 20).contains(&pid));
+    assert!(!world.entities().in_column(8, 8).contains(&pid));
+
+    // Player transitions must NOT reach the spatial entity plane — their
+    // render path is PlayerEvent::Moved via the registry.
+    quiesce(&handle);
+    while let Ok(msg) = rx.try_recv() {
+        if let SpatialMsg::Entities(changes) = &*msg {
+            assert!(changes.is_empty(), "player leaked onto the entity bus: {changes:?}");
+        }
+    }
+
+    // Disconnect: guarded despawn.
+    let cur = world.entities().get(pid).unwrap();
+    handle.submit_events(vec![Event {
+        payload: EventPayload::EntitySet { id: pid, old: Some(cur), new: None },
+    }]);
+    assert!(wait_for(|| world.entities().is_empty()), "player despawned on disconnect");
+}
+
 // ── Spatial projection ───────────────────────────────────────────────────
 
 #[test]

@@ -322,7 +322,19 @@ causality is the only ordering.
       1.77 s ≈ pure fall time, 9 events/entity (vanilla: 2.20 s floor).**
       Open: conversion vs rebalancer dual-ownership (~0.2% dupes with
       rebalancing on; bench runs rebalance-off; see design doc §8.7).
-- [ ] Players unified into EntityStore (replaces `entity_spawn_cap` with true AOI)
+- [x] Players unified into EntityStore ✓ (2026-07-01, position authority):
+      each connection mirrors its player as a `KIND_PLAYER` entity
+      (high-bit id namespace; rotations packed in aux) — guarded spawn at
+      join, per-move store-read-guarded updates (self-healing, no cache
+      chain), despawn on disconnect. Rules now see players as ordinary
+      spatial actors, and **player positions replicate across cluster
+      nodes via WriteSync** (tested: submitted on node 0, owned by node 1,
+      tracked on both) — the substrate for cross-node AOI/pickup/AI.
+      Registry keeps identity + the movement RENDER path (players are
+      filtered off the spatial entity plane to avoid double delivery).
+      Remaining for full unification: entity-based player rendering
+      (retires `entity_spawn_cap` for real AOI), cross-gateway player
+      visibility.
 - [ ] Mob spawning rules, basic mob AI (think = timed self-chained EntityWake;
       AI cadence is a per-mob rate, not a global tick)
 
