@@ -899,8 +899,15 @@ sand-rain across a 24×24-chunk arena, regions split ~50/50):
       re-solve), not one cell per game tick. Tests: attenuation 15→11
       along a run, full drain to 0, lamp tracking, torch inversion lag,
       six-flip oscillation in virtual time.
-      Post-MVP: wire climbing (up/down connections — enables true torch
-      clocks), repeaters/comparators, buttons/pressure plates, pistons.
+      Post-MVP ✓ (2026-08-21): wire climbing (occlusion-checked up/down
+      connections), buttons (timed self-release), pressure plates
+      (entity-substrate-driven: player mirrors press them; edge-triggered
+      by EntitySet transitions + while-pressed backstop poll), repeaters
+      (directional diode via emitted_power, 1-4 tick delay, click-cycled;
+      diode placement facing fixed to vanilla). Remaining: comparators,
+      pistons (move blocks — the causal model's most interesting case),
+      weighted plates, non-solid collision shapes (items/mobs currently
+      land ON plates instead of in their cell).
 - [ ] Localized weather simulation (wishlist)
 - [ ] Graph rewrite rule markup language (wishlist; worldgen JSON presets
       are the precedent)
