@@ -22,39 +22,10 @@ impl Scheduler {
 
     // ── Sequential execution ────────────────────────────────────────────
 
+    /// Sequential step: every consequent stays local. This is
+    /// [`step_routed`](Self::step_routed) with the identity router.
     pub fn step(&self, world: &World, graph: &mut CausalGraph, rules: &RuleSet) -> usize {
-        let batch = graph.drain_ready(self.max_events_per_step);
-        let mut executed = 0;
-        let mut synth = Vec::new();
-
-        for id in batch {
-            let event = match graph.get(id) {
-                Some(node) => node.event.clone(),
-                None => continue,
-            };
-
-            let effective = apply_event(world, &event.payload, &mut synth);
-            graph.mark_executed(id);
-            executed += 1;
-
-            if should_log(&event.payload, effective) {
-                graph.log_write(&event.payload);
-            }
-            for p in synth.drain(..) {
-                graph.log_write(&p);
-            }
-            if effective {
-                let consequents = rules.evaluate(world, &event.payload);
-                for new_event in consequents {
-                    graph.insert(new_event, vec![id]);
-                }
-            }
-            // All consequents are in; a pruning graph may now reap this
-            // node (it survives until its children execute otherwise).
-            graph.finish(id);
-        }
-
-        executed
+        self.step_routed(world, graph, rules, &mut |_, _| true)
     }
 
     /// Sequential step where every consequent passes through `route`
