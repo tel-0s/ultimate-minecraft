@@ -359,15 +359,16 @@ where
     // to the shared physics service and acknowledged immediately. All
     // resulting world changes — including our own — come back through the
     // event bus as `ChangeSource::Physics` batches.
-    use azalea_block::BlockState;
-    use azalea_core::direction::Direction;
+    
+use azalea_inventory::ItemStack;
+    
     use azalea_protocol::packets::game::{
         ClientboundBlockUpdate, ClientboundBlockChangedAck,
         s_player_action::Action,
     };
-    use ultimate_engine::world::block::BlockId;
+    
 
-    use crate::physics::BlockAction;
+    
 
     // Unique ID for this connection (used to filter self-originated bus messages).
     let conn_id = NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -552,10 +553,8 @@ where
     let mut player_z = spawn_z;
     let mut player_y_rot: f32 = 0.0;
     let mut player_x_rot: f32 = 0.0;
-    // Track hotbar contents and selected slot for creative placement.
-    use azalea_inventory::ItemStack;
-    let mut hotbar: [BlockState; 9] = [BlockState::AIR; 9];
-    let mut selected_slot: usize = 0;
+    // Creative inventory model lives in the gameplay layer.
+    let mut inventory = crate::gameplay::Inventory::default();
 
     // ── Main loop: keep-alive + handle incoming packets + bus ────────────
     let mut keepalive_timer = tokio::time::interval(Duration::from_secs(15));
@@ -676,18 +675,10 @@ where
                                         pos.x as i64, pos.y as i64, pos.z as i64,
                                     );
 
-                                    // Submit to the shared physics service; the
-                                    // cascade runs off this task. `old` is our
-                                    // observation — physics' stale-precondition
-                                    // guard drops the action if another event
-                                    // got to the cell first.
-                                    physics.submit_action(BlockAction {
-                                        pos: epos,
-                                        old: world.get_block(epos),
-                                        new: BlockId::AIR,
-                                        update_stairs: true,
-                                        drop_item: true,
-                                    });
+                                    // Gameplay decides the action; physics'
+                                    // stale-precondition guard drops it if
+                                    // another event got to the cell first.
+                                    physics.submit_action(crate::gameplay::break_action(&world, epos));
 
                                     // Acknowledge the sequence immediately; the
                                     // authoritative block updates arrive via the
@@ -704,75 +695,33 @@ where
                                 let hit = &place.block_hit;
 
                                 // Right-clicking an interactive block uses
-                                // it instead of placing (levers, Phase-5.5
-                                // redstone MVP).
+                                // it instead of placing (gameplay decides).
                                 let clicked = ultimate_engine::world::position::BlockPos::new(
                                     hit.block_pos.x as i64,
                                     hit.block_pos.y as i64,
                                     hit.block_pos.z as i64,
                                 );
-                                let clicked_id = world.get_block(clicked);
-                                if let Some(toggled) = crate::rules::redstone::toggle_lever(clicked_id) {
-                                    physics.submit_action(BlockAction {
-                                        pos: clicked,
-                                        old: clicked_id,
-                                        new: toggled,
-                                        update_stairs: false,
-                                        drop_item: false,
-                                    });
+                                if let Some(action) = crate::gameplay::use_block_action(&world, clicked) {
+                                    physics.submit_action(action);
                                     let ack: ClientboundGamePacket = ClientboundBlockChangedAck {
                                         seq: place.seq,
                                     }.into_variant();
                                     write_packet(&ack, write, compression, cipher_enc).await?;
                                     continue;
                                 }
-                                // Calculate target position (adjacent to clicked face)
-                                let target = match hit.direction {
-                                    Direction::Down  => azalea_core::position::BlockPos::new(hit.block_pos.x, hit.block_pos.y - 1, hit.block_pos.z),
-                                    Direction::Up    => azalea_core::position::BlockPos::new(hit.block_pos.x, hit.block_pos.y + 1, hit.block_pos.z),
-                                    Direction::North => azalea_core::position::BlockPos::new(hit.block_pos.x, hit.block_pos.y, hit.block_pos.z - 1),
-                                    Direction::South => azalea_core::position::BlockPos::new(hit.block_pos.x, hit.block_pos.y, hit.block_pos.z + 1),
-                                    Direction::West  => azalea_core::position::BlockPos::new(hit.block_pos.x - 1, hit.block_pos.y, hit.block_pos.z),
-                                    Direction::East  => azalea_core::position::BlockPos::new(hit.block_pos.x + 1, hit.block_pos.y, hit.block_pos.z),
-                                };
-
-                                let epos = ultimate_engine::world::position::BlockPos::new(
-                                    target.x as i64, target.y as i64, target.z as i64,
-                                );
-
-                                // Place the held block via the causal engine so that
-                                // gravity, fluid spread, etc. trigger on placement.
-                                let held = hotbar[selected_slot];
-                                if held == BlockState::AIR { continue; } // nothing to place
-
-                                // Orient the block based on player rotation & clicked face.
-                                let cursor_y = (hit.location.y - hit.block_pos.y as f64) as f32;
-                                let held = crate::placement::orient_block(
-                                    held,
+                                // Placement (face offset, orientation, stair
+                                // shape) is a gameplay decision; the cascade
+                                // runs in physics and comes back via the bus.
+                                let Some(action) = crate::gameplay::place_action(
+                                    &world,
+                                    inventory.held(),
+                                    hit,
                                     player_y_rot,
                                     player_x_rot,
-                                    hit.direction,
-                                    cursor_y,
-                                );
-                                // Compute stair corner shape based on neighbors
-                                // (before the block is in the world).
-                                let held = crate::placement::compute_stair_shape_for_placement(
-                                    held, world, epos,
-                                );
-
-                                let old = world.get_block(epos);
-                                let new_id = BlockId::new(u32::from(held) as u16);
-
-                                // Submit to the shared physics service; gravity,
-                                // fluid, and light cascades run off this task and
-                                // come back via the event bus.
-                                physics.submit_action(BlockAction {
-                                    pos: epos,
-                                    old,
-                                    new: new_id,
-                                    update_stairs: true,
-                                    drop_item: false,
-                                });
+                                ) else {
+                                    continue; // nothing to place
+                                };
+                                physics.submit_action(action);
 
                                 // Acknowledge immediately; authoritative updates
                                 // arrive via the event bus once the cascade settles.
@@ -784,24 +733,16 @@ where
 
                             // ── Creative inventory slot update ───────────
                             ServerboundGamePacket::SetCreativeModeSlot(slot) => {
-                                // Hotbar slots are 36-44 in the inventory window.
-                                let hotbar_idx = slot.slot_num as i32 - 36;
-                                if hotbar_idx >= 0 && hotbar_idx < 9 {
-                                    let bs = match &slot.item_stack {
-                                        ItemStack::Present(data) => {
-                                            item_to_block_kind(data.kind)
-                                                .map(BlockState::from)
-                                                .unwrap_or(BlockState::AIR)
-                                        }
-                                        ItemStack::Empty => BlockState::AIR,
-                                    };
-                                    hotbar[hotbar_idx as usize] = bs;
-                                }
+                                let kind = match &slot.item_stack {
+                                    ItemStack::Present(data) => Some(data.kind),
+                                    ItemStack::Empty => None,
+                                };
+                                inventory.set_creative_slot(slot.slot_num as i32, kind);
                             }
 
                             // ── Hotbar slot selection ────────────────────
                             ServerboundGamePacket::SetCarriedItem(carried) => {
-                                selected_slot = (carried.slot as usize).min(8);
+                                inventory.select(carried.slot as usize);
                             }
 
                             // ── Player movement ───────────────────────

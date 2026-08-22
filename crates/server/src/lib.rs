@@ -5,6 +5,7 @@ pub mod config;
 pub mod dashboard;
 pub mod event_bus;
 pub mod eviction;
+pub mod gameplay;
 pub mod net;
 pub mod persistence;
 pub mod physics;

@@ -32,22 +32,6 @@ pub(crate) fn degrees_to_byte_angle(degrees: f32) -> i8 {
 /// Uses string name matching: ItemKind::OakPlanks displays as "minecraft:oak_planks",
 /// and BlockKind::from_str("oak_planks") parses it back.
 /// Special-cases items whose name doesn't match a block (e.g. water_bucket → water).
-pub(crate) fn item_to_block_kind(item: azalea_registry::builtin::ItemKind) -> Option<azalea_registry::builtin::BlockKind> {
-    use azalea_registry::builtin::{BlockKind, ItemKind};
-
-    // Items whose name doesn't map to a block name directly.
-    match item {
-        ItemKind::WaterBucket => return Some(BlockKind::Water),
-        ItemKind::LavaBucket => return Some(BlockKind::Lava),
-        ItemKind::Redstone => return Some(BlockKind::RedstoneWire),
-        _ => {}
-    }
-
-    // Display gives "minecraft:oak_planks", strip prefix for FromStr which expects "oak_planks"
-    let full = format!("{}", item);
-    let name = full.strip_prefix("minecraft:").unwrap_or(&full);
-    name.parse::<BlockKind>().ok()
-}
 
 /// Map engine BlockId to MC BlockState for protocol.
 pub(crate) fn engine_block_to_mc(id: ultimate_engine::world::block::BlockId) -> azalea_block::BlockState {
