@@ -59,6 +59,38 @@ pub fn orient_block(
         }
     }
 
+    // ── face-attached blocks (lever, buttons, grindstone) ───────────────
+    // Vanilla (FaceAttachedHorizontalDirectionalBlock, verified against
+    // the deobfuscated jar): attaching to a top face → face=floor with
+    // facing = the player's horizontal look; bottom face → face=ceiling,
+    // same facing; a side face → face=wall, facing pointing AWAY from
+    // the support block (= the clicked face's direction).
+    let face_attached = props
+        .iter()
+        .any(|(k, v)| k == "face" && matches!(v.as_str(), "floor" | "wall" | "ceiling"));
+    if face_attached {
+        let (face, facing): (&str, String) = match hit_direction {
+            Direction::Up => ("floor", cardinal_same_as_yaw(player_y_rot).to_string()),
+            Direction::Down => ("ceiling", cardinal_same_as_yaw(player_y_rot).to_string()),
+            Direction::North => ("wall", "north".to_string()),
+            Direction::South => ("wall", "south".to_string()),
+            Direction::West => ("wall", "west".to_string()),
+            Direction::East => ("wall", "east".to_string()),
+        };
+        if let Some(val) = prop_mut(&mut props, "face") {
+            if *val != face {
+                *val = face.to_string();
+                changed = true;
+            }
+        }
+        if let Some(val) = prop_mut(&mut props, "facing") {
+            if *val != facing {
+                *val = facing;
+                changed = true;
+            }
+        }
+    }
+
     // ── facing ──────────────────────────────────────────────────────────
     // Check cubic support *before* taking a mutable borrow on props.
     let facing_is_cubic = props
@@ -71,10 +103,12 @@ pub fn orient_block(
         .unwrap_or(false);
 
     if let Some(val) = prop_mut(&mut props, "facing") {
-        if facing_is_cubic {
+        if face_attached {
+            // Already set above, from the attachment face.
+        } else if facing_is_cubic {
             // Six-directional blocks (pistons, dispensers, observers, etc.)
             // Face toward the direction the player is looking at.
-            let new = cubic_facing_from_look(player_y_rot, player_x_rot);
+            let new = cubic_facing_from_look(&name, player_y_rot, player_x_rot);
             if *val != new {
                 *val = new.to_string();
                 changed = true;
@@ -229,13 +263,15 @@ fn cardinal_same_as_yaw(y_rot: f32) -> &'static str {
 
 /// Six-directional (cubic) facing from the player's full look direction.
 /// Used for pistons, dispensers, observers, end rods, etc.
-fn cubic_facing_from_look(y_rot: f32, x_rot: f32) -> &'static str {
+/// The direction the player is most nearly looking toward, as a
+/// six-directional property value (vanilla's `getNearestLookingDirection`,
+/// with a 45° pitch threshold).
+fn nearest_looking_direction(y_rot: f32, x_rot: f32) -> &'static str {
     if x_rot > 45.0 {
         "down" // looking steeply down
     } else if x_rot < -45.0 {
         "up" // looking steeply up
     } else {
-        // Horizontal: same direction player is looking (not opposite!)
         let yaw = ((y_rot % 360.0) + 360.0) % 360.0;
         if yaw >= 315.0 || yaw < 45.0 {
             "south"
@@ -246,6 +282,35 @@ fn cubic_facing_from_look(y_rot: f32, x_rot: f32) -> &'static str {
         } else {
             "east"
         }
+    }
+}
+
+fn opposite_direction(d: &str) -> &'static str {
+    match d {
+        "north" => "south",
+        "south" => "north",
+        "east" => "west",
+        "west" => "east",
+        "up" => "down",
+        "down" => "up",
+        other => {
+            debug_assert!(false, "unknown direction {other}");
+            "north"
+        }
+    }
+}
+
+/// Six-directional facing for a placed block. Vanilla (verified against
+/// the deobfuscated 26.2 jar): pistons/dispensers/droppers face the
+/// OPPOSITE of the nearest looking direction (toward the placer — look
+/// down and the piston faces up at you); observers are the exception
+/// (`getOpposite().getOpposite()`) and face WITH the look.
+fn cubic_facing_from_look(name: &str, y_rot: f32, x_rot: f32) -> &'static str {
+    let nearest = nearest_looking_direction(y_rot, x_rot);
+    if name == "observer" {
+        nearest
+    } else {
+        opposite_direction(nearest)
     }
 }
 
@@ -575,6 +640,52 @@ mod tests {
         assert_eq!(cardinal_opposite_of_yaw(180.0), "south"); // facing north→south
         assert_eq!(cardinal_opposite_of_yaw(270.0), "west"); // facing east→west
         assert_eq!(cardinal_opposite_of_yaw(-90.0), "west"); // -90 == 270
+    }
+
+    /// Vanilla-verified (deobfuscated 26.2 jar): pistons face the
+    /// OPPOSITE of the nearest look direction — at the placer.
+    #[test]
+    fn test_piston_faces_the_placer() {
+        // Looking north (yaw 180): piston faces south, back at you.
+        assert_eq!(cubic_facing_from_look("piston", 180.0, 0.0), "south");
+        // Looking straight down: piston faces up, at you.
+        assert_eq!(cubic_facing_from_look("piston", 0.0, 80.0), "up");
+        assert_eq!(cubic_facing_from_look("piston", 0.0, -80.0), "down");
+        // Observers are the vanilla exception: they face WITH the look.
+        assert_eq!(cubic_facing_from_look("observer", 180.0, 0.0), "north");
+        assert_eq!(cubic_facing_from_look("observer", 0.0, 80.0), "down");
+    }
+
+    /// Vanilla-verified: levers/buttons attach by the clicked face.
+    #[test]
+    fn test_lever_attaches_to_the_clicked_face() {
+        let lever = azalea_block::BlockState::from(
+            azalea_registry::builtin::BlockKind::Lever,
+        );
+        let get = |state: BlockState, key: &str| -> String {
+            crate::registry::block_prop(
+                ultimate_engine::world::block::BlockId(u32::from(state) as u16),
+                key,
+            )
+            .unwrap()
+            .to_string()
+        };
+
+        // Clicked the top of a block, looking north: floor lever facing north.
+        let s = orient_block(lever, 180.0, 0.0, Direction::Up, 0.5);
+        assert_eq!(get(s, "face"), "floor");
+        assert_eq!(get(s, "facing"), "north");
+
+        // Clicked the underside: ceiling lever.
+        let s = orient_block(lever, 0.0, 0.0, Direction::Down, 0.5);
+        assert_eq!(get(s, "face"), "ceiling");
+        assert_eq!(get(s, "facing"), "south");
+
+        // Clicked the east face of a support block: wall lever pointing
+        // east (away from its support).
+        let s = orient_block(lever, 0.0, 0.0, Direction::East, 0.5);
+        assert_eq!(get(s, "face"), "wall");
+        assert_eq!(get(s, "facing"), "east");
     }
 
     #[test]
