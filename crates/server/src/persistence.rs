@@ -17,9 +17,8 @@ use ultimate_engine::world::chunk::{Chunk, ChunkSection};
 use ultimate_engine::world::position::{ChunkPos, LocalBlockPos};
 use ultimate_engine::world::World;
 
-// ── MC 1.21.11 data version ─────────────────────────────────────────────────
-
-/// DataVersion tag written into every saved chunk. MC 1.21.11 = 4189.
+/// DataVersion tag written into every saved chunk (see
+/// `registry::MC_DATA_VERSION`).
 const DATA_VERSION: i32 = crate::registry::MC_DATA_VERSION;
 
 /// Convert a palette entry (name + optional properties) back to a BlockId.

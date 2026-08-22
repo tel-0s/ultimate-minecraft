@@ -2,7 +2,7 @@
 name = "ultimate-server"
 version = "0.1.0"
 edition = "2024"
-description = "Minecraft 1.21.11 server built on the causal voxel engine"
+description = "Minecraft server (protocol version tracks the azalea dependency) built on the causal voxel engine"
 
 [dependencies]
 ultimate-engine = { path = "../engine" }
@@ -10,18 +10,18 @@ ultimate-engine = { path = "../engine" }
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# MC 1.21.11 protocol codec
-azalea-protocol = "0.15"
-azalea-core = "0.15"
-azalea-registry = "0.15"
-azalea-buf = "0.15"
-azalea-auth = "0.15"
+# MC protocol codec (the azalea version PINS the supported MC version)
+azalea-protocol = "0.16"
+azalea-core = "0.16"
+azalea-registry = "0.16"
+azalea-buf = "0.16"
+azalea-auth = "0.16"
 
-azalea-block = "0.15"
-azalea-chat = "0.15"
-azalea-entity = "0.15"
-azalea-crypto = "0.15"
-azalea-world = "0.15"
+azalea-block = "0.16"
+azalea-chat = "0.16"
+azalea-entity = "0.16"
+azalea-crypto = "0.16"
+azalea-world = "0.16"
 
 # Web dashboard
 axum = { version = "0.7", features = ["ws"] }
@@ -40,7 +40,7 @@ serde_yaml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indexmap = "2.13.0"
-azalea-inventory = "0.15"
+azalea-inventory = "0.16"
 
 # World generation
 noise = "0.9"

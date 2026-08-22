@@ -21,8 +21,11 @@ use ultimate_engine::world::block::BlockId;
 
 // ── Version facts (single home) ──────────────────────────────────────────
 
-/// Vanilla DataVersion stamped into Anvil saves (MC 1.21.11).
-pub const MC_DATA_VERSION: i32 = 4189;
+/// Vanilla DataVersion stamped into Anvil saves. The one version fact
+/// azalea doesn't export: comes from the `version.json` inside the client
+/// jar (or the minecraft.wiki page for the release). MC 26.1 = 4786
+/// (1.21.11 was 4189).
+pub const MC_DATA_VERSION: i32 = 4786;
 
 /// Wire-format identity for cluster peers: two nodes may only link when
 /// they agree on this. Combines the MC protocol version (block/biome ID

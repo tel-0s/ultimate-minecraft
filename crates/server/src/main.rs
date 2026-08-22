@@ -235,7 +235,12 @@ async fn main() {
     );
 
     // ── Start listener with graceful shutdown ────────────────────────────
-    tracing::info!("Starting Minecraft 1.21.11 server on {}", cfg.network.bind);
+    tracing::info!(
+        "Starting Minecraft {} (protocol {}) server on {}",
+        azalea_protocol::packets::VERSION_NAME,
+        azalea_protocol::packets::PROTOCOL_VERSION,
+        cfg.network.bind
+    );
 
     tokio::select! {
         result = ultimate_server::net::listener::run(

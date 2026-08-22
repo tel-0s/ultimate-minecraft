@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use azalea_auth::game_profile::GameProfile;
-use azalea_buf::AzaleaWrite;
+use azalea_buf::AzBuf;
 use azalea_chat::FormattedText;
 use azalea_core::bitset::BitSet;
 use azalea_protocol::common::movements::{PositionMoveRotation, RelativeMovements};
@@ -55,7 +55,7 @@ use azalea_entity::LookDirection;
 use azalea_registry::DataRegistry;
 use azalea_registry::data::DimensionKind;
 use azalea_registry::identifier::Identifier;
-use azalea_world::MinecraftEntityId;
+use azalea_core::entity_id::MinecraftEntityId;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use ultimate_engine::world::World;
@@ -1873,7 +1873,7 @@ async fn send_forget_level_chunk<W: AsyncWrite + Unpin + Send>(
     cx: i32,
     cz: i32,
 ) -> Result<()> {
-    use azalea_buf::AzaleaWriteVar;
+    use azalea_buf::AzBufVar;
     use azalea_protocol::packets::ProtocolPacket;
 
     let mut raw = Vec::new();
@@ -2078,7 +2078,7 @@ async fn send_chunk_from_world<W: AsyncWrite + Unpin + Send>(
     // Build the chunk packet manually because azalea's AzBuf derive
     // serializes heightmaps as a VarInt-prefixed Vec, but the MC protocol
     // expects them as an NBT compound. azalea is a client lib (reads only).
-    use azalea_buf::AzaleaWriteVar;
+    use azalea_buf::AzBufVar;
     use azalea_protocol::packets::ProtocolPacket;
 
     let mut raw_packet = Vec::new();
@@ -2092,7 +2092,7 @@ async fn send_chunk_from_world<W: AsyncWrite + Unpin + Send>(
         light_data: azalea_protocol::packets::game::c_light_update::ClientboundLightUpdatePacketData {
             sky_y_mask: BitSet::new(0), block_y_mask: BitSet::new(0),
             empty_sky_y_mask: BitSet::new(0), empty_block_y_mask: BitSet::new(0),
-            sky_updates: vec![], block_updates: vec![],
+            sky_updates: Default::default(), block_updates: Default::default(),
         },
     };
     let packet_id = ClientboundGamePacket::LevelChunkWithLight(dummy).id();
@@ -2253,7 +2253,7 @@ fn write_section_from_blocks(
     non_air_count: u16,
     biomes: &[u32; 64],
 ) -> Result<()> {
-    use azalea_buf::AzaleaWriteVar;
+    use azalea_buf::AzBufVar;
 
     // Palette: lookup keyed by state_id; cap palette length so we fall
     // back to direct encoding if a section is unusually heterogeneous.
@@ -2313,7 +2313,7 @@ fn write_section_from_blocks(
 ///
 /// 1.21.5+ format: no VarInt data_length for paletted containers.
 fn write_single_section(buf: &mut Vec<u8>, block_state_id: u32, biomes: &[u32; 64]) -> Result<()> {
-    use azalea_buf::AzaleaWriteVar;
+    use azalea_buf::AzBufVar;
 
     // Block count (i16)
     4096i16.azalea_write(buf)?;
@@ -2330,7 +2330,7 @@ fn write_single_section(buf: &mut Vec<u8>, block_state_id: u32, biomes: &[u32; 6
 ///
 /// 1.21.5+ format: no VarInt data_length for paletted containers.
 fn write_empty_section(buf: &mut Vec<u8>, biomes: &[u32; 64]) -> Result<()> {
-    use azalea_buf::AzaleaWriteVar;
+    use azalea_buf::AzBufVar;
 
     // Block count: 0 (no non-air blocks)
     0i16.azalea_write(buf)?;
@@ -2352,7 +2352,7 @@ fn write_empty_section(buf: &mut Vec<u8>, biomes: &[u32; 64]) -> Result<()> {
 /// Cell index layout matches azalea-world's `PalletedContainerKind<Biome>`:
 /// `index = y * 16 + z * 4 + x` where each axis is in `0..4`.
 fn write_biome_container(buf: &mut Vec<u8>, biomes: &[u32; 64]) -> Result<()> {
-    use azalea_buf::AzaleaWriteVar;
+    use azalea_buf::AzBufVar;
 
     let first = biomes[0];
     if biomes.iter().all(|&b| b == first) {
@@ -2494,7 +2494,7 @@ async fn send_light_updates<W: AsyncWrite + Unpin + Send>(
 
         // Build the LightUpdate packet manually (azalea's Write impls
         // don't always match the server-side wire format).
-        use azalea_buf::AzaleaWriteVar;
+        use azalea_buf::AzBufVar;
         use azalea_protocol::packets::ProtocolPacket;
 
         let mut raw = Vec::new();
@@ -2505,7 +2505,7 @@ async fn send_light_updates<W: AsyncWrite + Unpin + Send>(
             light_data: azalea_protocol::packets::game::c_light_update::ClientboundLightUpdatePacketData {
                 sky_y_mask: BitSet::new(0), block_y_mask: BitSet::new(0),
                 empty_sky_y_mask: BitSet::new(0), empty_block_y_mask: BitSet::new(0),
-                sky_updates: vec![], block_updates: vec![],
+                sky_updates: Default::default(), block_updates: Default::default(),
             },
         };
         let packet_id = ClientboundGamePacket::LightUpdate(dummy).id();
