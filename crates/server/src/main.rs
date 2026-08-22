@@ -192,8 +192,14 @@ async fn main() {
         m.attach(Arc::clone(&world), Arc::clone(&spatial), physics.clone());
     }
 
-    // Ambient simulation layers (empty for now).
-    let sim_layers: Vec<Box<dyn ultimate_server::simulation::SimulationLayer>> = vec![];
+    // Ambient simulation layers.
+    let mut sim_layers: Vec<Box<dyn ultimate_server::simulation::SimulationLayer>> = vec![];
+    if cfg.simulation.mob_spawning {
+        sim_layers.push(Box::new(ultimate_server::spawning::MobSpawner::new(
+            cfg.simulation.mob_cap_per_player,
+            cfg.simulation.mob_global_cap,
+        )));
+    }
     ultimate_server::simulation::start(Arc::clone(&world), sim_layers, physics.clone());
 
     // Shared player registry for multiplayer visibility. The node id

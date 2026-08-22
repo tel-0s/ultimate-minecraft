@@ -93,7 +93,7 @@ pub fn mob_ai(world: &World, payload: &EventPayload) -> Vec<Event> {
     }
 
     // Mid-flight (or unsupported): ordinary trajectory chaining.
-    if !(is_still(&cur) && supported(world, cur.pos)) {
+    if !(is_still(&cur) && supported(world, cur.kind, cur.pos)) {
         return vec![plan_next(world, id, cur, woken)];
     }
 

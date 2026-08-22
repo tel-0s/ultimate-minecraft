@@ -138,6 +138,41 @@ pub fn has_gravity(id: BlockId) -> bool {
     GRAVITY_LUT.get(id.0 as usize).copied().unwrap_or(false)
 }
 
+/// Does this block stop a moving ENTITY (item, mob)? Narrower than
+/// `is_solid`: attachments and plants have no collision box — an item
+/// falls INTO a pressure plate's cell (and presses it) instead of
+/// perching on top. Name-derived LUT, same pattern as the light tables.
+pub fn blocks_entity_movement(id: BlockId) -> bool {
+    static LUT: std::sync::LazyLock<Box<[bool]>> = std::sync::LazyLock::new(|| {
+        (0..=azalea_block::BlockState::MAX_STATE)
+            .map(|raw| {
+                let id = BlockId(raw as u16);
+                if is_replaceable(id) {
+                    return false;
+                }
+                let n = crate::registry::block_name(id);
+                let passthrough = matches!(
+                    n,
+                    "torch" | "wall_torch" | "soul_torch" | "soul_wall_torch"
+                        | "redstone_torch" | "redstone_wall_torch" | "redstone_wire"
+                        | "lever" | "rail" | "powered_rail" | "detector_rail"
+                        | "activator_rail" | "ladder" | "vine" | "sugar_cane"
+                        | "short_grass" | "tall_grass" | "fern" | "dead_bush"
+                        | "dandelion" | "poppy" | "blue_orchid" | "allium"
+                        | "azure_bluet" | "oxeye_daisy" | "cornflower"
+                        | "lily_of_the_valley" | "wither_rose"
+                ) || n.ends_with("_button")
+                    || n.ends_with("_pressure_plate")
+                    || n.ends_with("_sapling")
+                    || n.ends_with("_sign")
+                    || n.ends_with("_banner");
+                !passthrough
+            })
+            .collect()
+    });
+    LUT.get(id.0 as usize).copied().unwrap_or(true)
+}
+
 /// Can another block be placed in this space?
 pub fn is_replaceable(id: BlockId) -> bool {
     id == AIR || is_fluid(id)

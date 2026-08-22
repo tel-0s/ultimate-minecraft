@@ -14,4 +14,5 @@ pub mod player_registry;
 pub mod registry;
 pub mod rules;
 pub mod simulation;
+pub mod spawning;
 pub mod worldgen;

@@ -21,6 +21,8 @@ pub struct ServerConfig {
     pub world: WorldConfig,
     pub dashboard: DashboardConfig,
     pub physics: PhysicsConfig,
+    #[serde(default)]
+    pub simulation: SimulationConfig,
     pub cluster: ClusterConfig,
 }
 
@@ -54,6 +56,27 @@ impl Default for ClusterConfig {
             physics_nodes: 0,
             listen: "0.0.0.0:25600".into(),
             peers: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SimulationConfig {
+    /// Natural mob spawning around players (ambient simulation layer).
+    pub mob_spawning: bool,
+    /// Rough cap on mobs near any one player.
+    pub mob_cap_per_player: usize,
+    /// Hard cap on total natural mobs server-wide.
+    pub mob_global_cap: usize,
+}
+
+impl Default for SimulationConfig {
+    fn default() -> Self {
+        Self {
+            mob_spawning: true,
+            mob_cap_per_player: 8,
+            mob_global_cap: 256,
         }
     }
 }
@@ -181,6 +204,7 @@ impl Default for ServerConfig {
             world: WorldConfig::default(),
             dashboard: DashboardConfig::default(),
             physics: PhysicsConfig::default(),
+            simulation: SimulationConfig::default(),
             cluster: ClusterConfig::default(),
         }
     }
@@ -286,6 +310,14 @@ world:
 dashboard:
   # HTTP port for the live dashboard. Bound to localhost only.
   port: 8000
+
+simulation:
+  # Natural mob spawning around players.
+  mob_spawning: true
+  # Rough cap on mobs near any one player.
+  mob_cap_per_player: 8
+  # Hard cap on total natural mobs server-wide.
+  mob_global_cap: 256
 
 physics:
   # Partitioned physics workers. 0 = auto (one per available core).

@@ -219,17 +219,34 @@ pub fn item_kinematics(world: &World, payload: &EventPayload) -> Vec<Event> {
     }
 
     // At rest and supported: sleep. (The rest-costs-nothing invariant.)
-    if is_still(&cur) && supported(world, cur.pos) {
+    if is_still(&cur) && supported(world, cur.kind, cur.pos) {
         return Vec::new();
     }
 
     vec![plan_next(world, id, cur, woken)]
 }
 
-/// Standing on a solid top face?
-pub(crate) fn supported(world: &World, pos: Vec3) -> bool {
+/// Does the block at this cell stop entities of `kind`? Falling blocks
+/// keep the strict rule (they must land exactly where instant gravity
+/// would put the block); items and mobs pass through attachments and
+/// plants — which is what lets a pig stand IN a pressure plate's cell
+/// and press it.
+pub(crate) fn collides(kind: EntityKind, id: BlockId) -> bool {
+    if kind == KIND_FALLING_BLOCK {
+        block::is_solid(id)
+    } else {
+        block::blocks_entity_movement(id)
+    }
+}
+
+/// Standing on a solid top face? Center-point, consistent with the
+/// point trajectory sweep — footprint-corner probing without a matching
+/// Minkowski-dilated sweep lets a box "stand" on a wall it is pressed
+/// against (found by the fast-item wall test). True per-kind AABB
+/// sweeps (dilating the DDA by the half-width) are the follow-up.
+pub(crate) fn supported(world: &World, kind: EntityKind, pos: Vec3) -> bool {
     let below = Vec3::new(pos.x, pos.y - 0.06, pos.z).block_pos();
-    block::is_solid(world.get_block(below))
+    collides(kind, world.get_block(below))
 }
 
 /// EXACT swept collision: walk the parabolic trajectory
@@ -259,7 +276,7 @@ fn plan_segment(world: &World, start: &EntityState) -> EntityState {
 
     // Segment starts inside a solid cell (a block was placed into the
     // entity's cell): pop onto the cell top, like the sampler did.
-    if block::is_solid(world.get_block(cell)) {
+    if collides(start.kind, world.get_block(cell)) {
         return EntityState {
             pos: Vec3::new(p0.x, cell.y as f64 + 1.0, p0.z),
             vel: Vec3::ZERO,
@@ -348,7 +365,7 @@ fn plan_segment(world: &World, start: &EntityState) -> EntityState {
             _ => BlockPos::new(cell.x, cell.y, cell.z + v0.z.signum() as i64),
         };
 
-        if block::is_solid(world.get_block(entered)) {
+        if collides(start.kind, world.get_block(entered)) {
             let hit = at(t_cross);
             let pos = match (axis, dy) {
                 // Landing on a top face: rest exactly on it.
@@ -492,7 +509,7 @@ pub fn falling_block_kinematics(world: &World, payload: &EventPayload) -> Vec<Ev
         return Vec::new();
     }
 
-    if is_still(&cur) && supported(world, cur.pos) {
+    if is_still(&cur) && supported(world, cur.kind, cur.pos) {
         // Landed: ONE atomic conversion event. Contention (stolen cells,
         // co-landing stacks, region-handoff dual ownership) is resolved
         // inside its apply — the entity guard is the commit point and
