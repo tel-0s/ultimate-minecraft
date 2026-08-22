@@ -1,8 +1,9 @@
 # Ultimate Minecraft -- Roadmap
 
-A **real Minecraft 1.21.11 server** built on **causal graph dynamics**: no global tick
-clock, maximal parallelism from causal independence, Wolfram-inspired local rewriting
-rules on a sparse 3D block lattice. Real MC clients connect, see a world, and walk around.
+A **real Minecraft server** (currently MC **26.2**, protocol 776) built on **causal
+graph dynamics**: no global tick clock, maximal parallelism from causal independence,
+Wolfram-inspired local rewriting rules on a sparse 3D block lattice. Real MC clients
+connect, see a world, and walk around.
 
 > *Time is not a global parameter but the depth of the causal graph.*
 
@@ -923,10 +924,32 @@ sand-rain across a 24×24-chunk arena, regions split ~50/50):
 | Parallelism     | `rayon`                 | Work-stealing, maps to causal frontier draining|
 | Concurrent maps | `dashmap`               | Lock-sharded chunk storage                     |
 | Async I/O       | `tokio`                 | Battle-tested async networking                 |
-| MC Protocol     | `azalea-protocol` 0.15  | Full MC 1.21.11 packet codec                   |
+| MC Protocol     | `azalea-protocol` 0.16 (git pin) | Full MC 26.2 packet codec; the azalea version pins the MC version |
 | Causal graph    | `slotmap`               | Dense arena for event DAG nodes                |
 
 ---
+
+## Version-upgrade playbook (post-2026-08-21 architecture)
+
+The server is decoupled from the protocol version. To bump MC versions:
+
+1. Bump the `azalea-*` deps (or the `[patch.crates-io]` git pin) and fix
+   whatever the compiler names — packet fields and azalea API churn live
+   almost entirely in `net/` (the 1.21.11→26.1→26.2 double hop was ~20
+   mechanical fixes total).
+2. `cargo run --example gen_block_ids` — regenerates the named
+   block-state constants and fluid tables from azalea.
+   `tests/block_ids.rs` fails until you do; never hand-edit.
+3. Update `registry::MC_DATA_VERSION` (from the client jar's
+   `version.json` — the one fact azalea doesn't export).
+4. `cargo test --workspace` + a `load_test` smoke run.
+
+What makes this cheap: `crates/server/src/registry.rs` is the single
+name↔numeric-ID boundary (block states, biome wire ids, version facts);
+saves store block *names* (`UmcDeltaPal`) so worlds survive renumbering;
+cluster `Hello` frames carry a wire-version stamp so mixed-version nodes
+refuse to link; and the biome registry + worldgen wire ids derive from
+one azalea table.
 
 ## Milestones
 
@@ -934,3 +957,7 @@ sand-rain across a 24×24-chunk arena, regions split ~50/50):
 |------------|--------------------------------------------------------------|
 | 2026-02-07 | Phase 0-2: Engine, tests, parallel scheduler, workspace split|
 | 2026-02-07 | Phase 3: **First real MC 1.21.11 client connection**         |
+| 2026-08-21 | Engine entity module restored (lost to an unanchored gitignore rule); CI added |
+| 2026-08-21 | Registry version boundary: generated block ids, derived biomes, name-based delta saves |
+| 2026-08-21 | **MC 26.2** (protocol 776) via azalea 0.16 + git pin — double version hop, smoke-tested live |
+| 2026-08-21 | net/ split (handshake / chunk_stream / entity_view) + gameplay layer |
