@@ -276,10 +276,44 @@ world:
   # path to a JSON file -- see crates/server/src/worldgen/presets/ for
   # examples and the worldgen::preset module for the schema.
   preset: "noise"
+  # Chunk eviction: non-dirty chunks beyond this radius (in chunks) of
+  # every player and spawn are dropped from RAM and regenerated on
+  # demand (baseline + saved delta). 0 = view_distance+8.
+  keep_radius: 0
+  # How often the eviction sweep runs, seconds.
+  eviction_interval_secs: 30
 
 dashboard:
   # HTTP port for the live dashboard. Bound to localhost only.
   port: 8000
+
+physics:
+  # Partitioned physics workers. 0 = auto (one per available core).
+  workers: 0
+  # Pin each worker to a core (first step toward NUMA-local memory).
+  pin_workers: false
+  # Adaptive region rebalancing (move/split hot regions between workers).
+  rebalance: true
+  # Unsupported sand/gravel detaches into a visible falling-block ENTITY
+  # (vanilla parity). false = instant column gravity (bench mode).
+  falling_block_entities: true
+
+cluster:
+  # Multi-node mesh (Phase 6f). All nodes share identical worldgen
+  # config; regions are partitioned across nodes with node_id < physics_nodes.
+  # A node with node_id >= physics_nodes is a gateway (serves players,
+  # owns no regions). See gateway-demo.yaml for a worked example.
+  enabled: false
+  # This node's id, 0-based, unique across the mesh.
+  node_id: 0
+  # Total nodes in the mesh (physics + gateways).
+  total_nodes: 1
+  # Nodes [0, physics_nodes) own regions. 0 = all nodes are physics nodes.
+  physics_nodes: 0
+  # Address this node listens on for higher-id peers.
+  listen: "0.0.0.0:25600"
+  # Peer addresses, indexed by node id ("" for self / not yet known).
+  peers: []
 "#;
 
 /// Load `path` if it exists, otherwise write the default file there and
@@ -318,6 +352,26 @@ mod tests {
         assert_eq!(cfg.network.bind, parsed.network.bind);
         assert_eq!(cfg.network.view_distance, parsed.network.view_distance);
         assert_eq!(cfg.world.seed, parsed.world.seed);
+    }
+
+    #[test]
+    fn embedded_default_yaml_is_complete() {
+        // Every key that Default serializes must be discoverable in the
+        // commented literal — an operator reading server.yaml should see
+        // every knob that exists. (This is what caught the literal
+        // historically omitting the whole physics:/cluster: sections.)
+        let serialized = serde_yaml::to_string(&ServerConfig::default()).unwrap();
+        for line in serialized.lines() {
+            let trimmed = line.trim_start();
+            if let Some((key, _)) = trimmed.split_once(':') {
+                if key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    assert!(
+                        DEFAULT_CONFIG_YAML.contains(&format!("{key}:")),
+                        "DEFAULT_CONFIG_YAML omits the `{key}` field"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

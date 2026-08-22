@@ -37,7 +37,8 @@ use azalea_protocol::packets::status::c_status_response::SamplePlayer;
 use azalea_registry::builtin::EntityKind;
 use azalea_protocol::packets::handshake::ServerboundHandshakePacket;
 use azalea_protocol::packets::login::{
-    ClientboundLoginFinished, ClientboundLoginPacket, ServerboundLoginPacket,
+    ClientboundLoginDisconnect, ClientboundLoginFinished, ClientboundLoginPacket,
+    ServerboundLoginPacket,
 };
 use azalea_protocol::packets::status::{
     ClientboundPongResponse, ClientboundStatusPacket, ClientboundStatusResponse,
@@ -77,6 +78,19 @@ static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// Waiters idle in the main loop with keep-alives flowing.
 static STREAM_PERMITS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
     std::sync::OnceLock::new();
+
+/// Install the streaming-admission semaphore from server config. Called
+/// once by the listener at startup so the permit count comes from THE
+/// config, not whichever connection happened to arrive first.
+pub fn init_stream_permits(stream_permits: usize) {
+    let _ = STREAM_PERMITS.get_or_init(|| {
+        let n = match stream_permits {
+            0 => tokio::sync::Semaphore::MAX_PERMITS,
+            n => n,
+        };
+        Arc::new(tokio::sync::Semaphore::new(n))
+    });
+}
 
 /// Total bytes successfully handed to client sockets (all connections).
 /// Load-test diagnostic: correlate with process RSS to distinguish heap
@@ -157,6 +171,20 @@ pub async fn handle(
             handle_status(&mut read, &mut write, &mut buf, compression, &mut cipher_enc, &mut cipher_dec, &registry, &config.network).await?;
         }
         ClientIntention::Login => {
+            // Admission: the advertised max is enforced, not decorative.
+            // (Small TOCTOU window under concurrent joins is fine — the
+            // cap is capacity protection, not a hard invariant.)
+            let cap = config.network.max_players as usize;
+            if cap > 0 && registry.player_count() >= cap {
+                let reject: ClientboundLoginPacket = ClientboundLoginDisconnect {
+                    reason: azalea_chat::FormattedText::from(format!(
+                        "Server is full ({cap} players)"
+                    )),
+                }
+                .into_variant();
+                write_packet(&reject, &mut write, compression, &mut cipher_enc).await?;
+                return Ok(());
+            }
             let (name, uuid) = handle_login(&mut read, &mut write, &mut buf, compression, &mut cipher_enc, &mut cipher_dec).await?;
             handle_configuration(&mut read, &mut write, &mut buf, compression, &mut cipher_enc, &mut cipher_dec).await?;
             dashboard.metrics.player_joined();
@@ -629,15 +657,8 @@ where
     // permit is granted instantly and joining behaves as before; in a
     // join storm, permit-less connections defer EVERYTHING to the queue
     // and stream when their wave comes (keep-alives flowing meanwhile).
-    let stream_sem = STREAM_PERMITS
-        .get_or_init(|| {
-            let n = match config.network.stream_permits {
-                0 => tokio::sync::Semaphore::MAX_PERMITS,
-                n => n,
-            };
-            Arc::new(tokio::sync::Semaphore::new(n))
-        })
-        .clone();
+    init_stream_permits(config.network.stream_permits);
+    let stream_sem = STREAM_PERMITS.get().expect("init_stream_permits ran").clone();
     let mut stream_permit = Arc::clone(&stream_sem).try_acquire_owned().ok();
 
     let mut immediate: Vec<(i32, i32)> = Vec::new();
@@ -1217,14 +1238,24 @@ where
                         }
                     }
                     Err(e) => {
-                        let msg = format!("{}", e);
-                        if msg.contains("Leftover data") || msg.contains("unknown variant") {
-                            // Non-fatal parse error (modded client, unknown packet variant).
-                            // Log and continue rather than disconnecting.
-                            tracing::debug!("Ignoring packet parse error: {}", msg);
-                        } else {
-                            tracing::info!("{} disconnected: {}", player_name, e);
-                            break;
+                        // Structural classification (the old string-match on
+                        // the error message broke whenever azalea reworded
+                        // it). Recoverable: the frame splitter consumed the
+                        // whole frame, so a packet we couldn't make sense of
+                        // (modded client, unknown id, trailing data) can be
+                        // skipped without desyncing the stream. Everything
+                        // else is a transport-level failure — disconnect.
+                        use azalea_protocol::read::ReadPacketError as RPE;
+                        match &*e {
+                            RPE::Parse { .. }
+                            | RPE::UnknownPacketId { .. }
+                            | RPE::LeftoverData { .. } => {
+                                tracing::debug!("Ignoring packet parse error: {e}");
+                            }
+                            _ => {
+                                tracing::info!("{} disconnected: {}", player_name, e);
+                                break;
+                            }
                         }
                     }
                 }

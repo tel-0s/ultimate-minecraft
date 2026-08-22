@@ -21,6 +21,11 @@ pub async fn run(
     let listener = TcpListener::bind(&config.network.bind).await?;
     tracing::info!("Listening on {}", config.network.bind);
 
+    // Admission semaphore comes from THE startup config (previously
+    // initialized lazily by the first connection, freezing whatever
+    // config that connection carried).
+    super::connection::init_stream_permits(config.network.stream_permits);
+
     // Telemetry heartbeat: total socket bytes written, to correlate with
     // process RSS during load tests.
     tokio::spawn(async {
@@ -37,7 +42,16 @@ pub async fn run(
     });
 
     loop {
-        let (stream, addr) = listener.accept().await?;
+        // A failed accept (EMFILE, transient network error) must not kill
+        // the accept loop for every future player; back off and continue.
+        let (stream, addr) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::warn!("accept failed: {e}; retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         tracing::info!("Connection from {}", addr);
 
         // Disable Nagle's algorithm. Without this, the kernel batches small
