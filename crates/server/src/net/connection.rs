@@ -264,6 +264,9 @@ where
             name: name.clone(),
             properties: Default::default(),
         },
+        // 26.2: server-assigned session identity (used by the client for
+        // report/chat session plumbing; any stable UUID works offline).
+        session_id: uuid,
     }.into_variant();
     write_packet(&response, write, compression, cipher_enc).await?;
 
@@ -541,6 +544,8 @@ where
     let login: ClientboundGamePacket = ClientboundLogin {
         player_id: MinecraftEntityId(entity_id),
         hardcore: false,
+        // 26.2: tells the client whether the server verifies profiles.
+        online_mode: false,
         levels: vec![Identifier::new("minecraft:overworld")],
         max_players: config.network.max_players as i32,
         chunk_radius: config.network.view_distance.max(0) as u32,
@@ -1552,7 +1557,7 @@ fn dropped_item_kind(block: ultimate_engine::world::block::BlockId) -> azalea_re
     let Ok(state) = BlockState::try_from(block.0 as u32) else {
         return azalea_registry::builtin::ItemKind::Stone;
     };
-    let b: Box<dyn BlockTrait> = Box::<dyn BlockTrait>::from(state);
+    let b: &dyn BlockTrait = state.to_trait();
     b.id().parse().unwrap_or(azalea_registry::builtin::ItemKind::Stone)
 }
 

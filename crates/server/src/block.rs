@@ -193,7 +193,7 @@ fn light_emission_uncached(id: BlockId) -> u8 {
         Ok(s) => s,
         Err(_) => return 0,
     };
-    let block: Box<dyn BlockTrait> = Box::<dyn BlockTrait>::from(state);
+    let block: &dyn BlockTrait = state.to_trait();
     let name = block.id();
 
     // azalea's BlockTrait::id() returns the bare name (e.g. "torch"),
@@ -279,7 +279,7 @@ fn light_opacity_uncached(id: BlockId) -> u8 {
         Ok(s) => s,
         Err(_) => return 15,
     };
-    let block: Box<dyn BlockTrait> = Box::<dyn BlockTrait>::from(state);
+    let block: &dyn BlockTrait = state.to_trait();
     let name = block.id();
 
     // azalea's BlockTrait::id() returns the bare name (e.g. "torch"),

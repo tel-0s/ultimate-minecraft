@@ -32,7 +32,7 @@ pub fn orient_block(
     hit_direction: Direction,
     cursor_y: f32,
 ) -> BlockState {
-    let block: Box<dyn BlockTrait> = Box::<dyn BlockTrait>::from(default_state);
+    let block: &dyn BlockTrait = default_state.to_trait();
     let prop_map = block.property_map();
 
     // Fast path: blocks with no properties need no orientation.
@@ -323,7 +323,7 @@ fn stair_info_from_id(id: BlockId) -> Option<StairInfo> {
         return None;
     }
     let state = BlockState::try_from(id.0 as u32).ok()?;
-    let block: Box<dyn BlockTrait> = Box::<dyn BlockTrait>::from(state);
+    let block: &dyn BlockTrait = state.to_trait();
     if !block.id().ends_with("_stairs") {
         return None;
     }
@@ -436,7 +436,7 @@ pub fn compute_stair_shape_for_placement(
     world: &World,
     pos: EngineBlockPos,
 ) -> BlockState {
-    let block: Box<dyn BlockTrait> = Box::<dyn BlockTrait>::from(state);
+    let block: &dyn BlockTrait = state.to_trait();
     let name = block.id().to_string();
     if !name.ends_with("_stairs") {
         return state;
@@ -510,7 +510,7 @@ pub fn update_adjacent_stair_shapes(
             Ok(s) => s,
             Err(_) => continue,
         };
-        let block: Box<dyn BlockTrait> = Box::<dyn BlockTrait>::from(state);
+        let block: &dyn BlockTrait = state.to_trait();
         let name = block.id().to_string();
         if !name.ends_with("_stairs") {
             continue;
@@ -611,7 +611,7 @@ mod tests {
         let default = BlockState::from(BlockKind::OakLog);
         // Click the north face → axis should become z.
         let oriented = orient_block(default, 0.0, 0.0, Direction::North, 0.5);
-        let block: Box<dyn BlockTrait> = Box::<dyn BlockTrait>::from(oriented);
+        let block: &dyn BlockTrait = oriented.to_trait();
         let props = block.property_map();
         let axis = props.iter().find(|(k, _)| **k == "axis").map(|(_, v)| v.to_string());
         assert_eq!(axis.as_deref(), Some("z"));
@@ -625,7 +625,7 @@ mod tests {
         // Player facing north (yaw=180) → stairs face north (same direction,
         // so the step side faces toward the player).
         let oriented = orient_block(default, 180.0, 0.0, Direction::Up, 0.5);
-        let block: Box<dyn BlockTrait> = Box::<dyn BlockTrait>::from(oriented);
+        let block: &dyn BlockTrait = oriented.to_trait();
         let props = block.property_map();
         let facing = props
             .iter()
@@ -641,7 +641,7 @@ mod tests {
         let default = BlockState::from(BlockKind::OakSlab);
         // Click bottom face → top slab.
         let oriented = orient_block(default, 0.0, 0.0, Direction::Down, 0.5);
-        let block: Box<dyn BlockTrait> = Box::<dyn BlockTrait>::from(oriented);
+        let block: &dyn BlockTrait = oriented.to_trait();
         let props = block.property_map();
         let slab_type = props
             .iter()

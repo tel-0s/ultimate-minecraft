@@ -1,3 +1,20 @@
 [workspace]
 members = ["crates/engine", "crates/server"]
 resolver = "2"
+
+# MC 26.2 support is on azalea git but not yet published to crates.io
+# (latest release is 0.16.0+mc26.1). Pin one rev so builds are
+# reproducible; drop this whole section when 0.16.x+mc26.2 (or 0.17)
+# is released.
+[patch.crates-io]
+azalea-protocol = { git = "https://github.com/azalea-rs/azalea", rev = "6249c295d353b9b3ef68f665b311cba39211fd19" }
+azalea-core = { git = "https://github.com/azalea-rs/azalea", rev = "6249c295d353b9b3ef68f665b311cba39211fd19" }
+azalea-registry = { git = "https://github.com/azalea-rs/azalea", rev = "6249c295d353b9b3ef68f665b311cba39211fd19" }
+azalea-buf = { git = "https://github.com/azalea-rs/azalea", rev = "6249c295d353b9b3ef68f665b311cba39211fd19" }
+azalea-auth = { git = "https://github.com/azalea-rs/azalea", rev = "6249c295d353b9b3ef68f665b311cba39211fd19" }
+azalea-block = { git = "https://github.com/azalea-rs/azalea", rev = "6249c295d353b9b3ef68f665b311cba39211fd19" }
+azalea-chat = { git = "https://github.com/azalea-rs/azalea", rev = "6249c295d353b9b3ef68f665b311cba39211fd19" }
+azalea-entity = { git = "https://github.com/azalea-rs/azalea", rev = "6249c295d353b9b3ef68f665b311cba39211fd19" }
+azalea-crypto = { git = "https://github.com/azalea-rs/azalea", rev = "6249c295d353b9b3ef68f665b311cba39211fd19" }
+azalea-world = { git = "https://github.com/azalea-rs/azalea", rev = "6249c295d353b9b3ef68f665b311cba39211fd19" }
+azalea-inventory = { git = "https://github.com/azalea-rs/azalea", rev = "6249c295d353b9b3ef68f665b311cba39211fd19" }

@@ -23,9 +23,9 @@ use ultimate_engine::world::block::BlockId;
 
 /// Vanilla DataVersion stamped into Anvil saves. The one version fact
 /// azalea doesn't export: comes from the `version.json` inside the client
-/// jar (or the minecraft.wiki page for the release). MC 26.1 = 4786
-/// (1.21.11 was 4189).
-pub const MC_DATA_VERSION: i32 = 4786;
+/// jar (or the minecraft.wiki page for the release). MC 26.2 = 4903
+/// (26.1 was 4786, 1.21.11 was 4189).
+pub const MC_DATA_VERSION: i32 = 4903;
 
 /// Wire-format identity for cluster peers: two nodes may only link when
 /// they agree on this. Combines the MC protocol version (block/biome ID
@@ -49,7 +49,7 @@ static BLOCK_PARTS: LazyLock<Vec<(&'static str, Props)>> = LazyLock::new(|| {
     (0..=BlockState::MAX_STATE)
         .map(|raw| {
             let state = BlockState::try_from(raw).expect("id in range");
-            let block: Box<dyn BlockTrait> = Box::<dyn BlockTrait>::from(state);
+            let block: &dyn BlockTrait = state.to_trait();
             // azalea's names are 'static in disguise (string literals);
             // leaking the Box would also work, but `id()` returns &str
             // borrowed from the trait object — intern via leak once.
