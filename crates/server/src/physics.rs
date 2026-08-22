@@ -49,10 +49,14 @@
 //!
 //! ## Known ownership exceptions (deliberate, documented)
 //!
-//! - The light rule's BFS writes light values directly across chunk
-//!   borders (races converge; partition-aware light is future work).
 //! - Stair-shape rewrites touch radius-1 neighbours directly.
 //! - Rebalancing handoffs (above).
+//! - `ensure_sky_light`'s first-send initialization scan writes from
+//!   connection tasks (init-only; steady-state light is owner-written).
+//!
+//! (The light BFS used to write across chunk borders directly — the
+//! largest exception. It is now partition-aware: floods clip at the home
+//! chunk and continue on the neighbor's owner via `LightNotify` events.)
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
