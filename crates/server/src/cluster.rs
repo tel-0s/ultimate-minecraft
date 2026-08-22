@@ -288,8 +288,12 @@ enum OutFrame {
     /// so a coordinator can detect in-flight traffic on links it can't
     /// see (peer↔peer).
     Pong { token: u64, pending: i64, sent: u64, received: u64 },
-    /// Dialer identifies itself immediately after connecting.
-    Hello { node_id: u32 },
+    /// Dialer identifies itself immediately after connecting. `wire`
+    /// stamps the MC protocol + payload-codec version
+    /// (`registry::cluster_wire_version`): block/biome ids and frame
+    /// layouts are version-specific, so mixed-version nodes must refuse
+    /// the link loudly instead of corrupting each other's replicas.
+    Hello { node_id: u32, wire: u64 },
     /// Region ownership flip (migration). Counted, so quiescence waits
     /// for routing convergence.
     Transfer { region: (i32, i32), new_owner: u32 },
@@ -332,9 +336,10 @@ fn encode_frame(frame: &OutFrame) -> Vec<u8> {
             body.extend_from_slice(&sent.to_le_bytes());
             body.extend_from_slice(&received.to_le_bytes());
         }
-        OutFrame::Hello { node_id } => {
+        OutFrame::Hello { node_id, wire } => {
             body.push(KIND_HELLO);
             body.extend_from_slice(&node_id.to_le_bytes());
+            body.extend_from_slice(&wire.to_le_bytes());
         }
         OutFrame::Transfer { region, new_owner } => {
             body.push(KIND_TRANSFER);
@@ -392,7 +397,10 @@ impl ClusterLink {
             }
         };
         let link = Self::from_stream(stream)?;
-        let _ = link.out_tx.send(OutFrame::Hello { node_id: my_node_id });
+        let _ = link.out_tx.send(OutFrame::Hello {
+            node_id: my_node_id,
+            wire: crate::registry::cluster_wire_version(),
+        });
         Ok(link)
     }
 
@@ -411,6 +419,15 @@ impl ClusterLink {
             return Err(anyhow!("peer {peer} did not start with Hello"));
         }
         let node_id = r.u32()?;
+        let wire = r.u64()?;
+        let ours = crate::registry::cluster_wire_version();
+        if wire != ours {
+            return Err(anyhow!(
+                "peer {peer} (node {node_id}) speaks wire version {wire:#x}, \
+                 this node speaks {ours:#x} — mixed MC/codec versions would \
+                 corrupt replicas; refusing the link"
+            ));
+        }
         tracing::info!("cluster: node {node_id} connected from {peer}");
         Ok((node_id, Self::from_stream(stream)?))
     }

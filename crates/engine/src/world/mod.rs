@@ -138,6 +138,13 @@ impl World {
         self.chunks.remove(&pos).is_some()
     }
 
+    /// Mark a chunk as having unsaved modifications without writing a
+    /// block (persistence-format migration: a chunk loaded from a legacy
+    /// save format re-saves in the current one on the next autosave).
+    pub fn mark_dirty(&self, pos: ChunkPos) {
+        self.dirty.insert(pos);
+    }
+
     /// Whether this chunk has unsaved modifications.
     pub fn is_dirty(&self, pos: ChunkPos) -> bool {
         self.dirty.contains(&pos)

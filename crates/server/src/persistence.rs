@@ -93,13 +93,109 @@ struct ChunkNbt {
     gen_fp: Option<i64>,
     /// Phase 6c delta encoding: block modifications relative to the
     /// procedurally regenerated baseline, packed one per i64 as
-    /// `(section_y << 32) | (cell_index << 16) | block_id` with
+    /// `(section_y << 32) | (cell_index << 16) | low16` with
     /// `cell_index = local_y*256 + z*16 + x`. When present, `sections` is
     /// empty and loading regenerates the chunk then applies these cells.
     /// 10-100× smaller than full chunks for lightly-edited terrain, and
     /// robust to worldgen changes.
+    ///
+    /// `low16` is a [`UmcDeltaPal`](Self::delta_palette) palette index in
+    /// the current format, or a raw numeric block-state id in the legacy
+    /// (paletteless) format — see [`resolve_delta`].
     #[serde(rename = "UmcDelta", default, skip_serializing_if = "Option::is_none")]
     delta: Option<Vec<i64>>,
+    /// Name-based palette for `UmcDelta`: entry `i` describes the block
+    /// each packed cell with `low16 == i` holds, as `name` or
+    /// `name[prop=val,prop=val]` (sorted props, no `minecraft:` prefix).
+    /// Names are forever while numeric state ids renumber every MC
+    /// version — this is what lets block edits survive protocol upgrades.
+    #[serde(rename = "UmcDeltaPal", default, skip_serializing_if = "Option::is_none")]
+    delta_palette: Option<Vec<String>>,
+}
+
+// ── Delta block descriptors (name-based palette entries) ─────────────────
+
+/// `sand`, `oak_stairs[facing=north,half=bottom,...]` — the version-stable
+/// spelling of one block state.
+fn block_to_descriptor(id: BlockId) -> String {
+    let Some((name, props)) = crate::registry::block_parts(id) else {
+        return "air".into();
+    };
+    if props.is_empty() {
+        name.to_string()
+    } else {
+        let body: Vec<String> = props.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        format!("{name}[{}]", body.join(","))
+    }
+}
+
+/// Resolve a descriptor back to the current protocol's state id.
+fn descriptor_to_block(desc: &str) -> Option<BlockId> {
+    match desc.split_once('[') {
+        None => crate::registry::block_id_from_name(desc),
+        Some((name, rest)) => {
+            let body = rest.strip_suffix(']')?;
+            let mut props: Vec<(String, String)> = body
+                .split(',')
+                .map(|kv| {
+                    let (k, v) = kv.split_once('=')?;
+                    Some((k.to_string(), v.to_string()))
+                })
+                .collect::<Option<_>>()?;
+            props.sort();
+            crate::registry::lookup_block_state(name, &props)
+        }
+    }
+}
+
+/// Turn a saved delta into the runtime form (low 16 bits = current state
+/// id), resolving the name palette when present. Returns `None` when the
+/// delta cannot be trusted: a legacy paletteless delta whose numeric ids
+/// were minted under a different MC data version. (The chunk then
+/// regenerates clean — dropped edits, never corrupted ones.)
+fn resolve_delta(nbt: &ChunkNbt) -> Option<Vec<i64>> {
+    let delta = nbt.delta.as_ref()?;
+    match &nbt.delta_palette {
+        Some(palette) => {
+            let resolved: Vec<BlockId> = palette
+                .iter()
+                .map(|desc| {
+                    descriptor_to_block(desc).unwrap_or_else(|| {
+                        tracing::warn!(
+                            "Unknown block '{desc}' in delta palette — loading as air"
+                        );
+                        BlockId::AIR
+                    })
+                })
+                .collect();
+            Some(
+                delta
+                    .iter()
+                    .map(|&packed| {
+                        let idx = (packed & 0xFFFF) as usize;
+                        let id = resolved.get(idx).copied().unwrap_or(BlockId::AIR);
+                        (packed & !0xFFFF) | id.0 as i64
+                    })
+                    .collect(),
+            )
+        }
+        // Legacy paletteless delta: raw state ids, only valid under the
+        // exact data version that wrote them.
+        None if nbt.data_version == DATA_VERSION => Some(delta.clone()),
+        None => {
+            tracing::warn!(
+                "Skipping legacy numeric delta chunk ({}, {}) saved under \
+                 DataVersion {} (current {}): state ids are not portable \
+                 across MC versions. Load the world once under the old \
+                 version to migrate it to name-based deltas.",
+                nbt.x_pos,
+                nbt.z_pos,
+                nbt.data_version,
+                DATA_VERSION,
+            );
+            None
+        }
+    }
 }
 
 // ── Delta store + overlay generator (Phase 6c eviction) ─────────────────────
@@ -304,8 +400,10 @@ pub fn save_world(
 
         // Refresh the live delta store: after this save the chunk is
         // clean AND its regeneration recipe is current → evictable.
+        // (Resolve through the palette: the store holds the RUNTIME form,
+        // low 16 bits = current state id.)
         if let Some(store) = deltas {
-            if let Some(delta) = &nbt.delta {
+            if let Some(delta) = resolve_delta(&nbt) {
                 store.insert(*pos, std::sync::Arc::from(delta.as_slice()));
             }
         }
@@ -388,6 +486,8 @@ fn chunk_to_delta_nbt(
     section_indices.dedup();
 
     let mut delta = Vec::new();
+    let mut palette: Vec<String> = Vec::new();
+    let mut palette_map: HashMap<BlockId, u16> = HashMap::new();
     for si in section_indices {
         let live = chunk.section(si);
         let base = baseline.section(si);
@@ -395,7 +495,13 @@ fn chunk_to_delta_nbt(
             let live_block = live.map_or(BlockId::AIR, |s| s.get_by_index(cell));
             let base_block = base.map_or(BlockId::AIR, |s| s.get_by_index(cell));
             if live_block != base_block {
-                delta.push(pack_delta(si, cell, live_block));
+                // Low 16 bits carry a name-palette index, not a state id:
+                // names survive MC version bumps, numeric ids don't.
+                let idx = *palette_map.entry(live_block).or_insert_with(|| {
+                    palette.push(block_to_descriptor(live_block));
+                    (palette.len() - 1) as u16
+                });
+                delta.push(pack_delta(si, cell, BlockId(idx)));
             }
         }
     }
@@ -409,6 +515,7 @@ fn chunk_to_delta_nbt(
         status: "minecraft:full".into(),
         gen_fp: Some(gen_fp as i64),
         delta: Some(delta),
+        delta_palette: Some(palette),
     }
 }
 
@@ -439,6 +546,7 @@ fn chunk_to_nbt(pos: ChunkPos, chunk: &Chunk, gen_fp: u64) -> ChunkNbt {
         status: "minecraft:full".into(),
         gen_fp: Some(gen_fp as i64),
         delta: None,
+        delta_palette: None,
     }
 }
 
@@ -578,8 +686,12 @@ pub fn load_into(
 
                 let chunk_pos = ChunkPos::new(chunk_nbt.x_pos, chunk_nbt.z_pos);
 
-                if let Some(delta) = &chunk_nbt.delta {
+                if chunk_nbt.delta.is_some() {
                     // Delta chunk: regenerate baseline (if needed), apply.
+                    let Some(delta) = resolve_delta(&chunk_nbt) else {
+                        stale_chunks += 1; // untrusted legacy delta — regen clean
+                        continue;
+                    };
                     if chunk_nbt.gen_fp != Some(gen_fp as i64) {
                         migrated_chunks += 1;
                     }
@@ -592,10 +704,16 @@ pub fn load_into(
                     }
                     worldgen.ensure_generated(world, chunk_pos.x, chunk_pos.z);
                     if let Some(mut chunk) = world.get_chunk_mut(&chunk_pos) {
-                        for &packed in delta {
+                        for &packed in &delta {
                             let (sy, cell, block) = unpack_delta(packed);
                             chunk.set_block(delta_local_pos(sy, cell), block);
                         }
+                    }
+                    if chunk_nbt.delta_palette.is_none() {
+                        // Legacy numeric delta under the current data
+                        // version: schedule a re-save so it migrates to
+                        // the name-based format on the next autosave.
+                        world.mark_dirty(chunk_pos);
                     }
                     total_chunks += 1;
                     continue;
@@ -965,6 +1083,116 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 
+    fn v1_nbt(data_version: i32, delta: Vec<i64>) -> ChunkNbt {
+        ChunkNbt {
+            data_version,
+            x_pos: 0,
+            z_pos: 0,
+            y_pos: 0,
+            sections: Vec::new(),
+            status: "minecraft:full".into(),
+            gen_fp: Some(1),
+            delta: Some(delta),
+            delta_palette: None,
+        }
+    }
+
+    #[test]
+    fn test_descriptor_roundtrip() {
+        let stairs = crate::registry::lookup_block_state(
+            "oak_stairs",
+            &{
+                let mut p: Vec<(String, String)> = [
+                    ("facing", "north"),
+                    ("half", "bottom"),
+                    ("shape", "straight"),
+                    ("waterlogged", "false"),
+                ]
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .to_vec();
+                p.sort();
+                p
+            },
+        )
+        .expect("oak_stairs state exists");
+        for id in [
+            crate::block::AIR,
+            crate::block::SAND,
+            crate::block::FluidKind::Water.at_level(3),
+            stairs,
+        ] {
+            let desc = block_to_descriptor(id);
+            assert_eq!(
+                descriptor_to_block(&desc),
+                Some(id),
+                "descriptor '{desc}' must roundtrip"
+            );
+        }
+    }
+
+    #[test]
+    fn test_palette_delta_resolves_by_name_even_across_versions() {
+        // A palette delta written under a FOREIGN data version still
+        // resolves — by name — to the current protocol's state id.
+        let mut nbt = v1_nbt(DATA_VERSION + 1000, vec![pack_delta(2, 77, BlockId(0))]);
+        nbt.delta_palette = Some(vec!["sand".into()]);
+        let resolved = resolve_delta(&nbt).expect("palette deltas are always resolvable");
+        assert_eq!(unpack_delta(resolved[0]), (2, 77, crate::block::SAND));
+    }
+
+    #[test]
+    fn test_legacy_numeric_delta_gated_on_data_version() {
+        let packed = vec![pack_delta(1, 5, crate::block::SAND)];
+        // Same version: trusted verbatim.
+        assert_eq!(
+            resolve_delta(&v1_nbt(DATA_VERSION, packed.clone())),
+            Some(packed.clone())
+        );
+        // Foreign version: numeric ids are not portable — refused.
+        assert_eq!(resolve_delta(&v1_nbt(DATA_VERSION + 1, packed)), None);
+    }
+
+    #[test]
+    fn test_legacy_delta_load_migrates_to_name_based() {
+        use ultimate_engine::world::position::BlockPos;
+
+        // Hand-write a v1 (paletteless, numeric) region file...
+        let wg = FillGen(crate::block::STONE);
+        let nbt = v1_nbt(
+            DATA_VERSION,
+            vec![pack_delta(0, 5 * 256 + 5 * 16 + 5, crate::block::SAND)],
+        );
+        let tmp = std::env::temp_dir().join("ultimate_mc_test_delta_v1_migrate");
+        let _ = fs::remove_dir_all(&tmp);
+        let region_dir = tmp.join("region");
+        fs::create_dir_all(&region_dir).unwrap();
+        let mut region = fastanvil::Region::new(Cursor::new(Vec::new())).unwrap();
+        region
+            .write_chunk(0, 0, &fastnbt::to_bytes(&nbt).unwrap())
+            .unwrap();
+        fs::write(region_dir.join("r.0.0.mca"), region.into_inner().unwrap().into_inner()).unwrap();
+
+        // ...load it: the edit applies, and the chunk is marked dirty so
+        // the next autosave rewrites it in the name-based format.
+        let world = World::new();
+        let n = load_into(&world, &tmp, 1, &wg, None).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(world.get_block(BlockPos::new(5, 5, 5)), crate::block::SAND);
+        assert!(
+            world.is_dirty(ChunkPos::new(0, 0)),
+            "legacy delta chunk must be scheduled for format migration"
+        );
+
+        // The migration save produces a palette delta loadable anywhere.
+        save_world(&world, &tmp, 1, &wg, None).unwrap();
+        let world2 = World::new();
+        load_into(&world2, &tmp, 1, &wg, None).unwrap();
+        assert_eq!(world2.get_block(BlockPos::new(5, 5, 5)), crate::block::SAND);
+        assert!(!world2.is_dirty(ChunkPos::new(0, 0)), "migrated chunk loads clean");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn test_delta_chunks_survive_generator_change() {
         use ultimate_engine::world::position::BlockPos;
@@ -1017,9 +1245,14 @@ mod tests {
 
         let chunk_ref = world.get_chunk(&ChunkPos::new(0, 0)).unwrap();
         let nbt = chunk_to_delta_nbt(ChunkPos::new(0, 0), &chunk_ref, 1, &generator);
-        let delta = nbt.delta.expect("delta format");
-        assert_eq!(delta.len(), 1, "one edit → one delta cell, got {}", delta.len());
-        let (sy, cell, block) = unpack_delta(delta[0]);
+        assert_eq!(
+            nbt.delta.as_deref().map(<[i64]>::len),
+            Some(1),
+            "one edit → one delta cell"
+        );
+        // Saved by NAME (palette), not by numeric state id.
+        assert_eq!(nbt.delta_palette.as_deref(), Some(&["sand".to_string()][..]));
+        let (sy, cell, block) = unpack_delta(resolve_delta(&nbt).unwrap()[0]);
         assert_eq!((sy, block), (0, crate::block::SAND));
         assert_eq!(cell, 2 * 256 + 7 * 16 + 7);
     }
