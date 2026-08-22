@@ -559,9 +559,11 @@ Known limitations / next:
 - Speedup flattens 8→16 workers (36 regions over 24×24 chunks → load
   imbalance; plus shared-DashMap bandwidth). 6d's adaptive region sizing
   and work stealing, and 6c's per-partition arenas, attack this.
-- Light BFS still writes across partitions directly (documented
-  ownership exception; races converge since light recomputes from block
-  state). Needs a partition-aware strategy.
+- ~~Light BFS still writes across partitions directly~~ **RESOLVED**
+  (2026-08-21): floods clip at the home chunk and continue on the
+  neighbor's owner via dedup-coalesced `LightNotify` re-derivation —
+  owner-written light, cluster-correct, worker-count-independent
+  (tested), and the sky-column-cut gap fixed along the way.
 - Stair-shape rewrites may write a foreign chunk at radius 1 (rare,
   idempotent, direct).
 
