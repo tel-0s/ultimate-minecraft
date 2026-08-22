@@ -904,10 +904,20 @@ sand-rain across a 24×24-chunk arena, regions split ~50/50):
       (entity-substrate-driven: player mirrors press them; edge-triggered
       by EntitySet transitions + while-pressed backstop poll), repeaters
       (directional diode via emitted_power, 1-4 tick delay, click-cycled;
-      diode placement facing fixed to vanilla). Remaining: comparators,
-      pistons (move blocks — the causal model's most interesting case),
-      weighted plates, non-solid collision shapes (items/mobs currently
-      land ON plates instead of in their cell).
+      diode placement facing fixed to vanilla).
+      **Pistons ✓** (2026-08-21): a push is ONE engine-level
+      `AtomicBlockSet` — every cell guarded, applied all-or-nothing under
+      the affected chunks' write locks (`World::apply_atomic_writes`,
+      deadlock-free by the sorted-multi-lock discipline; cluster codec
+      v2). 12-block limit, immovable/soft-block sets, sticky pull;
+      post-apply notifies re-enter the ordinary cascade (pushed sand
+      falls). Chasing a 1-in-30-runs conservation miss with this
+      machinery also fixed a PRE-EXISTING race: the materialize landing
+      scan is now column-atomic under the chunk guard (160000/160000
+      across 6 consecutive bench runs). Remaining: comparators, weighted
+      plates, piston animation entity, drops from piston-destroyed soft
+      blocks, non-solid collision shapes (items/mobs currently land ON
+      plates instead of in their cell).
 - [ ] Localized weather simulation (wishlist)
 - [ ] Graph rewrite rule markup language (wishlist; worldgen JSON presets
       are the precedent)
