@@ -364,6 +364,27 @@ pub(crate) fn registry_entries() -> Vec<(String, Vec<String>)> {
             "minecraft:cute".into(), "minecraft:grumpy".into(), "minecraft:puglin".into(),
             "minecraft:sad".into(),
         ]),
+        // MC 26.x: every mob VARIANT family is validated REQUIRED-NON-EMPTY
+        // by the client (`RegistryValidator.nonEmpty` in vanilla's
+        // RegistryDataLoader) — the sound-variant registries below are new
+        // in 26.x and refusing to declare them refuses the connection.
+        // Derived from azalea's tables so they track the pinned version.
+        (
+            "minecraft:cat_sound_variant".into(),
+            crate::registry::registry_names(azalea_registry::data::CatSoundVariantKey::ALL),
+        ),
+        (
+            "minecraft:chicken_sound_variant".into(),
+            crate::registry::registry_names(azalea_registry::data::ChickenSoundVariantKey::ALL),
+        ),
+        (
+            "minecraft:cow_sound_variant".into(),
+            crate::registry::registry_names(azalea_registry::data::CowSoundVariantKey::ALL),
+        ),
+        (
+            "minecraft:pig_sound_variant".into(),
+            crate::registry::registry_names(azalea_registry::data::PigSoundVariantKey::ALL),
+        ),
         ("minecraft:zombie_nautilus_variant".into(), vec![
             "minecraft:temperate".into(), "minecraft:warm".into(),
         ]),
@@ -400,5 +421,39 @@ mod tests {
             &vec!["minecraft:overworld".to_string(), "minecraft:the_end".to_string()],
         );
         assert!(get("minecraft:worldgen/biome").len() >= 60);
+    }
+
+    /// The complete REQUIRED-NON-EMPTY set from vanilla 26.2's
+    /// RegistryDataLoader (extracted from the deobfuscated client jar:
+    /// every synchronized RegistryData built with
+    /// `RegistryValidator.nonEmpty()`). A vanilla client refuses the
+    /// connection if ANY of these is missing or empty. On a version
+    /// bump, re-extract the list and update it here.
+    #[test]
+    fn configuration_declares_every_required_non_empty_registry() {
+        let regs = registry_entries();
+        for name in [
+            "minecraft:wolf_variant",
+            "minecraft:wolf_sound_variant",
+            "minecraft:pig_variant",
+            "minecraft:pig_sound_variant",
+            "minecraft:frog_variant",
+            "minecraft:cat_variant",
+            "minecraft:cat_sound_variant",
+            "minecraft:cow_variant",
+            "minecraft:cow_sound_variant",
+            "minecraft:chicken_variant",
+            "minecraft:chicken_sound_variant",
+            "minecraft:zombie_nautilus_variant",
+            "minecraft:painting_variant",
+        ] {
+            let entries = regs
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("client requires {name} to be declared"))
+                .1
+                .len();
+            assert!(entries > 0, "client requires {name} to be NON-EMPTY");
+        }
     }
 }

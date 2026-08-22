@@ -174,7 +174,7 @@ pub fn fluid_level_ids(name: &str) -> [u16; 16] {
 
 /// Namespaced names of a derived data registry, in azalea's (= vanilla
 /// data-pack) order.
-fn registry_names<K: Clone>(all: &[K]) -> Vec<String>
+pub fn registry_names<K: Clone>(all: &[K]) -> Vec<String>
 where
     azalea_registry::identifier::Identifier: From<K>,
 {
