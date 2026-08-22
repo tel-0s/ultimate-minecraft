@@ -204,3 +204,194 @@ fn torch_tracks_oscillating_input_with_one_tick_lag() {
         assert_eq!(is_lit(&world, torch), expected_lit, "torch tracks with one-tick lag");
     }
 }
+
+// ── Post-MVP: climbing, buttons, plates, repeaters ───────────────────────
+
+/// A block's state with some properties changed (test helper riding the
+/// registry's state table).
+fn with_props(id: BlockId, changes: &[(&str, &str)]) -> BlockId {
+    ultimate_server::registry::with_props(id, changes).expect("state combination exists")
+}
+
+#[test]
+fn wire_climbs_a_step_and_occlusion_blocks_it() {
+    let (world, _clock) = flat_world(2);
+    let handle = start(&world);
+
+    // lever + wire on the surface; a stone step with wire on top; wire
+    // continues on the upper level into a lamp.
+    // x:  0      1       2(step y5, wire y6)   3 (wire y6)  4 (lamp y6)
+    place(&handle, &world, BlockPos::new(0, Y, 8), state_of("lever"));
+    place(&handle, &world, BlockPos::new(1, Y, 8), state_of("redstone_wire"));
+    place(&handle, &world, BlockPos::new(2, Y, 8), BlockId::new(1)); // stone step
+    place(&handle, &world, BlockPos::new(2, Y + 1, 8), state_of("redstone_wire"));
+    place(&handle, &world, BlockPos::new(3, Y + 1, 8), state_of("redstone_wire"));
+    place(&handle, &world, BlockPos::new(3, Y, 8), BlockId::new(1)); // support
+    place(&handle, &world, BlockPos::new(4, Y + 1, 8), state_of("redstone_lamp"));
+    place(&handle, &world, BlockPos::new(4, Y, 8), BlockId::new(1)); // support
+    quiesce(&handle);
+
+    let lever = BlockPos::new(0, Y, 8);
+    let on = ultimate_server::rules::redstone::toggle_lever(world.get_block(lever)).unwrap();
+    place(&handle, &world, lever, on);
+    quiesce(&handle);
+
+    // Signal climbs: 15 on the ground wire, 14 on the step top, 13 next.
+    assert_eq!(wire_power(&world, BlockPos::new(1, Y, 8)), 15);
+    assert_eq!(wire_power(&world, BlockPos::new(2, Y + 1, 8)), 14, "climbed the step");
+    assert_eq!(wire_power(&world, BlockPos::new(3, Y + 1, 8)), 13);
+    assert!(is_lit(&world, BlockPos::new(4, Y + 1, 8)), "lamp on the upper level lights");
+
+    // Occlude the diagonal: a solid block above the lower wire severs
+    // the climb, and the upper run drains.
+    place(&handle, &world, BlockPos::new(1, Y + 1, 8), BlockId::new(1));
+    quiesce(&handle);
+    assert_eq!(wire_power(&world, BlockPos::new(2, Y + 1, 8)), 0, "climb occluded");
+    assert!(!is_lit(&world, BlockPos::new(4, Y + 1, 8)), "upper lamp dark");
+}
+
+#[test]
+fn button_presses_and_releases_itself() {
+    let (world, clock) = flat_world(2);
+    let handle = start(&world);
+
+    place(&handle, &world, BlockPos::new(0, Y, 8), state_of("stone_button"));
+    place(&handle, &world, BlockPos::new(1, Y, 8), state_of("redstone_wire"));
+    place(&handle, &world, BlockPos::new(2, Y, 8), state_of("redstone_lamp"));
+    quiesce(&handle);
+
+    // Press (what the gameplay layer submits on right-click).
+    let button = BlockPos::new(0, Y, 8);
+    let action = ultimate_server::gameplay::use_block_action(&world, button)
+        .expect("button press produces an action");
+    handle.submit_action(action);
+    quiesce(&handle);
+    assert_eq!(wire_power(&world, BlockPos::new(1, Y, 8)), 15, "pressed button powers");
+    assert!(is_lit(&world, BlockPos::new(2, Y, 8)));
+
+    // A second use while pressed is a no-op.
+    assert!(
+        ultimate_server::gameplay::use_block_action(&world, button).is_none(),
+        "re-pressing a pressed button does nothing"
+    );
+
+    // Stone buttons release after 1.0 s of virtual time.
+    tick(&clock, &handle, 900);
+    assert_eq!(wire_power(&world, BlockPos::new(1, Y, 8)), 15, "still pressed at 0.9s");
+    tick(&clock, &handle, 200);
+    assert_eq!(wire_power(&world, BlockPos::new(1, Y, 8)), 0, "released after 1.0s");
+    assert!(!is_lit(&world, BlockPos::new(2, Y, 8)), "lamp dark again");
+}
+
+#[test]
+fn pressure_plate_reads_the_entity_substrate() {
+    use ultimate_engine::causal::event::{Event, EventPayload};
+    use ultimate_engine::world::entity::{EntityState, Vec3};
+
+    let (world, _clock) = flat_world(2);
+    let handle = start(&world);
+
+    place(&handle, &world, BlockPos::new(0, Y, 8), state_of("stone_pressure_plate"));
+    place(&handle, &world, BlockPos::new(1, Y, 8), state_of("redstone_wire"));
+    place(&handle, &world, BlockPos::new(2, Y, 8), state_of("redstone_lamp"));
+    quiesce(&handle);
+    assert_eq!(wire_power(&world, BlockPos::new(1, Y, 8)), 0);
+
+    // A still entity whose feet occupy the plate's cell (a player mirror
+    // standing on the plate looks exactly like this).
+    let id = world.entities().allocate_id();
+    let standing = EntityState {
+        kind: ultimate_server::rules::entity::KIND_PLAYER,
+        pos: Vec3::new(0.5, Y as f64 + 0.1, 8.5),
+        vel: Vec3::ZERO,
+        stamp: world.now(),
+        aux: 0,
+    };
+    handle.submit_events(vec![Event {
+        payload: EventPayload::EntitySet { id, old: None, new: Some(standing) },
+    }]);
+    quiesce(&handle);
+    assert_eq!(wire_power(&world, BlockPos::new(1, Y, 8)), 15, "plate pressed");
+    assert!(is_lit(&world, BlockPos::new(2, Y, 8)));
+
+    // The entity steps off: the departure transition releases the plate
+    // without waiting for the backstop poll.
+    let away = EntityState {
+        pos: Vec3::new(5.5, Y as f64 + 0.1, 8.5),
+        ..standing
+    };
+    handle.submit_events(vec![Event {
+        payload: EventPayload::EntitySet { id, old: Some(standing), new: Some(away) },
+    }]);
+    quiesce(&handle);
+    assert_eq!(wire_power(&world, BlockPos::new(1, Y, 8)), 0, "plate released");
+    assert!(!is_lit(&world, BlockPos::new(2, Y, 8)));
+}
+
+#[test]
+fn repeater_delays_refreshes_and_isolates() {
+    let (world, clock) = flat_world(2);
+    let handle = start(&world);
+
+    // lever(x0) → wire(x1) → repeater(x2, input west) → wire(x3) → lamp(x4)
+    place(&handle, &world, BlockPos::new(0, Y, 8), state_of("lever"));
+    place(&handle, &world, BlockPos::new(1, Y, 8), state_of("redstone_wire"));
+    let repeater = with_props(state_of("repeater"), &[("facing", "west")]);
+    place(&handle, &world, BlockPos::new(2, Y, 8), repeater);
+    place(&handle, &world, BlockPos::new(3, Y, 8), state_of("redstone_wire"));
+    place(&handle, &world, BlockPos::new(4, Y, 8), state_of("redstone_lamp"));
+    quiesce(&handle);
+
+    let lever = BlockPos::new(0, Y, 8);
+    let on = ultimate_server::rules::redstone::toggle_lever(world.get_block(lever)).unwrap();
+    place(&handle, &world, lever, on);
+    quiesce(&handle);
+
+    // Input side live immediately; output waits one redstone tick.
+    assert_eq!(wire_power(&world, BlockPos::new(1, Y, 8)), 15);
+    assert_eq!(wire_power(&world, BlockPos::new(3, Y, 8)), 0, "output waits for the delay");
+    tick(&clock, &handle, 150);
+    assert_eq!(
+        wire_power(&world, BlockPos::new(3, Y, 8)),
+        15,
+        "repeater REFRESHES the signal to 15 (wire would be at 13 here)"
+    );
+    assert!(is_lit(&world, BlockPos::new(4, Y, 8)));
+
+    // Switch off: output drops one tick later.
+    let off = ultimate_server::rules::redstone::toggle_lever(world.get_block(lever)).unwrap();
+    place(&handle, &world, lever, off);
+    quiesce(&handle);
+    assert_eq!(wire_power(&world, BlockPos::new(1, Y, 8)), 0, "input drains at once");
+    tick(&clock, &handle, 150);
+    assert_eq!(wire_power(&world, BlockPos::new(3, Y, 8)), 0, "output follows after the delay");
+
+    // Isolation: powering the OUTPUT side must not leak backwards.
+    place(&handle, &world, BlockPos::new(3, Y, 7), state_of("lever"));
+    quiesce(&handle);
+    let side = BlockPos::new(3, Y, 7);
+    let on = ultimate_server::rules::redstone::toggle_lever(world.get_block(side)).unwrap();
+    place(&handle, &world, side, on);
+    quiesce(&handle);
+    tick(&clock, &handle, 500);
+    assert_eq!(wire_power(&world, BlockPos::new(3, Y, 8)), 15, "output side lit by side lever");
+    assert_eq!(
+        wire_power(&world, BlockPos::new(1, Y, 8)),
+        0,
+        "diode: nothing leaks back to the input side"
+    );
+}
+
+#[test]
+fn repeater_delay_cycles_on_use() {
+    let base = with_props(state_of("repeater"), &[("delay", "1")]);
+    let mut id = base;
+    let mut seen = Vec::new();
+    for _ in 0..5 {
+        id = ultimate_server::rules::redstone::cycle_repeater_delay(id).unwrap();
+        seen.push(
+            ultimate_server::registry::block_prop(id, "delay").unwrap().to_string(),
+        );
+    }
+    assert_eq!(seen, ["2", "3", "4", "1", "2"]);
+}

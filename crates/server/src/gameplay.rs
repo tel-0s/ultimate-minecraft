@@ -66,15 +66,19 @@ pub fn break_action(world: &World, pos: BlockPos) -> BlockAction {
     }
 }
 
-/// Right-clicking an interactive block *uses* it instead of placing
-/// (levers today; buttons/doors later). Returns the resulting action.
+/// Right-clicking an interactive block *uses* it instead of placing:
+/// levers toggle, buttons press (they release themselves via a timed
+/// event in the redstone rule), repeaters cycle their delay. Returns
+/// the resulting action.
 pub fn use_block_action(world: &World, clicked: BlockPos) -> Option<BlockAction> {
     let clicked_id = world.get_block(clicked);
-    let toggled = crate::rules::redstone::toggle_lever(clicked_id)?;
+    let new = crate::rules::redstone::toggle_lever(clicked_id)
+        .or_else(|| crate::rules::redstone::press_button(clicked_id))
+        .or_else(|| crate::rules::redstone::cycle_repeater_delay(clicked_id))?;
     Some(BlockAction {
         pos: clicked,
         old: clicked_id,
-        new: toggled,
+        new,
         update_stairs: false,
         drop_item: false,
     })

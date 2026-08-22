@@ -173,9 +173,10 @@ fn block_supports_vertical_facing(name: &str, props: &[(String, String)]) -> boo
 /// player), but stairs, repeaters, and comparators face the *same* way (so
 /// the step / input side faces toward the player).
 fn uses_same_direction_facing(name: &str) -> bool {
+    // NOT repeaters/comparators: vanilla's DiodeBlock sets FACING to the
+    // player's look direction REVERSED (arrow pointing away, input side
+    // toward the placer) — they had been placed backwards here.
     name.ends_with("_stairs")
-        || name == "repeater"
-        || name == "comparator"
 }
 
 /// Axis from the face that was clicked:
