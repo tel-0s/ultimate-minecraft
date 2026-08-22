@@ -77,22 +77,42 @@ pub struct PlayerRegistry {
     spatial: std::sync::Arc<crate::event_bus::SpatialBus>,
 }
 
+/// Player entity ids live in `[1, 0x4000_0000)` — the high bit ranges are
+/// namespaced: `0x4000_0000 |` marks spatial-entity wire ids (see
+/// `net::entity_view::item_wire_id`). Within the player range, each
+/// cluster node owns a `node_id << 24` sub-range so ids minted on
+/// different nodes never collide — they flow into the SHARED EntityStore
+/// id space via `rules::entity::player_entity_id` (and replicate through
+/// WriteSync), where a collision would make two nodes' player mirrors
+/// fight over one entity entry.
+const EIDS_PER_NODE: i32 = 1 << 24;
+
+/// Highest node id that fits under the item-wire-id namespace bit.
+pub const MAX_NODE_ID_FOR_EIDS: u32 = (0x4000_0000 / EIDS_PER_NODE as u32) - 1;
+
 impl PlayerRegistry {
-    /// Create a new empty registry. Entity IDs start at 2 (1 is conventionally
-    /// the "self" entity on vanilla clients, but we use our own IDs now).
-    pub fn new(spatial: std::sync::Arc<crate::event_bus::SpatialBus>) -> Self {
+    /// Create a new empty registry. `node_id` partitions the entity-id
+    /// space across cluster nodes (0 for single-node servers — ids then
+    /// start at 1, exactly as before).
+    pub fn new(spatial: std::sync::Arc<crate::event_bus::SpatialBus>, node_id: u32) -> Self {
+        assert!(
+            node_id <= MAX_NODE_ID_FOR_EIDS,
+            "node_id {node_id} exceeds the player entity-id namespace \
+             (max {MAX_NODE_ID_FOR_EIDS})"
+        );
         // Lifecycle-only channel: joins/leaves/chat are rare, so a modest
         // buffer suffices (movement no longer flows through here).
         let (event_tx, _) = broadcast::channel(4096);
         Self {
             players: RwLock::new(HashMap::new()),
-            next_entity_id: AtomicI32::new(1),
+            next_entity_id: AtomicI32::new(node_id as i32 * EIDS_PER_NODE + 1),
             event_tx,
             spatial,
         }
     }
 
-    /// Allocate a unique entity ID for a new player.
+    /// Allocate a unique entity ID for a new player (unique across the
+    /// whole cluster, not just this node — see [`EIDS_PER_NODE`]).
     pub fn allocate_entity_id(&self) -> i32 {
         self.next_entity_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -203,5 +223,38 @@ impl PlayerRegistry {
     /// Subscribe to player lifecycle events.
     pub fn subscribe(&self) -> broadcast::Receiver<PlayerEvent> {
         self.event_tx.subscribe()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entity_ids_are_disjoint_across_nodes() {
+        let bus = crate::event_bus::SpatialBus::new();
+        let a = PlayerRegistry::new(std::sync::Arc::clone(&bus), 0);
+        let b = PlayerRegistry::new(bus, 1);
+        let ids_a: Vec<i32> = (0..100).map(|_| a.allocate_entity_id()).collect();
+        let ids_b: Vec<i32> = (0..100).map(|_| b.allocate_entity_id()).collect();
+        assert_eq!(ids_a[0], 1, "single-node/node-0 ids start at 1, as before");
+        for ia in &ids_a {
+            assert!(ids_b.iter().all(|ib| ib != ia), "cross-node collision");
+        }
+        // The derived EntityStore mirror ids must also be distinct — a
+        // collision there makes two nodes' player mirrors fight over one
+        // entity entry on every replica.
+        assert_ne!(
+            crate::rules::entity::player_entity_id(ids_a[0]),
+            crate::rules::entity::player_entity_id(ids_b[0]),
+        );
+        // And every player id stays below the item-wire-id namespace bit.
+        assert!(ids_b.iter().all(|id| *id < 0x4000_0000));
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds the player entity-id namespace")]
+    fn oversized_node_id_is_rejected() {
+        let _ = PlayerRegistry::new(crate::event_bus::SpatialBus::new(), MAX_NODE_ID_FOR_EIDS + 1);
     }
 }

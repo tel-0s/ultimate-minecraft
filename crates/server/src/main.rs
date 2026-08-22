@@ -196,8 +196,13 @@ async fn main() {
     let sim_layers: Vec<Box<dyn ultimate_server::simulation::SimulationLayer>> = vec![];
     ultimate_server::simulation::start(Arc::clone(&world), sim_layers, physics.clone());
 
-    // Shared player registry for multiplayer visibility.
-    let registry = Arc::new(PlayerRegistry::new(Arc::clone(&spatial)));
+    // Shared player registry for multiplayer visibility. The node id
+    // partitions the player entity-id space so ids (and the EntityStore
+    // mirrors derived from them) never collide across cluster nodes.
+    let registry = Arc::new(PlayerRegistry::new(
+        Arc::clone(&spatial),
+        if cfg.cluster.enabled { cfg.cluster.node_id } else { 0 },
+    ));
 
     // ── Periodic autosave ────────────────────────────────────────────────
     let save_world_ref = Arc::clone(&world);
