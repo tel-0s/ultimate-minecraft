@@ -97,6 +97,8 @@ where
                 // needs the real scheduler's apply (synthesized log). No
                 // scenario here emits it (instant-gravity rule set).
                 EventPayload::EntityMaterialize { .. } => false,
+                // Compound rewrite: mirror the engine's all-or-nothing.
+                EventPayload::AtomicBlockSet { writes } => world.apply_atomic_writes(writes),
                 EventPayload::After { .. } => false,
             };
             graph.mark_executed(id);

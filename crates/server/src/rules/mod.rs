@@ -3,6 +3,7 @@ pub mod entity;
 pub mod helpers;
 pub mod light;
 pub mod mob;
+pub mod piston;
 pub mod redstone;
 
 use ultimate_engine::rules::RuleSet;
@@ -21,6 +22,7 @@ pub fn standard() -> RuleSet {
     rules.add(mob::mob_ai);
     rules.add(entity::entity_block_wake);
     rules.add(redstone::redstone);
+    rules.add(piston::piston);
     rules
 }
 
@@ -40,5 +42,6 @@ pub fn standard_with_falling_blocks() -> RuleSet {
     rules.add(mob::mob_ai);
     rules.add(entity::entity_block_wake);
     rules.add(redstone::redstone);
+    rules.add(piston::piston);
     rules
 }

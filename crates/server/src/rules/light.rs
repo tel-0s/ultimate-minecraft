@@ -26,6 +26,16 @@ const MAX_Y: i64 = 319;
 pub fn light_propagation(world: &World, payload: &EventPayload) -> Vec<Event> {
     match payload {
         EventPayload::BlockSet { pos, old, new } => update_light(world, *pos, *old, *new),
+        // A compound rewrite (piston push) changed several cells at once;
+        // its synthesized per-cell BlockSets don't evaluate rules, so the
+        // light updates fold here.
+        EventPayload::AtomicBlockSet { writes } => {
+            let mut events = Vec::new();
+            for w in writes.iter() {
+                events.extend(update_light(world, w.pos, w.old, w.new));
+            }
+            events
+        }
         _ => Vec::new(),
     }
 }

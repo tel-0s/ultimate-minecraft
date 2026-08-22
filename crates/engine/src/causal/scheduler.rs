@@ -198,8 +198,9 @@ fn should_log(payload: &EventPayload, effective: bool) -> bool {
     match payload {
         EventPayload::BlockSet { .. } | EventPayload::EntitySet { .. } => effective,
         EventPayload::LightSet { .. } | EventPayload::LightBatch { .. } => true,
-        // Compound: apply synthesizes its concrete outcome entries itself.
+        // Compounds: apply synthesizes their concrete outcome entries.
         EventPayload::EntityMaterialize { .. } => false,
+        EventPayload::AtomicBlockSet { .. } => false,
         _ => false,
     }
 }
@@ -295,6 +296,21 @@ fn apply_event(world: &World, payload: &EventPayload, synth_log: &mut Vec<EventP
             }
             // No free cell below the ceiling: the block is voided (the
             // despawn stands — matter loss only above build height).
+            true
+        }
+        // ATOMIC multi-cell rewrite (pistons): all-or-nothing under the
+        // affected chunks' write locks — see `World::apply_atomic_writes`.
+        // On success, synthesize per-cell `BlockSet` log entries so
+        // replicas and clients replay the exact outcome; on any stale
+        // cell, nothing moved and nothing is logged (the emitting rule
+        // re-evaluates from a later notify — self-healing, no tearing).
+        EventPayload::AtomicBlockSet { writes } => {
+            if !world.apply_atomic_writes(writes) {
+                return false;
+            }
+            for w in writes.iter() {
+                synth_log.push(EventPayload::BlockSet { pos: w.pos, old: w.old, new: w.new });
+            }
             true
         }
         // `After` never executes directly: the physics router unwraps it

@@ -111,7 +111,7 @@ fn repeater_output(pos: BlockPos, id: BlockId) -> Option<BlockPos> {
 /// Power the block at `from` pushes into the adjacent cell `to`.
 /// Directional emitters (repeaters) check the direction; everything else
 /// radiates. Wire is handled separately (its power attenuates).
-fn emitted_power(world: &World, from: BlockPos, to: BlockPos) -> u8 {
+pub(crate) fn emitted_power(world: &World, from: BlockPos, to: BlockPos) -> u8 {
     let id = world.get_block(from);
     match block_name(id) {
         "lever" if is_powered(id) => 15,

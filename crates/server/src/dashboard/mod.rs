@@ -127,6 +127,14 @@ pub fn snapshot_graph(graph: &CausalGraph) -> GraphSnapshot {
                 format!("LightNotify ({},{},{})", pos.x, pos.y, pos.z),
                 [pos.x, pos.y, pos.z],
             ),
+            EventPayload::AtomicBlockSet { writes } => (
+                "atomic_block_set".to_string(),
+                format!("AtomicSet ({} cells)", writes.len()),
+                writes
+                    .first()
+                    .map(|w| [w.pos.x, w.pos.y, w.pos.z])
+                    .unwrap_or([0, 0, 0]),
+            ),
             EventPayload::LightBatch { changes } => {
                 let anchor = changes
                     .first()

@@ -21,6 +21,14 @@ pub struct Event {
     pub payload: EventPayload,
 }
 
+/// One cell of an [`EventPayload::AtomicBlockSet`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockWrite {
+    pub pos: BlockPos,
+    pub old: BlockId,
+    pub new: BlockId,
+}
+
 /// One cell of a [`EventPayload::LightBatch`].
 #[derive(Debug, Clone, Copy)]
 pub struct LightCell {
@@ -97,6 +105,18 @@ pub enum EventPayload {
         block: BlockId,
     },
 
+    /// ATOMIC multi-cell block rewrite (Phase 7: pistons): every write is
+    /// guarded on its recorded `old`, and apply is all-or-nothing — the
+    /// cells are verified and written together under the affected chunks'
+    /// write locks. This is the block-lattice sibling of
+    /// `EntityMaterialize`, and exists for the same reason: a piston push
+    /// moves up to 12 blocks as ONE rewrite, and no composition of
+    /// separately-guarded `BlockSet`s conserves matter when another
+    /// cascade wins a race for one cell mid-chain (half the chain moves,
+    /// the other half duplicates). Apply synthesizes per-cell `BlockSet`
+    /// write-log entries so replicas and clients replay the outcome.
+    AtomicBlockSet { writes: std::sync::Arc<[BlockWrite]> },
+
     /// A timed event (Phase 5): `inner` must not execute before engine time
     /// `at`. The causal graph itself stays pure-causal — the physics
     /// worker's router unwraps `After` into its timer heap and inserts
@@ -126,6 +146,7 @@ impl EventPayload {
             | EventPayload::LightSet { pos, .. }
             | EventPayload::LightNotify { pos } => vec![*pos],
             EventPayload::LightBatch { changes } => changes.iter().map(|c| c.pos).collect(),
+            EventPayload::AtomicBlockSet { writes } => writes.iter().map(|w| w.pos).collect(),
             EventPayload::EntitySet { old, new, .. } => new
                 .as_ref()
                 .or(old.as_ref())
@@ -144,6 +165,14 @@ impl EventPayload {
             | EventPayload::BlockNotify { pos }
             | EventPayload::LightSet { pos, .. }
             | EventPayload::LightNotify { pos } => pos.chunk(),
+            // The initiating cell (a piston's own block) is written first
+            // and anchors ownership; the rest of the chain may cross into
+            // a neighboring chunk, which the multi-chunk-locked apply
+            // tolerates.
+            EventPayload::AtomicBlockSet { writes } => writes
+                .first()
+                .map(|w| w.pos.chunk())
+                .unwrap_or(ChunkPos::new(0, 0)),
             // A light flood spans chunks; its origin cell anchors it.
             EventPayload::LightBatch { changes } => changes
                 .first()
@@ -189,6 +218,7 @@ impl EventPayload {
             | EventPayload::LightBatch { .. }
             | EventPayload::EntitySet { .. }
             | EventPayload::EntityMaterialize { .. }
+            | EventPayload::AtomicBlockSet { .. }
             // Timed events never coalesce (their identity includes `at`;
             // two despawn timers for different entities share nothing).
             | EventPayload::After { .. } => None,

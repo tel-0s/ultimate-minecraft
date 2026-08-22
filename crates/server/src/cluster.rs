@@ -73,6 +73,9 @@ fn put_i64(buf: &mut Vec<u8>, v: i64) {
 fn put_u16(buf: &mut Vec<u8>, v: u16) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
+fn put_u32(buf: &mut Vec<u8>, v: u32) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
 fn put_pos(buf: &mut Vec<u8>, p: BlockPos) {
     put_i64(buf, p.x);
     put_i64(buf, p.y);
@@ -184,6 +187,15 @@ fn encode_payload(buf: &mut Vec<u8>, p: &EventPayload) {
             put_opt_entity_state(buf, &Some(*old));
             put_u16(buf, block.0);
         }
+        EventPayload::AtomicBlockSet { writes } => {
+            buf.push(9);
+            put_u32(buf, writes.len() as u32);
+            for w in writes.iter() {
+                put_pos(buf, w.pos);
+                put_u16(buf, w.old.0);
+                put_u16(buf, w.new.0);
+            }
+        }
     }
 }
 
@@ -248,6 +260,18 @@ fn decode_payload(r: &mut Reader) -> Result<EventPayload> {
             old: read_opt_entity_state(r)?.ok_or_else(|| anyhow!("materialize without state"))?,
             block: BlockId(r.u16()?),
         },
+        9 => {
+            let n = r.u32()? as usize;
+            let mut writes = Vec::with_capacity(n);
+            for _ in 0..n {
+                writes.push(ultimate_engine::causal::event::BlockWrite {
+                    pos: r.pos()?,
+                    old: BlockId(r.u16()?),
+                    new: BlockId(r.u16()?),
+                });
+            }
+            EventPayload::AtomicBlockSet { writes: writes.into() }
+        }
         other => return Err(anyhow!("bad payload tag {other}")),
     })
 }
@@ -862,6 +886,13 @@ fn apply_replica_writes(world: &World, payloads: &[EventPayload]) {
         match p {
             EventPayload::BlockSet { pos, new, .. } => {
                 world.set_block_untracked(*pos, *new);
+            }
+            // Never in a write log (apply synthesizes per-cell BlockSets),
+            // but harmless to honor: outcomes are authoritative here.
+            EventPayload::AtomicBlockSet { writes } => {
+                for w in writes.iter() {
+                    world.set_block_untracked(w.pos, w.new);
+                }
             }
             EventPayload::LightSet { pos, light_type, new, .. } => match light_type {
                 LightType::Sky => {

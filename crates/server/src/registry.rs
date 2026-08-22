@@ -31,7 +31,8 @@ pub const MC_DATA_VERSION: i32 = 4903;
 /// they agree on this. Combines the MC protocol version (block/biome ID
 /// spaces) with our own payload-codec revision (bump when
 /// `cluster::encode_payload` changes shape).
-pub const CLUSTER_CODEC_VERSION: u32 = 1;
+/// v2: `AtomicBlockSet` payload (tag 9, pistons).
+pub const CLUSTER_CODEC_VERSION: u32 = 2;
 pub fn cluster_wire_version() -> u64 {
     ((azalea_protocol::packets::PROTOCOL_VERSION as u64) << 32) | CLUSTER_CODEC_VERSION as u64
 }

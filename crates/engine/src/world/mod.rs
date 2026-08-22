@@ -133,6 +133,60 @@ impl World {
         self.chunks.remove(&pos).is_some()
     }
 
+    /// Apply a set of guarded writes ALL-OR-NOTHING: acquire the write
+    /// guards of every affected chunk (in canonical order — all
+    /// multi-chunk lockers must sort, and every other path in the
+    /// codebase holds at most one chunk guard at a time, so this cannot
+    /// deadlock), verify that every cell still holds its recorded `old`,
+    /// then perform every write. Returns whether the writes applied.
+    ///
+    /// This is the block-lattice commit point for compound rewrites
+    /// (piston pushes): holding the chunk guards excludes EVERY other
+    /// writer — same-worker, cross-partition, and rebalance-window alike
+    /// — so a chain can never tear.
+    ///
+    /// A write into a missing (unloaded/ungenerated) chunk fails the
+    /// whole set: movement into unmaterialized space is indistinguishable
+    /// from a stale precondition.
+    pub fn apply_atomic_writes(&self, writes: &[crate::causal::event::BlockWrite]) -> bool {
+        let mut chunk_positions: Vec<ChunkPos> = writes.iter().map(|w| w.pos.chunk()).collect();
+        chunk_positions.sort_unstable_by_key(|c| (c.x, c.z));
+        chunk_positions.dedup();
+
+        let mut guards: Vec<(ChunkPos, dashmap::mapref::one::RefMut<'_, ChunkPos, Chunk>)> =
+            Vec::with_capacity(chunk_positions.len());
+        for cp in &chunk_positions {
+            match self.chunks.get_mut(cp) {
+                Some(g) => guards.push((*cp, g)),
+                None => return false,
+            }
+        }
+
+        let chunk_of = |guards: &mut Vec<(ChunkPos, dashmap::mapref::one::RefMut<'_, ChunkPos, Chunk>)>,
+                        cp: ChunkPos|
+         -> usize {
+            guards.iter().position(|(c, _)| *c == cp).expect("guard held")
+        };
+
+        // Verify every precondition under the locks...
+        for w in writes {
+            let i = chunk_of(&mut guards, w.pos.chunk());
+            if guards[i].1.get_block(w.pos.local()) != w.old {
+                return false;
+            }
+        }
+        // ...then commit every write.
+        for w in writes {
+            let i = chunk_of(&mut guards, w.pos.chunk());
+            guards[i].1.set_block(w.pos.local(), w.new);
+        }
+        drop(guards);
+        for cp in chunk_positions {
+            self.dirty.insert(cp);
+        }
+        true
+    }
+
     /// Mark a chunk as having unsaved modifications without writing a
     /// block (persistence-format migration: a chunk loaded from a legacy
     /// save format re-saves in the current one on the next autosave).
@@ -259,6 +313,42 @@ impl Default for World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_writes_are_all_or_nothing() {
+        use crate::causal::event::BlockWrite;
+        let world = World::new();
+        let a = BlockPos::new(1, 10, 1);
+        let b = BlockPos::new(40, 10, 40); // different chunk
+        world.set_block(a, BlockId::new(7));
+        world.set_block(b, BlockId::new(8));
+
+        // One stale precondition anywhere → NOTHING is written.
+        let stale = [
+            BlockWrite { pos: a, old: BlockId::new(7), new: BlockId::new(9) },
+            BlockWrite { pos: b, old: BlockId::new(999), new: BlockId::new(10) },
+        ];
+        assert!(!world.apply_atomic_writes(&stale));
+        assert_eq!(world.get_block(a), BlockId::new(7), "no partial application");
+        assert_eq!(world.get_block(b), BlockId::new(8));
+
+        // All preconditions hold → everything is written, across chunks.
+        let good = [
+            BlockWrite { pos: a, old: BlockId::new(7), new: BlockId::new(9) },
+            BlockWrite { pos: b, old: BlockId::new(8), new: BlockId::new(10) },
+        ];
+        assert!(world.apply_atomic_writes(&good));
+        assert_eq!(world.get_block(a), BlockId::new(9));
+        assert_eq!(world.get_block(b), BlockId::new(10));
+
+        // A write into a missing chunk fails the whole set.
+        let missing = [BlockWrite {
+            pos: BlockPos::new(10_000, 10, 10_000),
+            old: BlockId::AIR,
+            new: BlockId::new(1),
+        }];
+        assert!(!world.apply_atomic_writes(&missing));
+    }
 
     #[test]
     fn set_block_marks_dirty_but_untracked_does_not() {
