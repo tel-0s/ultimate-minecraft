@@ -1,3 +1,4 @@
+pub mod attachment;
 pub mod block_updates;
 pub mod entity;
 pub mod helpers;
@@ -23,6 +24,7 @@ pub fn standard() -> RuleSet {
     rules.add(entity::entity_block_wake);
     rules.add(redstone::redstone);
     rules.add(piston::piston);
+    rules.add(attachment::attachment_support);
     rules
 }
 
@@ -43,5 +45,6 @@ pub fn standard_with_falling_blocks() -> RuleSet {
     rules.add(entity::entity_block_wake);
     rules.add(redstone::redstone);
     rules.add(piston::piston);
+    rules.add(attachment::attachment_support);
     rules
 }

@@ -99,11 +99,36 @@ pub fn player_state(
 
 // ── Spawning ─────────────────────────────────────────────────────────────
 
+/// Entity id for an item popped off a broken support at `pos` — DERIVED
+/// from the position (bit-62 namespace; x/z 26 bits, y 9 bits) instead
+/// of allocated. Determinism is what makes pop drops exactly-once with
+/// no new machinery: two racing pop evaluations spawn the SAME id, and
+/// the second dies at the ordinary `EntitySet { old: None }` guard.
+/// (While a popped item lies unclaimed on its cell, a second pop at that
+/// exact cell is suppressed — accepted, documented coarseness.)
+pub fn pop_item_id(pos: BlockPos) -> ultimate_engine::world::entity::EntityId {
+    let x = (pos.x as u64) & 0x3FF_FFFF;
+    let z = (pos.z as u64) & 0x3FF_FFFF;
+    let y = ((pos.y + 64) as u64) & 0x1FF;
+    ultimate_engine::world::entity::EntityId((1 << 62) | (x << 35) | (z << 9) | y)
+}
+
 /// Events that bring a dropped item into the world: the guarded spawn
 /// `EntitySet` plus its despawn timer. Deterministic pop velocity (derived
 /// from the id) so replicas/replays agree.
 pub fn spawn_item_events(world: &World, at: BlockPos, dropped: BlockId) -> Vec<Event> {
     let id = world.entities().allocate_id();
+    spawn_item_events_with_id(world, id, at, dropped)
+}
+
+/// `spawn_item_events` with a caller-chosen id (position-derived pop
+/// drops use this for guard-based exactly-once).
+pub fn spawn_item_events_with_id(
+    world: &World,
+    id: ultimate_engine::world::entity::EntityId,
+    at: BlockPos,
+    dropped: BlockId,
+) -> Vec<Event> {
     let now = world.now();
     let angle = (id.0.wrapping_mul(0x9E3779B97F4A7C15) >> 40) as f64 / (1 << 24) as f64
         * std::f64::consts::TAU;

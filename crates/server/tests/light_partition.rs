@@ -75,7 +75,7 @@ fn place(handle: &PhysicsHandle, world: &World, pos: BlockPos, id: BlockId) {
     });
 }
 
-const Y: i64 = 6; // torches sit on the surface (dirt top at y=5)
+const Y: i64 = 5; // the first air cell — torches stand ON the dirt at y=4
 
 /// Sample the block-light field in a box around `center`.
 fn light_field(world: &World, center: BlockPos, r: i64) -> Vec<u8> {

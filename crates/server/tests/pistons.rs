@@ -74,6 +74,13 @@ fn with_props(id: BlockId, changes: &[(&str, &str)]) -> BlockId {
     ultimate_server::registry::with_props(id, changes).expect("state combination exists")
 }
 
+/// A lever standing on the block below (the default state is a WALL
+/// lever, which the attachment rule would rightly pop off thin air).
+fn floor_lever() -> BlockId {
+    ultimate_server::registry::with_props(state_of("lever"), &[("face", "floor")])
+        .expect("floor lever state")
+}
+
 fn place(handle: &PhysicsHandle, world: &World, pos: BlockPos, id: BlockId) {
     handle.submit_action(BlockAction {
         pos,
@@ -100,7 +107,7 @@ fn piston_rig(handle: &PhysicsHandle, world: &World, sticky: bool) -> (BlockPos,
     let piston = BlockPos::new(2, Y, 8);
     let lever = BlockPos::new(1, Y, 8);
     place(handle, world, piston, with_props(state_of(base), &[("facing", "east")]));
-    place(handle, world, lever, state_of("lever"));
+    place(handle, world, lever, floor_lever());
     (piston, lever)
 }
 
@@ -151,7 +158,7 @@ fn immovable_and_push_limit_abort_without_tearing() {
         let piston = BlockPos::new(2, Y, 10);
         let lever = BlockPos::new(1, Y, 10);
         place(&handle, &world, piston, with_props(state_of("piston"), &[("facing", "east")]));
-        place(&handle, &world, lever, state_of("lever"));
+        place(&handle, &world, lever, floor_lever());
         (piston, lever)
     };
     for x in 3..(3 + 13) {
@@ -207,7 +214,7 @@ fn sticky_piston_pulls_on_retract_and_normal_leaves() {
     let piston2 = BlockPos::new(2, Y, 12);
     let lever2 = BlockPos::new(1, Y, 12);
     place(&handle, &world, piston2, with_props(state_of("piston"), &[("facing", "east")]));
-    place(&handle, &world, lever2, state_of("lever"));
+    place(&handle, &world, lever2, floor_lever());
     place(&handle, &world, BlockPos::new(3, Y, 12), block::DIRT);
     quiesce(&handle);
     flip_lever(&handle, &world, lever2);

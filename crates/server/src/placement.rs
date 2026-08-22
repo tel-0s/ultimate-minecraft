@@ -177,6 +177,30 @@ pub fn orient_block(
         .unwrap_or(default_state)
 }
 
+/// Torch-family blocks placed against a horizontal face become their
+/// WALL variant (a different block kind), facing away from the support —
+/// vanilla behavior a real client also predicts. Returns `None` for
+/// non-torches or top/bottom placements (the standing form is correct).
+pub fn attachable_wall_variant(held: BlockState, hit: Direction) -> Option<BlockState> {
+    let name = held.to_trait().id();
+    let wall = match name {
+        "torch" => "wall_torch",
+        "soul_torch" => "soul_wall_torch",
+        "redstone_torch" => "redstone_wall_torch",
+        _ => return None,
+    };
+    let facing = match hit {
+        Direction::North => "north",
+        Direction::South => "south",
+        Direction::West => "west",
+        Direction::East => "east",
+        Direction::Up | Direction::Down => return None,
+    };
+    let wall_default = crate::registry::block_id_from_name(wall)?;
+    let oriented = crate::registry::with_props(wall_default, &[("facing", facing)])?;
+    BlockState::try_from(oriented.0 as u32).ok()
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Get a mutable reference to a property value by key, if it exists.

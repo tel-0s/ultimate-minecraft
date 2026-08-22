@@ -56,13 +56,16 @@ impl Inventory {
 
 /// Break a block: instant in creative. `old` is our observation — the
 /// physics stale guard drops the action if another event won the cell.
+/// Creative breaks drop NOTHING (vanilla); the one legitimate drop path
+/// is an attachment popping off a broken support, which the
+/// `rules::attachment` support rule handles with its own guarded spawn.
 pub fn break_action(world: &World, pos: BlockPos) -> BlockAction {
     BlockAction {
         pos,
         old: world.get_block(pos),
         new: crate::block::AIR,
         update_stairs: true,
-        drop_item: true,
+        drop_item: false,
     }
 }
 
@@ -118,14 +121,22 @@ pub fn place_action(
     let target = placement_target(hit);
 
     let cursor_y = (hit.location.y - hit.block_pos.y as f64) as f32;
-    let oriented = crate::placement::orient_block(
-        held,
-        player_y_rot,
-        player_x_rot,
-        hit.direction,
-        cursor_y,
-    );
-    let oriented = crate::placement::compute_stair_shape_for_placement(oriented, world, target);
+    // Torch-family blocks placed against a side face become their WALL
+    // variant (a different block, not a property) — checked before the
+    // generic orientation pass.
+    let oriented = match crate::placement::attachable_wall_variant(held, hit.direction) {
+        Some(wall_state) => wall_state,
+        None => {
+            let o = crate::placement::orient_block(
+                held,
+                player_y_rot,
+                player_x_rot,
+                hit.direction,
+                cursor_y,
+            );
+            crate::placement::compute_stair_shape_for_placement(o, world, target)
+        }
+    };
 
     Some(BlockAction {
         pos: target,

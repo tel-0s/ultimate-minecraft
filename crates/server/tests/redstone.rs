@@ -76,6 +76,13 @@ fn state_of(name: &str) -> BlockId {
     BlockId(u32::from(azalea_block::BlockState::from(kind)) as u16)
 }
 
+/// A lever standing on the block below (the default state is a WALL
+/// lever, which the attachment rule would rightly pop off thin air).
+fn floor_lever() -> BlockId {
+    ultimate_server::registry::with_props(state_of("lever"), &[("face", "floor")])
+        .expect("floor lever state")
+}
+
 fn place(handle: &PhysicsHandle, world: &World, pos: BlockPos, id: BlockId) {
     handle.submit_action(BlockAction {
         pos,
@@ -103,7 +110,7 @@ fn lever_powers_wire_run_and_lamp() {
     let handle = start(&world);
 
     // lever at x=0, wire x=1..=5, lamp at x=6 — all on the surface.
-    place(&handle, &world, BlockPos::new(0, Y, 8), state_of("lever"));
+    place(&handle, &world, BlockPos::new(0, Y, 8), floor_lever());
     for x in 1..=5 {
         place(&handle, &world, BlockPos::new(x, Y, 8), state_of("redstone_wire"));
     }
@@ -153,7 +160,7 @@ fn torch_inverts_with_one_redstone_tick_delay() {
     let lever = BlockPos::new(3, Y, 8);
     place(&handle, &world, pillar, BlockId::new(1));
     place(&handle, &world, torch, state_of("redstone_torch"));
-    place(&handle, &world, lever, state_of("lever"));
+    place(&handle, &world, lever, floor_lever());
     quiesce(&handle);
     assert!(is_lit(&world, torch), "torch lit while input off");
 
@@ -189,7 +196,7 @@ fn torch_tracks_oscillating_input_with_one_tick_lag() {
     let lever = BlockPos::new(7, Y, 8);
     place(&handle, &world, pillar, BlockId::new(1));
     place(&handle, &world, torch, state_of("redstone_torch"));
-    place(&handle, &world, lever, state_of("lever"));
+    place(&handle, &world, lever, floor_lever());
     quiesce(&handle);
 
     let mut expected_lit = true;
@@ -221,7 +228,7 @@ fn wire_climbs_a_step_and_occlusion_blocks_it() {
     // lever + wire on the surface; a stone step with wire on top; wire
     // continues on the upper level into a lamp.
     // x:  0      1       2(step y5, wire y6)   3 (wire y6)  4 (lamp y6)
-    place(&handle, &world, BlockPos::new(0, Y, 8), state_of("lever"));
+    place(&handle, &world, BlockPos::new(0, Y, 8), floor_lever());
     place(&handle, &world, BlockPos::new(1, Y, 8), state_of("redstone_wire"));
     place(&handle, &world, BlockPos::new(2, Y, 8), BlockId::new(1)); // stone step
     place(&handle, &world, BlockPos::new(2, Y + 1, 8), state_of("redstone_wire"));
@@ -255,7 +262,12 @@ fn button_presses_and_releases_itself() {
     let (world, clock) = flat_world(2);
     let handle = start(&world);
 
-    place(&handle, &world, BlockPos::new(0, Y, 8), state_of("stone_button"));
+    place(
+        &handle,
+        &world,
+        BlockPos::new(0, Y, 8),
+        with_props(state_of("stone_button"), &[("face", "floor")]),
+    );
     place(&handle, &world, BlockPos::new(1, Y, 8), state_of("redstone_wire"));
     place(&handle, &world, BlockPos::new(2, Y, 8), state_of("redstone_lamp"));
     quiesce(&handle);
@@ -334,7 +346,7 @@ fn repeater_delays_refreshes_and_isolates() {
     let handle = start(&world);
 
     // lever(x0) → wire(x1) → repeater(x2, input west) → wire(x3) → lamp(x4)
-    place(&handle, &world, BlockPos::new(0, Y, 8), state_of("lever"));
+    place(&handle, &world, BlockPos::new(0, Y, 8), floor_lever());
     place(&handle, &world, BlockPos::new(1, Y, 8), state_of("redstone_wire"));
     let repeater = with_props(state_of("repeater"), &[("facing", "west")]);
     place(&handle, &world, BlockPos::new(2, Y, 8), repeater);
@@ -367,7 +379,7 @@ fn repeater_delays_refreshes_and_isolates() {
     assert_eq!(wire_power(&world, BlockPos::new(3, Y, 8)), 0, "output follows after the delay");
 
     // Isolation: powering the OUTPUT side must not leak backwards.
-    place(&handle, &world, BlockPos::new(3, Y, 7), state_of("lever"));
+    place(&handle, &world, BlockPos::new(3, Y, 7), floor_lever());
     quiesce(&handle);
     let side = BlockPos::new(3, Y, 7);
     let on = ultimate_server::rules::redstone::toggle_lever(world.get_block(side)).unwrap();

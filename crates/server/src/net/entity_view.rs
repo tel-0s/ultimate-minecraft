@@ -64,7 +64,14 @@ pub(crate) fn dropped_item_kind(block: ultimate_engine::world::block::BlockId) -
         return azalea_registry::builtin::ItemKind::Stone;
     };
     let b: &dyn BlockTrait = state.to_trait();
-    b.id().parse().unwrap_or(azalea_registry::builtin::ItemKind::Stone)
+    // Blocks whose item form has a different name (mirror of
+    // gameplay::item_to_block_kind's special cases).
+    match b.id() {
+        "redstone_wire" => azalea_registry::builtin::ItemKind::Redstone,
+        "water" => azalea_registry::builtin::ItemKind::WaterBucket,
+        "lava" => azalea_registry::builtin::ItemKind::LavaBucket,
+        n => n.parse().unwrap_or(azalea_registry::builtin::ItemKind::Stone),
+    }
 }
 
 /// Is this an engine entity kind we project to clients?
