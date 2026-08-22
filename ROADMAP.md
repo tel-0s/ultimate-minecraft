@@ -975,3 +975,4 @@ one azalea table.
 | 2026-08-21 | net/ split (handshake / chunk_stream / entity_view) + gameplay layer |
 | 2026-08-21 | handle_play componentized (ChunkStreamer/EntityTracker/Presence/Avatar); cross-node player-eid collision fixed |
 | 2026-08-21 | P2: exact swept collision (parabolic DDA) + mob AI skeleton (/summon) |
+| 2026-08-21 | **Real vanilla 26.2 client joins and plays** — five protocol fixes found via the deobfuscated client jar (world_clock + sound-variant registries, full vanilla tag networks, all synchronized registry elements, 26.x section fluid_count); swarm upgraded from packet counter to format validator |
