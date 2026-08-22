@@ -2,9 +2,10 @@
 //!
 //! The design contract (docs/phase5-entities.md):
 //! - Entity state is a parametric trajectory (pos, vel, stamp). The rule
-//!   plans ONE segment ahead — to the first collision, or a 1 s
-//!   extrapolation cap — and emits a single `After`-wrapped `EntitySet`
-//!   for the segment's end. Between events nothing runs.
+//!   plans ONE segment ahead — to the first collision (EXACT parabolic
+//!   voxel sweep, see `plan_segment`), or a 1 s extrapolation cap — and
+//!   emits a single `After`-wrapped `EntitySet` for the segment's end.
+//!   Between events nothing runs.
 //! - At rest (supported, still) the rule emits NOTHING. A resting entity
 //!   is woken exclusively by `EntityWake` (block change, timer, pickup).
 //! - Every `EntitySet` is guarded on `old`; a superseded in-flight segment
@@ -39,9 +40,14 @@ pub const KIND_FALLING_BLOCK: EntityKind = EntityKind(2);
 const GRAVITY: f64 = -20.0;
 /// Maximum trajectory-segment length: bounds client extrapolation drift.
 const T_CAP: Nanos = 1_000_000_000;
-/// Planning resolution for the swept collision check. Planning cost only —
-/// paid once per segment, never per frame.
-const SUBSTEP: Nanos = 25_000_000;
+/// Escape hatch when a segment STARTS inside a solid cell (a block was
+/// placed into the entity's cell): the entity pops onto the cell top
+/// after this much virtual time, so the zero-length "segment" still
+/// advances the timeline.
+const BURIED_ESCAPE: Nanos = 25_000_000;
+/// Offset from a face a side/ceiling impact rests at, so the resting
+/// point floors into the free cell, not the wall.
+const FACE_EPS: f64 = 1e-6;
 /// Items despawn 5 minutes after spawn (vanilla parity).
 pub const DESPAWN_AFTER: Nanos = 300_000_000_000;
 /// |velocity| below this counts as still.
@@ -201,36 +207,167 @@ fn supported(world: &World, pos: Vec3) -> bool {
     block::is_solid(world.get_block(below))
 }
 
-/// Integrate the trajectory in planning substeps until it enters a solid
-/// cell or the extrapolation cap. Returns the segment-end state (velocity
-/// zeroed on impact; the follow-up evaluation re-sleeps or re-falls).
+/// EXACT swept collision: walk the parabolic trajectory
+/// (`x,z` linear, `y` quadratic under gravity) through the voxel grid by
+/// solving successive cell-boundary crossing times, until it enters a
+/// solid cell or reaches the extrapolation cap. Replaces the fixed-25ms
+/// substep sampler, which could tunnel through single blocks above
+/// ~40 blocks/s and quantized landing times to the substep. Cost is
+/// O(cells traversed); the math is pure f64, so trajectories stay
+/// bit-identical across worker counts.
+///
+/// Returns the segment-end state — velocity zeroed on impact; the
+/// follow-up evaluation re-sleeps, converts (falling blocks), or
+/// re-falls (side/ceiling stops re-plan straight down).
 fn plan_segment(world: &World, start: &EntityState) -> EntityState {
-    let mut pos = start.pos;
-    let mut vel = start.vel;
-    let dt = SUBSTEP as f64 / 1e9;
-    let steps = (T_CAP / SUBSTEP).max(1);
+    let (p0, v0) = (start.pos, start.vel);
+    let t_max = T_CAP as f64 / 1e9;
+    let mut cell = p0.block_pos();
+    // A rest pose sits EXACTLY on a cell boundary (y = k + 1.0). A
+    // non-rising entity there occupies the cell BELOW — without this the
+    // τ=0 double root of the floor plane is filtered as "already
+    // crossed" and the sweep never sees the entity enter it (planning a
+    // clean 1-second drop through the floor).
+    if p0.y == cell.y as f64 && v0.y <= 0.0 {
+        cell.y -= 1;
+    }
 
-    for i in 1..=steps {
-        vel.y += GRAVITY * dt;
-        let next = Vec3::new(pos.x + vel.x * dt, pos.y + vel.y * dt, pos.z + vel.z * dt);
-        if block::is_solid(world.get_block(next.block_pos())) {
-            // Impact: stop at the last free position. If we were falling,
-            // snap to the top face of the cell below for a clean rest.
-            let mut landed = pos;
-            if vel.y < 0.0 {
-                landed.y = next.block_pos().y as f64 + 1.0;
+    // Segment starts inside a solid cell (a block was placed into the
+    // entity's cell): pop onto the cell top, like the sampler did.
+    if block::is_solid(world.get_block(cell)) {
+        return EntityState {
+            pos: Vec3::new(p0.x, cell.y as f64 + 1.0, p0.z),
+            vel: Vec3::ZERO,
+            stamp: start.stamp + BURIED_ESCAPE,
+            ..*start
+        };
+    }
+
+    // Position on the exact parabola at time t since segment start.
+    let at = |t: f64| {
+        Vec3::new(
+            p0.x + v0.x * t,
+            p0.y + v0.y * t + 0.5 * GRAVITY * t * t,
+            p0.z + v0.z * t,
+        )
+    };
+
+    // Linear DDA state per horizontal axis: time of next boundary
+    // crossing and the fixed per-cell time step.
+    let axis_init = |x0: f64, vx: f64, cx: i64| -> (f64, f64) {
+        if vx > 0.0 {
+            (((cx + 1) as f64 - x0) / vx, 1.0 / vx)
+        } else if vx < 0.0 {
+            ((cx as f64 - x0) / vx, -1.0 / vx)
+        } else {
+            (f64::INFINITY, f64::INFINITY)
+        }
+    };
+    let (mut t_x, dt_x) = axis_init(p0.x, v0.x, cell.x);
+    let (mut t_z, dt_z) = axis_init(p0.z, v0.z, cell.z);
+
+    // Next y-boundary crossing strictly after `t`, leaving the current
+    // cell. The parabola is concave (GRAVITY < 0), so it crosses any
+    // horizontal line at most twice: once rising (smaller root), once
+    // falling (larger root). Returns (t_cross, dy).
+    let next_y = |t: f64, cy: i64| -> (f64, i64) {
+        // Roots of ½g·τ² + v0y·τ + (p0.y - yb) = 0.
+        let roots = |yb: f64| -> (f64, f64) {
+            let (a, b, c) = (0.5 * GRAVITY, v0.y, p0.y - yb);
+            let disc = b * b - 4.0 * a * c;
+            if disc < 0.0 {
+                return (f64::INFINITY, f64::INFINITY);
             }
+            let sq = disc.sqrt();
+            // a < 0: (−b+√)/2a is the SMALLER (rising) root.
+            let r1 = (-b + sq) / (2.0 * a);
+            let r2 = (-b - sq) / (2.0 * a);
+            (r1.min(r2), r1.max(r2))
+        };
+        const T_EPS: f64 = 1e-12;
+        // Rising exit through the ceiling plane…
+        let (up, _) = roots((cy + 1) as f64);
+        // …or falling exit through the floor plane.
+        let (_, down) = roots(cy as f64);
+        let up = if up > t + T_EPS { up } else { f64::INFINITY };
+        let down = if down > t + T_EPS { down } else { f64::INFINITY };
+        if up < down { (up, 1) } else { (down, -1) }
+    };
+
+    let mut t = 0.0;
+    loop {
+        let (t_y, dy) = next_y(t, cell.y);
+        // Earliest crossing wins; ties break y-first (deterministic).
+        let (t_cross, axis) = if t_y <= t_x && t_y <= t_z {
+            (t_y, 1)
+        } else if t_x <= t_z {
+            (t_x, 0)
+        } else {
+            (t_z, 2)
+        };
+
+        if t_cross > t_max {
+            // No solid within the cap: chain another segment from the
+            // exact parabola state at t_max.
             return EntityState {
-                pos: landed,
-                vel: Vec3::ZERO,
-                stamp: start.stamp + i * SUBSTEP,
+                pos: at(t_max),
+                vel: Vec3::new(v0.x, v0.y + GRAVITY * t_max, v0.z),
+                stamp: start.stamp + T_CAP,
                 ..*start
             };
         }
-        pos = next;
-    }
 
-    EntityState { pos, vel, stamp: start.stamp + T_CAP, ..*start }
+        let entered = match axis {
+            1 => BlockPos::new(cell.x, cell.y + dy, cell.z),
+            0 => BlockPos::new(cell.x + v0.x.signum() as i64, cell.y, cell.z),
+            _ => BlockPos::new(cell.x, cell.y, cell.z + v0.z.signum() as i64),
+        };
+
+        if block::is_solid(world.get_block(entered)) {
+            let hit = at(t_cross);
+            let pos = match (axis, dy) {
+                // Landing on a top face: rest exactly on it.
+                (1, -1) => Vec3::new(hit.x, entered.y as f64 + 1.0, hit.z),
+                // Ceiling: stop just below the face.
+                (1, _) => Vec3::new(hit.x, entered.y as f64 - FACE_EPS, hit.z),
+                // Wall: stop just in front of the face; the follow-up
+                // evaluation finds no support and re-plans straight down.
+                // (The sampler used to VAULT side-grazes onto the wall
+                // top whenever the entity was falling — an artifact of
+                // its 0.5-block resolution, not vanilla behavior.)
+                (0, _) => {
+                    let face = if v0.x > 0.0 {
+                        entered.x as f64 - FACE_EPS
+                    } else {
+                        (entered.x + 1) as f64 + FACE_EPS
+                    };
+                    Vec3::new(face, hit.y, hit.z)
+                }
+                _ => {
+                    let face = if v0.z > 0.0 {
+                        entered.z as f64 - FACE_EPS
+                    } else {
+                        (entered.z + 1) as f64 + FACE_EPS
+                    };
+                    Vec3::new(hit.x, hit.y, face)
+                }
+            };
+            return EntityState {
+                pos,
+                vel: Vec3::ZERO,
+                stamp: start.stamp + (t_cross * 1e9) as Nanos,
+                ..*start
+            };
+        }
+
+        cell = entered;
+        match axis {
+            0 => t_x += dt_x,
+            2 => t_z += dt_z,
+            _ => {}
+        }
+        t = t_cross;
+    }
 }
 
 // ── FallingBlock (vanilla sand/gravel parity) ────────────────────────────

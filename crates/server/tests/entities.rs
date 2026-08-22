@@ -310,6 +310,77 @@ fn falling_matches_instant_gravity_final_state() {
     assert_eq!(run(true), run(false), "entity and instant gravity must agree");
 }
 
+// ── Exact swept collision: no tunneling at any speed ─────────────────────
+// The pre-sweep sampler integrated in fixed 25 ms substeps, so anything
+// faster than ~40 blocks/s could step clean over a 1-block wall. The
+// exact parabolic sweep solves boundary-crossing times instead; these
+// pin that behavior with velocities the sampler provably tunneled at.
+
+/// Far-future despawn deadline + dropped-block id, packed the way
+/// `rules::entity` packs item aux (high 48 bits = deadline ms).
+fn far_deadline_aux() -> u64 {
+    (600_000u64 << 16) | block::DIRT.0 as u64
+}
+
+#[test]
+fn fast_horizontal_item_stops_at_thin_wall() {
+    let (world, clock) = flat_world_manual_clock(2);
+    // A 1-block-thick wall at x=20, in the flight path.
+    for y in 5..9 {
+        world.set_block(BlockPos::new(20, y, 8), BlockId::new(1));
+    }
+    let handle = start(&world, 4);
+
+    let id = world.entities().allocate_id();
+    let s0 = EntityState {
+        kind: KIND_ITEM,
+        pos: ultimate_engine::world::entity::Vec3::new(8.5, 5.5, 8.5),
+        vel: ultimate_engine::world::entity::Vec3::new(400.0, 0.0, 0.0),
+        stamp: world.now(),
+        aux: far_deadline_aux(),
+    };
+    handle.submit_events(vec![Event {
+        payload: EventPayload::EntitySet { id, old: None, new: Some(s0) },
+    }]);
+    quiesce(&handle);
+    advance_and_settle(&clock, &handle, 1000);
+
+    let (_, s) = the_item(&world);
+    assert!(
+        s.pos.x < 20.0 && s.pos.x > 18.0,
+        "400 b/s item must stop at the wall (x=20), got x={}",
+        s.pos.x
+    );
+    assert!((s.pos.y - 5.0).abs() < 1e-9, "then drop to the floor, got y={}", s.pos.y);
+}
+
+#[test]
+fn fast_vertical_item_lands_on_the_ground() {
+    let (world, clock) = flat_world_manual_clock(2);
+    let handle = start(&world, 4);
+
+    let id = world.entities().allocate_id();
+    let s0 = EntityState {
+        kind: KIND_ITEM,
+        pos: ultimate_engine::world::entity::Vec3::new(8.5, 60.0, 8.5),
+        vel: ultimate_engine::world::entity::Vec3::new(0.0, -400.0, 0.0),
+        stamp: world.now(),
+        aux: far_deadline_aux(),
+    };
+    handle.submit_events(vec![Event {
+        payload: EventPayload::EntitySet { id, old: None, new: Some(s0) },
+    }]);
+    quiesce(&handle);
+    advance_and_settle(&clock, &handle, 1000);
+
+    let (_, s) = the_item(&world);
+    assert!(
+        (s.pos.y - 5.0).abs() < 1e-9,
+        "a 400 b/s drop must land on the 5-block-thick ground, got y={}",
+        s.pos.y
+    );
+}
+
 // ── Determinism across worker counts ─────────────────────────────────────
 
 #[test]
