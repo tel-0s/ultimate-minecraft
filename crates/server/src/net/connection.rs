@@ -7,12 +7,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use azalea_chat::FormattedText;
 use azalea_protocol::common::movements::{PositionMoveRotation, RelativeMovements};
 use azalea_protocol::packets::ClientIntention;
 use azalea_protocol::packets::game::{
     ClientboundGamePacket, ClientboundGameEvent, ClientboundLogin,
     ClientboundPlayerPosition, ClientboundSetChunkCacheCenter,
     ClientboundTeleportEntity, ClientboundRotateHead,
+    ClientboundSystemChat,
     ServerboundGamePacket,
 };
 use azalea_protocol::packets::game::c_game_event::EventType;
@@ -654,8 +656,23 @@ where
                                 registry.broadcast_chat(conn_id, &player_name, &chat.message);
                             }
                             ServerboundGamePacket::ChatCommand(cmd) => {
-                                // Ignore slash-commands for now; just swallow the packet.
-                                tracing::debug!("{} sent command: /{}", player_name, cmd.command);
+                                let mut parts = cmd.command.split_whitespace();
+                                match parts.next() {
+                                    Some("summon") => {
+                                        let n = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+                                        let msg = crate::gameplay::summon_mobs(
+                                            world, physics, avatar.x, avatar.y, avatar.z, n,
+                                        );
+                                        let reply: ClientboundGamePacket = ClientboundSystemChat {
+                                            content: FormattedText::from(msg),
+                                            overlay: false,
+                                        }.into_variant();
+                                        write_packet(&reply, write, compression, cipher_enc).await?;
+                                    }
+                                    _ => {
+                                        tracing::debug!("{} sent command: /{}", player_name, cmd.command);
+                                    }
+                                }
                             }
 
                             // ── Ignored packets ─────────────────────────

@@ -150,3 +150,25 @@ pub fn item_to_block_kind(item: azalea_registry::builtin::ItemKind) -> Option<az
     let name = full.strip_prefix("minecraft:").unwrap_or(&full);
     name.parse::<BlockKind>().ok()
 }
+
+/// `/summon [count]` — spawn wander-mobs near a position (the manual
+/// spawn path until natural spawning lands). Returns a human-readable
+/// receipt for the chat.
+pub fn summon_mobs(
+    world: &World,
+    physics: &crate::physics::PhysicsHandle,
+    x: f64,
+    y: f64,
+    z: f64,
+    count: usize,
+) -> String {
+    use ultimate_engine::world::entity::Vec3;
+    let n = count.clamp(1, 100);
+    for i in 0..n {
+        // Ring placement so a batch doesn't stack in one cell.
+        let theta = i as f64 / n as f64 * std::f64::consts::TAU;
+        let at = Vec3::new(x + theta.cos() * 2.0, y + 0.5, z + theta.sin() * 2.0);
+        physics.submit_events(crate::rules::mob::spawn_mob_events(world, at, 0));
+    }
+    format!("Summoned {n} mob{}", if n == 1 { "" } else { "s" })
+}

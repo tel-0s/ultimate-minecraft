@@ -130,7 +130,7 @@ pub fn spawn_item_events(world: &World, at: BlockPos, dropped: BlockId) -> Vec<E
 // ── The kinematics rule ──────────────────────────────────────────────────
 
 /// Which entity does this payload concern (for kinematics rules)?
-fn kinematics_subject(payload: &EventPayload) -> Option<(ultimate_engine::world::entity::EntityId, bool)> {
+pub(crate) fn kinematics_subject(payload: &EventPayload) -> Option<(ultimate_engine::world::entity::EntityId, bool)> {
     match payload {
         // A segment endpoint just applied: keep chaining on its timeline.
         EventPayload::EntitySet { id, new: Some(_), .. } => Some((*id, false)),
@@ -140,7 +140,7 @@ fn kinematics_subject(payload: &EventPayload) -> Option<(ultimate_engine::world:
     }
 }
 
-fn is_still(s: &EntityState) -> bool {
+pub(crate) fn is_still(s: &EntityState) -> bool {
     s.vel.x.abs() < REST_EPS && s.vel.y.abs() < REST_EPS && s.vel.z.abs() < REST_EPS
 }
 
@@ -156,7 +156,7 @@ fn is_still(s: &EntityState) -> bool {
 /// superseded in-flight segment to the guard. A block *removed* from the
 /// path makes the old (now floating) endpoint win instead — and its
 /// removal wake then re-derives, so it self-heals downward.
-fn plan_next(world: &World, id: ultimate_engine::world::entity::EntityId, cur: EntityState, woken: bool) -> Event {
+pub(crate) fn plan_next(world: &World, id: ultimate_engine::world::entity::EntityId, cur: EntityState, woken: bool) -> Event {
     let start = if woken && is_still(&cur) {
         EntityState { stamp: world.now(), ..cur }
     } else {
@@ -202,7 +202,7 @@ pub fn item_kinematics(world: &World, payload: &EventPayload) -> Vec<Event> {
 }
 
 /// Standing on a solid top face?
-fn supported(world: &World, pos: Vec3) -> bool {
+pub(crate) fn supported(world: &World, pos: Vec3) -> bool {
     let below = Vec3::new(pos.x, pos.y - 0.06, pos.z).block_pos();
     block::is_solid(world.get_block(below))
 }

@@ -69,7 +69,17 @@ pub(crate) fn dropped_item_kind(block: ultimate_engine::world::block::BlockId) -
 
 /// Is this an engine entity kind we project to clients?
 pub(crate) fn is_client_entity(kind: ultimate_engine::world::entity::EntityKind) -> bool {
-    kind == crate::rules::entity::KIND_ITEM || kind == crate::rules::entity::KIND_FALLING_BLOCK
+    kind == crate::rules::entity::KIND_ITEM
+        || kind == crate::rules::entity::KIND_FALLING_BLOCK
+        || kind == crate::rules::mob::KIND_MOB
+}
+
+/// Wire entity type for a mob variant (aux low 16 bits).
+pub(crate) fn mob_entity_kind(variant: u16) -> EntityKind {
+    match variant {
+        1 => EntityKind::Zombie,
+        _ => EntityKind::Pig,
+    }
 }
 
 /// Spawn an engine entity on the client. Items get AddEntity + the
@@ -86,11 +96,18 @@ pub(crate) async fn send_entity_spawn<W: AsyncWrite + Unpin + Send>(
     use azalea_inventory::ItemStack;
 
     let falling = state.kind == crate::rules::entity::KIND_FALLING_BLOCK;
+    let mob = state.kind == crate::rules::mob::KIND_MOB;
     let wire = item_wire_id(id);
     let add: ClientboundGamePacket = ClientboundAddEntity {
         id: wire,
         uuid: item_uuid(id),
-        entity_type: if falling { EntityKind::FallingBlock } else { EntityKind::Item },
+        entity_type: if falling {
+            EntityKind::FallingBlock
+        } else if mob {
+            mob_entity_kind(crate::rules::mob::mob_variant(state.aux))
+        } else {
+            EntityKind::Item
+        },
         position: Vec3 { x: state.pos.x, y: state.pos.y, z: state.pos.z },
         // Initial velocity (blocks/tick on the wire): the client animates
         // the pop arc / fall locally between our segment corrections.
@@ -110,7 +127,7 @@ pub(crate) async fn send_entity_spawn<W: AsyncWrite + Unpin + Send>(
     }.into_variant();
     write_packet(&add, write, compression, cipher).await?;
 
-    if !falling {
+    if !falling && !mob {
         let stack = ItemStack::Present(azalea_inventory::ItemStackData {
             kind: dropped_item_kind(crate::rules::entity::aux_block(state.aux)),
             count: 1,
