@@ -19,40 +19,235 @@ use ultimate_engine::world::World;
 use crate::event_bus::{self};
 use crate::worldgen::WorldGen;
 
-// ── Dynamic chunk loading ────────────────────────────────────────────────
+// ── Per-connection chunk streaming state ────────────────────────────────
 
-/// Check if the player has crossed a chunk boundary, and if so, queue new
-/// chunks for deferred loading and immediately unload old ones.
+/// Everything one connection needs to stream chunks: the view set, the
+/// deferred queue, delivery tracking, and bulk-streaming admission.
 ///
-/// New chunks are sorted by Chebyshev distance from the player (nearest first)
-/// and added to `chunk_send_queue`. The main loop drains this queue
-/// progressively so the event loop stays responsive during fast movement.
-pub(crate) async fn update_loaded_chunks<W: AsyncWrite + Unpin + Send>(
-    write: &mut W,
-    compression: Option<u32>,
-    cipher: &mut Option<azalea_crypto::Aes128CfbEnc>,
-    world: &World,
-    worldgen: &dyn WorldGen,
-    player_x: f64,
-    player_z: f64,
+/// Previously ~10 loose locals in `handle_play`; the invariants they
+/// share (loaded ⊇ sent; queue ⊆ loaded; permit held iff streaming) now
+/// live behind methods.
+pub(crate) struct ChunkStreamer {
     view_distance: i32,
     immediate_radius: i32,
-    current_chunk_x: &mut i32,
-    current_chunk_z: &mut i32,
-    loaded_chunks: &mut HashSet<(i32, i32)>,
-    sent_to_client: &mut HashSet<(i32, i32)>,
-    chunk_send_queue: &mut VecDeque<(i32, i32)>,
-) -> Result<()> {
+    chunks_per_iter: usize,
+    /// Player's current chunk (view center).
+    center: (i32, i32),
+    /// Chunks the client is *supposed* to have (claimed optimistically;
+    /// superset of `sent`).
+    loaded: HashSet<(i32, i32)>,
+    /// Chunks actually delivered to the socket.
+    sent: HashSet<(i32, i32)>,
+    /// Deferred delivery queue (nearest-first at enqueue time).
+    queue: VecDeque<(i32, i32)>,
+    /// Bulk-streaming admission (`network.stream_permits`): at most N
+    /// connections drain their queues at once so a join storm streams in
+    /// fast waves instead of 10k simultaneous trickles.
+    sem: std::sync::Arc<tokio::sync::Semaphore>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    wait_started: Option<std::time::Instant>,
+}
+
+impl ChunkStreamer {
+    /// Seed the full view around `center`. Chunks inside
+    /// `immediate_radius` are returned for synchronous send by
+    /// [`send_initial`](Self::send_initial) *if* admission granted a
+    /// permit immediately; everything else waits in the queue.
+    pub fn new(
+        net: &crate::config::NetworkConfig,
+        sem: std::sync::Arc<tokio::sync::Semaphore>,
+        center: (i32, i32),
+    ) -> Self {
+        let view_distance = net.view_distance;
+        let mut s = Self {
+            view_distance,
+            immediate_radius: net.immediate_radius.unwrap_or(2).min(view_distance),
+            chunks_per_iter: net.chunks_per_iter,
+            center,
+            loaded: HashSet::new(),
+            sent: HashSet::new(),
+            queue: VecDeque::new(),
+            permit: sem.clone().try_acquire_owned().ok(),
+            sem,
+            wait_started: None,
+        };
+        for cx in (center.0 - view_distance)..=(center.0 + view_distance) {
+            for cz in (center.1 - view_distance)..=(center.1 + view_distance) {
+                s.loaded.insert((cx, cz));
+            }
+        }
+        s
+    }
+
+    pub fn center(&self) -> (i32, i32) {
+        self.center
+    }
+
+    pub fn view_distance(&self) -> i32 {
+        self.view_distance
+    }
+
+    /// Initial load: the inner ring goes out synchronously (only while
+    /// holding a permit — in a join storm everything defers so
+    /// keep-alives keep flowing); the rest queues nearest-first.
+    pub async fn send_initial<W: AsyncWrite + Unpin + Send>(
+        &mut self,
+        write: &mut W,
+        compression: Option<u32>,
+        cipher: &mut Option<azalea_crypto::Aes128CfbEnc>,
+        world: &World,
+        worldgen: &dyn WorldGen,
+    ) -> Result<()> {
+        let (cx0, cz0) = self.center;
+        let mut immediate: Vec<(i32, i32)> = Vec::new();
+        let mut deferred: Vec<(i32, i32)> = Vec::new();
+        for &(cx, cz) in &self.loaded {
+            let inner = (cx - cx0).abs().max((cz - cz0).abs()) <= self.immediate_radius;
+            if inner && self.permit.is_some() {
+                immediate.push((cx, cz));
+            } else {
+                deferred.push((cx, cz));
+            }
+        }
+
+        if !immediate.is_empty() {
+            let batch_start: ClientboundGamePacket = ClientboundChunkBatchStart.into_variant();
+            write_packet(&batch_start, write, compression, cipher).await?;
+            for &(cx, cz) in &immediate {
+                worldgen.ensure_generated(world, cx, cz);
+                send_chunk_from_world(write, compression, cipher, world, worldgen, cx, cz).await?;
+                self.sent.insert((cx, cz));
+            }
+            let batch_end: ClientboundGamePacket = ClientboundChunkBatchFinished {
+                batch_size: immediate.len() as u32,
+            }.into_variant();
+            write_packet(&batch_end, write, compression, cipher).await?;
+        }
+
+        deferred.sort_by_key(|(cx, cz)| (cx - cx0).abs().max((cz - cz0).abs()));
+        self.queue.extend(deferred);
+        Ok(())
+    }
+
+    /// Top-of-loop pump: send up to `chunks_per_iter` queued chunks (while
+    /// holding the admission permit), self-heal claimed-but-unsent chunks
+    /// back into the queue, and release the permit once idle.
+    pub async fn pump<W: AsyncWrite + Unpin + Send>(
+        &mut self,
+        write: &mut W,
+        compression: Option<u32>,
+        cipher: &mut Option<azalea_crypto::Aes128CfbEnc>,
+        world: &World,
+        worldgen: &dyn WorldGen,
+    ) -> Result<()> {
+        if self.permit.is_some() {
+            let mut to_send: Vec<(i32, i32)> = Vec::new();
+            while to_send.len() < self.chunks_per_iter {
+                let Some((cx, cz)) = self.queue.pop_front() else { break };
+                if !self.loaded.contains(&(cx, cz)) {
+                    self.sent.remove(&(cx, cz));
+                    continue; // player moved away before this chunk was sent
+                }
+                to_send.push((cx, cz));
+            }
+
+            if !to_send.is_empty() {
+                let batch_start: ClientboundGamePacket = ClientboundChunkBatchStart.into_variant();
+                write_packet(&batch_start, write, compression, cipher).await?;
+                for &(cx, cz) in &to_send {
+                    worldgen.ensure_generated(world, cx, cz);
+                    send_chunk_from_world(write, compression, cipher, world, worldgen, cx, cz).await?;
+                    self.sent.insert((cx, cz));
+                }
+                let batch_end: ClientboundGamePacket = ClientboundChunkBatchFinished {
+                    batch_size: to_send.len() as u32,
+                }.into_variant();
+                write_packet(&batch_end, write, compression, cipher).await?;
+            }
+        }
+
+        // Self-heal: when the queue drains, re-queue anything claimed but
+        // never delivered (deferred chunks are claimed optimistically).
+        if self.queue.is_empty() {
+            self.sent.retain(|pos| self.loaded.contains(pos));
+            for pos in self.loaded.iter() {
+                if !self.sent.contains(pos) {
+                    self.queue.push_back(*pos);
+                }
+            }
+        }
+
+        // Done streaming: hand the permit to the next waiting connection.
+        if self.queue.is_empty() {
+            self.permit = None;
+        } else if self.permit.is_none() && self.wait_started.is_none() {
+            self.wait_started = Some(std::time::Instant::now());
+        }
+        Ok(())
+    }
+
+    /// select! guard: queued work and permission to stream it now.
+    pub fn streaming_ready(&self) -> bool {
+        self.permit.is_some() && !self.queue.is_empty()
+    }
+
+    /// select! guard: queued work waiting on admission.
+    pub fn awaiting_admission(&self) -> bool {
+        self.permit.is_none() && !self.queue.is_empty()
+    }
+
+    /// The admission semaphore (for the select! acquire arm).
+    pub fn semaphore(&self) -> std::sync::Arc<tokio::sync::Semaphore> {
+        self.sem.clone()
+    }
+
+    /// Admission granted: start (or resume) streaming.
+    pub fn admit(&mut self, permit: tokio::sync::OwnedSemaphorePermit, player_name: &str) {
+        self.permit = Some(permit);
+        if let Some(t0) = self.wait_started.take() {
+            let waited = t0.elapsed();
+            if waited > std::time::Duration::from_secs(30) {
+                tracing::info!(
+                    "{} admitted to stream after {:.1}s wait ({} chunks queued)",
+                    player_name,
+                    waited.as_secs_f64(),
+                    self.queue.len(),
+                );
+            }
+        }
+    }
+}
+
+// ── Dynamic chunk loading ────────────────────────────────────────────────
+
+/// Boundary-crossing view update, as a `ChunkStreamer` method: unload
+/// out-of-range chunks, send the inner ring synchronously, queue the
+/// rest nearest-first.
+impl ChunkStreamer {
+    pub async fn on_player_move<W: AsyncWrite + Unpin + Send>(
+        &mut self,
+        write: &mut W,
+        compression: Option<u32>,
+        cipher: &mut Option<azalea_crypto::Aes128CfbEnc>,
+        world: &World,
+        worldgen: &dyn WorldGen,
+        player_x: f64,
+        player_z: f64,
+    ) -> Result<()> {
+    let view_distance = self.view_distance;
+    let immediate_radius = self.immediate_radius;
+    let loaded_chunks = &mut self.loaded;
+    let sent_to_client = &mut self.sent;
+    let chunk_send_queue = &mut self.queue;
     let new_cx = (player_x.floor() as i32) >> 4;
     let new_cz = (player_z.floor() as i32) >> 4;
 
     // No chunk boundary crossed -- nothing to do.
-    if new_cx == *current_chunk_x && new_cz == *current_chunk_z {
+    if (new_cx, new_cz) == self.center {
         return Ok(());
     }
 
-    *current_chunk_x = new_cx;
-    *current_chunk_z = new_cz;
+    self.center = (new_cx, new_cz);
 
     // Compute the desired set of loaded chunks.
     let desired: HashSet<(i32, i32)> = {
@@ -151,6 +346,7 @@ pub(crate) async fn update_loaded_chunks<W: AsyncWrite + Unpin + Send>(
     }
 
     Ok(())
+    }
 }
 
 // ── Chunk data ──────────────────────────────────────────────────────────

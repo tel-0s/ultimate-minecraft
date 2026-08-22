@@ -2,30 +2,20 @@
 //!
 //! Handshake -> Status | Login -> Configuration -> Play
 
-use std::collections::{HashSet, VecDeque};
 use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use azalea_auth::game_profile::GameProfile;
-use azalea_chat::FormattedText;
 use azalea_protocol::common::movements::{PositionMoveRotation, RelativeMovements};
 use azalea_protocol::packets::ClientIntention;
 use azalea_protocol::packets::game::{
     ClientboundGamePacket, ClientboundGameEvent, ClientboundLogin,
     ClientboundPlayerPosition, ClientboundSetChunkCacheCenter,
-    ClientboundPlayerInfoUpdate, ClientboundPlayerInfoRemove,
-    ClientboundAddEntity, ClientboundRemoveEntities,
     ClientboundTeleportEntity, ClientboundRotateHead,
-    ClientboundChunkBatchStart, ClientboundChunkBatchFinished,
-    ClientboundSystemChat,
     ServerboundGamePacket,
 };
 use azalea_protocol::packets::game::c_game_event::EventType;
-use azalea_protocol::packets::game::c_player_info_update::{ActionEnumSet, PlayerInfoEntry};
-use azalea_core::delta::LpVec3;
-use azalea_registry::builtin::EntityKind;
 use azalea_protocol::packets::handshake::ServerboundHandshakePacket;
 use azalea_protocol::packets::login::{
     ClientboundLoginDisconnect, ClientboundLoginPacket,
@@ -194,6 +184,76 @@ pub async fn handle(
 
 // ── Play ────────────────────────────────────────────────────────────────
 
+/// The player's connection-local identity and last-known pose. The
+/// EntityStore mirror and the registry are updated FROM this via
+/// [`apply_player_move`]; this copy exists so packet handling never
+/// reads back through a lock.
+struct Avatar {
+    conn_id: u64,
+    entity_id: i32,
+    /// EntityStore id (high-bit player namespace).
+    pid: ultimate_engine::world::entity::EntityId,
+    x: f64,
+    y: f64,
+    z: f64,
+    y_rot: f32,
+    x_rot: f32,
+}
+
+/// One player-movement update, shared by all three movement packet
+/// shapes (pos / pos+rot / rot — previously three copy-pasted arms):
+/// update the avatar, the registry render path, and the EntityStore
+/// mirror; when the position changed, also roll the chunk view, spatial
+/// subscription, entity backfill, and item pickup.
+#[allow(clippy::too_many_arguments)]
+async fn apply_player_move<W: AsyncWrite + Unpin + Send>(
+    write: &mut W,
+    compression: Option<u32>,
+    cipher_enc: &mut Option<azalea_crypto::Aes128CfbEnc>,
+    world: &World,
+    worldgen: &dyn WorldGen,
+    registry: &PlayerRegistry,
+    physics: &crate::physics::PhysicsHandle,
+    avatar: &mut Avatar,
+    streamer: &mut ChunkStreamer,
+    tracker: &mut EntityTracker,
+    spatial_sub: &mut event_bus::SpatialSubscriber,
+    pos: Option<(f64, f64, f64)>,
+    rot: Option<(f32, f32)>,
+    on_ground: bool,
+) -> Result<()> {
+    if let Some((x, y, z)) = pos {
+        avatar.x = x;
+        avatar.y = y;
+        avatar.z = z;
+    }
+    if let Some((y_rot, x_rot)) = rot {
+        avatar.y_rot = y_rot;
+        avatar.x_rot = x_rot;
+    }
+    registry.update_position(
+        avatar.conn_id, avatar.x, avatar.y, avatar.z, avatar.y_rot, avatar.x_rot, on_ground,
+    );
+    mirror_player_entity(
+        world, physics, avatar.pid, avatar.x, avatar.y, avatar.z, avatar.y_rot, avatar.x_rot,
+    );
+    if pos.is_some() {
+        streamer
+            .on_player_move(write, compression, cipher_enc, world, worldgen, avatar.x, avatar.z)
+            .await?;
+        let (ccx, ccz) = streamer.center();
+        let added = spatial_sub.set_view(ccx, ccz, streamer.view_distance());
+        tracker.backfill(write, compression, cipher_enc, world, &added).await?;
+        try_item_pickup(
+            write, compression, cipher_enc, world, physics,
+            avatar.entity_id, avatar.x, avatar.y, avatar.z,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+
 async fn handle_play<R, W>(
     read: &mut R, write: &mut W, buf: &mut Cursor<Vec<u8>>,
     compression: Option<u32>,
@@ -293,64 +353,18 @@ where
     }.into_variant();
     write_packet(&center, write, compression, cipher_enc).await?;
 
-    // Send chunk data for a small area around the player.
-    // MC 1.20+ requires chunks to be wrapped in ChunkBatchStart/Finished
-    // markers — without these, the client receives the data but won't
-    // render the chunks (blocks remain interactable but invisible).
+    // Chunk streaming (view set, deferred queue, bulk-streaming
+    // admission) lives in the ChunkStreamer. MC 1.20+ requires chunks to
+    // be wrapped in ChunkBatchStart/Finished markers — without these,
+    // the client receives the data but won't render the chunks.
     let view_distance = config.network.view_distance;
-    // null in config → a small inner ring is sent synchronously; everything
-    // else streams through the deferred queue from the main loop, where
-    // keep-alives interleave between chunk batches. Sending the full view
-    // synchronously here meant a client could sit >30s without a single
-    // packet during a join storm and time itself out (10k load test).
-    let immediate_radius = config.network.immediate_radius.unwrap_or(2).min(view_distance);
-    let mut loaded_chunks: HashSet<(i32, i32)> = HashSet::new();
-    // Queue for deferred chunk loading -- chunks are sent progressively to
-    // avoid blocking the event loop during the initial load and fast movement.
-    let mut chunk_send_queue: VecDeque<(i32, i32)> = VecDeque::new();
-
-    // Bulk-streaming admission (see STREAM_PERMITS). Uncontended, the
-    // permit is granted instantly and joining behaves as before; in a
-    // join storm, permit-less connections defer EVERYTHING to the queue
-    // and stream when their wave comes (keep-alives flowing meanwhile).
     init_stream_permits(config.network.stream_permits);
-    let stream_sem = STREAM_PERMITS.get().expect("init_stream_permits ran").clone();
-    let mut stream_permit = Arc::clone(&stream_sem).try_acquire_owned().ok();
-
-    let mut immediate: Vec<(i32, i32)> = Vec::new();
-    let mut deferred: Vec<(i32, i32)> = Vec::new();
-    for cx in (chunk_x - view_distance)..=(chunk_x + view_distance) {
-        for cz in (chunk_z - view_distance)..=(chunk_z + view_distance) {
-            let inner = (cx - chunk_x).abs().max((cz - chunk_z).abs()) <= immediate_radius;
-            if inner && stream_permit.is_some() {
-                immediate.push((cx, cz));
-            } else {
-                deferred.push((cx, cz));
-            }
-            loaded_chunks.insert((cx, cz));
-        }
-    }
-
-    if !immediate.is_empty() {
-        let batch_start: ClientboundGamePacket = ClientboundChunkBatchStart.into_variant();
-        write_packet(&batch_start, write, compression, cipher_enc).await?;
-        for &(cx, cz) in &immediate {
-            worldgen.ensure_generated(world, cx, cz);
-            send_chunk_from_world(write, compression, cipher_enc, world, &*worldgen, cx, cz).await?;
-        }
-        let batch_end: ClientboundGamePacket = ClientboundChunkBatchFinished {
-            batch_size: immediate.len() as u32,
-        }.into_variant();
-        write_packet(&batch_end, write, compression, cipher_enc).await?;
-    }
-
-    // Outer ring (everything, when admission deferred us) streams from the
-    // main loop, nearest first.
-    deferred.sort_by_key(|(cx, cz)| (cx - chunk_x).abs().max((cz - chunk_z).abs()));
-    chunk_send_queue.extend(deferred.iter());
-
-    let mut current_chunk_x = chunk_x;
-    let mut current_chunk_z = chunk_z;
+    let mut streamer = ChunkStreamer::new(
+        &config.network,
+        STREAM_PERMITS.get().expect("init_stream_permits ran").clone(),
+        (chunk_x, chunk_z),
+    );
+    streamer.send_initial(write, compression, cipher_enc, world, &*worldgen).await?;
 
     tracing::info!("{} joined the game at ({}, {}, {})", player_name, spawn_x, spawn_y, spawn_z);
 
@@ -359,16 +373,11 @@ where
     // to the shared physics service and acknowledged immediately. All
     // resulting world changes — including our own — come back through the
     // event bus as `ChangeSource::Physics` batches.
-    
-use azalea_inventory::ItemStack;
-    
+    use azalea_inventory::ItemStack;
     use azalea_protocol::packets::game::{
         ClientboundBlockUpdate, ClientboundBlockChangedAck,
         s_player_action::Action,
     };
-    
-
-    
 
     // Unique ID for this connection (used to filter self-originated bus messages).
     let conn_id = NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -411,108 +420,28 @@ use azalea_inventory::ItemStack;
 
     // Spatial subscription (Phase 6f): world changes and entity moves are
     // delivered only for regions near this player; re-pointed on chunk
-    // border crossings.
-    // Item entities this client has been sent (Phase 5) — the client's
-    // ground truth for spawn/teleport/remove packet correctness.
-    let mut spawned_items: HashSet<u64> = HashSet::new();
-
+    // border crossings. The EntityTracker owns what this client has been
+    // sent, and backfills entities already at rest in view — they emit
+    // no events, so a newcomer would otherwise never see them.
+    let mut tracker = EntityTracker::new();
     let (mut spatial_sub, mut spatial_rx) = spatial.subscribe();
-    let initial_regions = spatial_sub.set_view(chunk_x, chunk_z, config.network.view_distance);
-    // Backfill entities already at rest in view — they emit no events, so
-    // a newcomer would otherwise never see them.
-    backfill_region_entities(
-        write, compression, cipher_enc, world, &initial_regions, &mut spawned_items,
-    ).await?;
+    let initial_regions = spatial_sub.set_view(chunk_x, chunk_z, view_distance);
+    tracker.backfill(write, compression, cipher_enc, world, &initial_regions).await?;
     // Subscribe to player lifecycle events (join/leave/chat — global).
     let mut player_rx = registry.subscribe();
 
     // ── Multiplayer: send existing players to newcomer, then register ───
-    // Presence caps (`network.tab_list_cap` / `network.entity_spawn_cap`):
-    // uncapped, presence is O(N²) bytes across clients — at 10k players
-    // the join-storm tab/spawn flood alone is ~12 GB and chokes the write
-    // plane. Track WHO this client knows so removals stay consistent.
-    let tab_cap = match config.network.tab_list_cap {
-        0 => usize::MAX,
-        n => n,
-    };
-    let spawn_cap = match config.network.entity_spawn_cap {
-        0 => usize::MAX,
-        n => n,
-    };
-    let mut tab_listed: HashSet<uuid::Uuid> = HashSet::new();
-    let mut spawned_entities: HashSet<i32> = HashSet::new();
-
-    // Step 1: Tell this client about every player already online (plus
-    // ourselves) in ONE multi-entry tab-list packet — a packet per player
-    // made joining O(N) packets and a join storm O(N²) server-wide.
-    let existing_players = registry.snapshot();
-    let mut tab_entries: Vec<PlayerInfoEntry> = Vec::new();
-    for p in existing_players.iter().take(tab_cap) {
-        tab_listed.insert(p.uuid);
-        tab_entries.push(PlayerInfoEntry {
-            profile: GameProfile {
-                uuid: p.uuid,
-                name: p.name.clone(),
-                properties: Default::default(),
-            },
-            listed: true,
-            latency: 0,
-            game_mode: GameMode::Creative,
-            display_name: None,
-            list_order: 0,
-            update_hat: false,
-            chat_session: None,
-        });
+    let mut presence = super::presence::Presence::new(&config.network);
+    {
+        let existing_players = registry.snapshot();
+        presence
+            .send_initial(write, compression, cipher_enc, &existing_players, player_uuid, player_name)
+            .await?;
+        // Scope-drop: the snapshot (up to one PlayerInfo per online
+        // player) must not live in this stack frame for the connection's
+        // whole lifetime — ~0.5 MB × 10k connections was gigabytes in
+        // the 10k load test.
     }
-    tab_entries.push(PlayerInfoEntry {
-        profile: GameProfile {
-            uuid: player_uuid,
-            name: player_name.to_owned(),
-            properties: Default::default(),
-        },
-        listed: true,
-        latency: 0,
-        game_mode: GameMode::Creative,
-        display_name: None,
-        list_order: 0,
-        update_hat: false,
-        chat_session: None,
-    });
-    let info_packet: ClientboundGamePacket = ClientboundPlayerInfoUpdate {
-        actions: ActionEnumSet {
-            add_player: true,
-            initialize_chat: false,
-            update_game_mode: true,
-            update_listed: true,
-            update_latency: true,
-            update_display_name: false,
-            update_hat: false,
-            update_list_order: false,
-        },
-        entries: tab_entries,
-    }.into_variant();
-    write_packet(&info_packet, write, compression, cipher_enc).await?;
-
-    // Spawn each existing player's entity at their current position.
-    for p in existing_players.iter().take(spawn_cap) {
-        spawned_entities.insert(p.entity_id);
-        let spawn_packet: ClientboundGamePacket = ClientboundAddEntity {
-            id: MinecraftEntityId(p.entity_id),
-            uuid: p.uuid,
-            entity_type: EntityKind::Player,
-            position: Vec3 { x: p.x, y: p.y, z: p.z },
-            movement: LpVec3::Zero,
-            x_rot: degrees_to_byte_angle(p.x_rot),
-            y_rot: degrees_to_byte_angle(p.y_rot),
-            y_head_rot: degrees_to_byte_angle(p.y_rot),
-            data: 0,
-        }.into_variant();
-        write_packet(&spawn_packet, write, compression, cipher_enc).await?;
-    }
-    // Without this, the snapshot (up to one PlayerInfo per online player)
-    // lives in this stack frame for the connection's whole lifetime —
-    // ~0.5 MB × 10k connections was gigabytes in the 10k load test.
-    drop(existing_players);
 
     // Player mirror in the EntityStore (Phase 5 unification): position
     // authority for RULES and cluster replicas. The registry keeps
@@ -547,12 +476,19 @@ use azalea_inventory::ItemStack;
         on_ground: false,
     });
 
-    // Track player position and rotation for movement relaying.
-    let mut player_x = spawn_x;
-    let mut player_y = spawn_y;
-    let mut player_z = spawn_z;
-    let mut player_y_rot: f32 = 0.0;
-    let mut player_x_rot: f32 = 0.0;
+    // The player's avatar: ids + last-known position/rotation (the
+    // connection-local copy; the EntityStore mirror and registry are
+    // updated through `apply_player_move`).
+    let mut avatar = Avatar {
+        conn_id,
+        entity_id,
+        pid: player_pid,
+        x: spawn_x,
+        y: spawn_y,
+        z: spawn_z,
+        y_rot: 0.0,
+        x_rot: 0.0,
+    };
     // Creative inventory model lives in the gameplay layer.
     let mut inventory = crate::gameplay::Inventory::default();
 
@@ -562,89 +498,23 @@ use azalea_inventory::ItemStack;
     // Diagnostics: a keep-alive gap above 25s means this client was one
     // missed packet from a vanilla 30s timeout — log who and how long.
     let mut last_keepalive_sent: Option<std::time::Instant> = None;
-    let mut stream_wait_started: Option<std::time::Instant> = None;
-
-    // Max chunks to send per loop iteration. Keeps the loop responsive while
-    // still making rapid progress on the queue.
-    let chunks_per_iter: usize = config.network.chunks_per_iter;
-
-    // Track chunks physically sent to the client. Deferred chunks are added to
-    // `loaded_chunks` optimistically before being sent, so this set lets us
-    // detect and re-queue any that slip through the cracks. The initial load
-    // also defers its outer ring, so anything still queued is not yet sent.
-    let mut sent_to_client: HashSet<(i32, i32)> = loaded_chunks
-        .iter()
-        .copied()
-        .filter(|pos| !chunk_send_queue.contains(pos))
-        .collect();
 
     loop {
-        // ── Eagerly drain chunk queue before waiting for events ──────────
-        // Only while holding a bulk-streaming permit (admission control —
-        // without it we wait for the permit arm in the select below).
-        // Wrap each drain pass in a ChunkBatchStart/Finished pair so the
-        // client renders the chunks (1.20+ requirement).
-        if stream_permit.is_some() {
-            let mut to_send: Vec<(i32, i32)> = Vec::new();
-            while to_send.len() < chunks_per_iter {
-                let Some((cx, cz)) = chunk_send_queue.pop_front() else { break };
-                if !loaded_chunks.contains(&(cx, cz)) {
-                    sent_to_client.remove(&(cx, cz));
-                    continue; // Player moved away before this chunk was sent.
-                }
-                to_send.push((cx, cz));
-            }
-
-            if !to_send.is_empty() {
-                let batch_start: ClientboundGamePacket = ClientboundChunkBatchStart.into_variant();
-                write_packet(&batch_start, write, compression, cipher_enc).await?;
-
-                for &(cx, cz) in &to_send {
-                    worldgen.ensure_generated(world, cx, cz);
-                    send_chunk_from_world(write, compression, cipher_enc, world, &*worldgen, cx, cz).await?;
-                    sent_to_client.insert((cx, cz));
-                }
-
-                let batch_end: ClientboundGamePacket = ClientboundChunkBatchFinished {
-                    batch_size: to_send.len() as u32,
-                }.into_variant();
-                write_packet(&batch_end, write, compression, cipher_enc).await?;
-            }
-        }
-
-        // ── Self-heal: when queue is empty, re-queue any claimed-but-unsent chunks ──
-        if chunk_send_queue.is_empty() {
-            sent_to_client.retain(|pos| loaded_chunks.contains(pos));
-            for pos in loaded_chunks.iter() {
-                if !sent_to_client.contains(pos) {
-                    chunk_send_queue.push_back(*pos);
-                }
-            }
-        }
-
-        // Done streaming: hand the permit to the next waiting connection.
-        if chunk_send_queue.is_empty() {
-            stream_permit = None;
-        } else if stream_permit.is_none() && stream_wait_started.is_none() {
-            stream_wait_started = Some(std::time::Instant::now());
-        }
+        // Eagerly pump the chunk queue before waiting for events (batch
+        // send + self-heal + permit handoff — see ChunkStreamer::pump).
+        streamer.pump(write, compression, cipher_enc, world, &*worldgen).await?;
 
         tokio::select! {
             // When chunks are queued and we hold the streaming permit, yield
-            // immediately so we cycle back to the drain at the top of the
+            // immediately so we cycle back to the pump at the top of the
             // loop. This keeps chunk loading progressing rapidly without
             // starving event processing.
-            _ = std::future::ready(()), if stream_permit.is_some() && !chunk_send_queue.is_empty() => {}
+            _ = std::future::ready(()), if streamer.streaming_ready() => {}
             // Chunks queued but no permit yet: wait for admission. Other
             // arms (keep-alive, reads, lifecycle) stay live while we wait.
-            permit = Arc::clone(&stream_sem).acquire_owned(), if stream_permit.is_none() && !chunk_send_queue.is_empty() => {
-                stream_permit = permit.ok();
-                if let Some(t0) = stream_wait_started.take() {
-                    let waited = t0.elapsed();
-                    if waited > Duration::from_secs(30) {
-                        tracing::info!("{} admitted to stream after {:.1}s wait ({} chunks queued)",
-                            player_name, waited.as_secs_f64(), chunk_send_queue.len());
-                    }
+            permit = streamer.semaphore().acquire_owned(), if streamer.awaiting_admission() => {
+                if let Ok(permit) = permit {
+                    streamer.admit(permit, player_name);
                 }
             }
             _ = keepalive_timer.tick() => {
@@ -716,8 +586,8 @@ use azalea_inventory::ItemStack;
                                     &world,
                                     inventory.held(),
                                     hit,
-                                    player_y_rot,
-                                    player_x_rot,
+                                    avatar.y_rot,
+                                    avatar.x_rot,
                                 ) else {
                                     continue; // nothing to place
                                 };
@@ -745,78 +615,37 @@ use azalea_inventory::ItemStack;
                                 inventory.select(carried.slot as usize);
                             }
 
-                            // ── Player movement ───────────────────────
+                            // ── Player movement (one path for all three
+                            // packet shapes; previously triplicated) ────
                             ServerboundGamePacket::MovePlayerPos(pkt) => {
-                                player_x = pkt.pos.x;
-                                player_y = pkt.pos.y;
-                                player_z = pkt.pos.z;
-                                registry.update_position(
-                                    conn_id, player_x, player_y, player_z,
-                                    player_y_rot, player_x_rot, pkt.flags.on_ground,
-                                );
-                                mirror_player_entity(
-                                    world, physics, player_pid,
-                                    player_x, player_y, player_z, player_y_rot, player_x_rot,
-                                );
-                                update_loaded_chunks(
-                                    write, compression, cipher_enc, world,
-                                    &*worldgen,
-                                    player_x, player_z, view_distance, immediate_radius,
-                                    &mut current_chunk_x, &mut current_chunk_z,
-                                    &mut loaded_chunks, &mut sent_to_client,
-                                    &mut chunk_send_queue,
-                                ).await?;
-                                let added = spatial_sub.set_view(current_chunk_x, current_chunk_z, view_distance);
-                                backfill_region_entities(
-                                    write, compression, cipher_enc, world, &added, &mut spawned_items,
-                                ).await?;
-                                try_item_pickup(
-                                    write, compression, cipher_enc, world, physics,
-                                    entity_id, player_x, player_y, player_z,
+                                apply_player_move(
+                                    write, compression, cipher_enc, world, &*worldgen,
+                                    registry, physics,
+                                    &mut avatar, &mut streamer, &mut tracker, &mut spatial_sub,
+                                    Some((pkt.pos.x, pkt.pos.y, pkt.pos.z)),
+                                    None,
+                                    pkt.flags.on_ground,
                                 ).await?;
                             }
                             ServerboundGamePacket::MovePlayerPosRot(pkt) => {
-                                player_x = pkt.pos.x;
-                                player_y = pkt.pos.y;
-                                player_z = pkt.pos.z;
-                                player_y_rot = pkt.look_direction.y_rot();
-                                player_x_rot = pkt.look_direction.x_rot();
-                                registry.update_position(
-                                    conn_id, player_x, player_y, player_z,
-                                    player_y_rot, player_x_rot, pkt.flags.on_ground,
-                                );
-                                mirror_player_entity(
-                                    world, physics, player_pid,
-                                    player_x, player_y, player_z, player_y_rot, player_x_rot,
-                                );
-                                update_loaded_chunks(
-                                    write, compression, cipher_enc, world,
-                                    &*worldgen,
-                                    player_x, player_z, view_distance, immediate_radius,
-                                    &mut current_chunk_x, &mut current_chunk_z,
-                                    &mut loaded_chunks, &mut sent_to_client,
-                                    &mut chunk_send_queue,
-                                ).await?;
-                                let added = spatial_sub.set_view(current_chunk_x, current_chunk_z, view_distance);
-                                backfill_region_entities(
-                                    write, compression, cipher_enc, world, &added, &mut spawned_items,
-                                ).await?;
-                                try_item_pickup(
-                                    write, compression, cipher_enc, world, physics,
-                                    entity_id, player_x, player_y, player_z,
+                                apply_player_move(
+                                    write, compression, cipher_enc, world, &*worldgen,
+                                    registry, physics,
+                                    &mut avatar, &mut streamer, &mut tracker, &mut spatial_sub,
+                                    Some((pkt.pos.x, pkt.pos.y, pkt.pos.z)),
+                                    Some((pkt.look_direction.y_rot(), pkt.look_direction.x_rot())),
+                                    pkt.flags.on_ground,
                                 ).await?;
                             }
                             ServerboundGamePacket::MovePlayerRot(pkt) => {
-                                player_y_rot = pkt.look_direction.y_rot();
-                                player_x_rot = pkt.look_direction.x_rot();
-                                registry.update_position(
-                                    conn_id, player_x, player_y, player_z,
-                                    player_y_rot, player_x_rot, pkt.flags.on_ground,
-                                );
-                                mirror_player_entity(
-                                    world, physics, player_pid,
-                                    player_x, player_y, player_z, player_y_rot, player_x_rot,
-                                );
+                                apply_player_move(
+                                    write, compression, cipher_enc, world, &*worldgen,
+                                    registry, physics,
+                                    &mut avatar, &mut streamer, &mut tracker, &mut spatial_sub,
+                                    None,
+                                    Some((pkt.look_direction.y_rot(), pkt.look_direction.x_rot())),
+                                    pkt.flags.on_ground,
+                                ).await?;
                             }
 
                             // ── Chat ────────────────────────────────────
@@ -904,58 +733,9 @@ use azalea_inventory::ItemStack;
                                 latest_move.insert(*entity_id, ev.clone());
                             }
                         }
-                        // ── Item entities (Phase 5) ──────────────────────
+                        // ── Spatial entities (Phase 5) ───────────────
                         event_bus::SpatialMsg::Entities(changes) => {
-                            for c in changes {
-                                match c {
-                                    event_bus::EntityChange::Spawn { id, state } => {
-                                        if is_client_entity(state.kind)
-                                            && spawned_items.insert(id.0)
-                                        {
-                                            send_entity_spawn(write, compression, cipher_enc, *id, state).await?;
-                                        }
-                                    }
-                                    event_bus::EntityChange::Move { id, state } => {
-                                        if !spawned_items.contains(&id.0) {
-                                            // Entered our view mid-flight (or
-                                            // crossed in from another region):
-                                            // late-spawn it.
-                                            if is_client_entity(state.kind)
-                                                && spawned_items.insert(id.0)
-                                            {
-                                                send_entity_spawn(write, compression, cipher_enc, *id, state).await?;
-                                            }
-                                            continue;
-                                        }
-                                        let tp: ClientboundGamePacket = ClientboundTeleportEntity {
-                                            id: item_wire_id(*id),
-                                            change: PositionMoveRotation {
-                                                pos: Vec3 { x: state.pos.x, y: state.pos.y, z: state.pos.z },
-                                                // Velocity: clients extrapolate
-                                                // between segment endpoints
-                                                // (blocks/tick on the wire).
-                                                delta: Vec3 {
-                                                    x: state.vel.x / 20.0,
-                                                    y: state.vel.y / 20.0,
-                                                    z: state.vel.z / 20.0,
-                                                },
-                                                look_direction: LookDirection::new(0.0, 0.0),
-                                            },
-                                            relative: RelativeMovements::default(),
-                                            on_ground: state.vel.y == 0.0,
-                                        }.into_variant();
-                                        write_packet(&tp, write, compression, cipher_enc).await?;
-                                    }
-                                    event_bus::EntityChange::Despawn { id, .. } => {
-                                        if spawned_items.remove(&id.0) {
-                                            let rm: ClientboundGamePacket = ClientboundRemoveEntities {
-                                                entity_ids: vec![item_wire_id(*id)],
-                                            }.into_variant();
-                                            write_packet(&rm, write, compression, cipher_enc).await?;
-                                        }
-                                    }
-                                }
-                            }
+                            tracker.apply_changes(write, compression, cipher_enc, changes).await?;
                         }
                     }
                 }
@@ -967,7 +747,7 @@ use azalea_inventory::ItemStack;
                     if moved_id == conn_id { continue; }
                     // Fine AOI filter on top of region-granular delivery.
                     let aoi = ((config.network.view_distance as f64) + 2.0) * 16.0;
-                    if (x - player_x).abs() > aoi || (z - player_z).abs() > aoi {
+                    if (x - avatar.x).abs() > aoi || (z - avatar.z).abs() > aoi {
                         continue;
                     }
 
@@ -1022,102 +802,9 @@ use azalea_inventory::ItemStack;
                     }
                 }
 
-                let mut join_entries: Vec<PlayerInfoEntry> = Vec::new();
-                let mut spawn_pkts: Vec<ClientboundGamePacket> = Vec::new();
-                let mut left_eids: Vec<MinecraftEntityId> = Vec::new();
-                let mut left_uuids = Vec::new();
-                for event in events {
-                    match event {
-                        PlayerEvent::Joined { conn_id: joined_id, entity_id: eid, uuid, name, x, y, z, y_rot, x_rot } => {
-                            // Skip our own join event.
-                            if joined_id == conn_id { continue; }
-                            if tab_listed.len() < tab_cap && tab_listed.insert(uuid) {
-                                join_entries.push(PlayerInfoEntry {
-                                    profile: GameProfile {
-                                        uuid,
-                                        name,
-                                        properties: Default::default(),
-                                    },
-                                    listed: true,
-                                    latency: 0,
-                                    game_mode: GameMode::Creative,
-                                    display_name: None,
-                                    list_order: 0,
-                                    update_hat: false,
-                                    chat_session: None,
-                                });
-                            }
-                            if spawned_entities.len() < spawn_cap && spawned_entities.insert(eid) {
-                                spawn_pkts.push(ClientboundAddEntity {
-                                    id: MinecraftEntityId(eid),
-                                    uuid,
-                                    entity_type: EntityKind::Player,
-                                    position: Vec3 { x, y, z },
-                                    movement: LpVec3::Zero,
-                                    x_rot: degrees_to_byte_angle(x_rot),
-                                    y_rot: degrees_to_byte_angle(y_rot),
-                                    y_head_rot: degrees_to_byte_angle(y_rot),
-                                    data: 0,
-                                }.into_variant());
-                            }
-                        }
-                        PlayerEvent::Moved { .. } => {
-                            // Movement is delivered through the spatial
-                            // bus; nothing should arrive here.
-                        }
-                        PlayerEvent::Left { conn_id: left_id, entity_id: eid, uuid } => {
-                            if left_id == conn_id { continue; }
-                            // Only retract what this client was actually sent.
-                            if spawned_entities.remove(&eid) {
-                                left_eids.push(MinecraftEntityId(eid));
-                            }
-                            if tab_listed.remove(&uuid) {
-                                left_uuids.push(uuid);
-                            }
-                        }
-                        PlayerEvent::Chat { name, message, .. } => {
-                            // Send as system chat to all clients (including sender).
-                            let text = format!("<{}> {}", name, message);
-                            let chat_pkt: ClientboundGamePacket = ClientboundSystemChat {
-                                content: FormattedText::from(text),
-                                overlay: false,
-                            }.into_variant();
-                            write_packet(&chat_pkt, write, compression, cipher_enc).await?;
-                        }
-                    }
-                }
-
-                if !join_entries.is_empty() {
-                    let info_pkt: ClientboundGamePacket = ClientboundPlayerInfoUpdate {
-                        actions: ActionEnumSet {
-                            add_player: true,
-                            initialize_chat: false,
-                            update_game_mode: true,
-                            update_listed: true,
-                            update_latency: true,
-                            update_display_name: false,
-                            update_hat: false,
-                            update_list_order: false,
-                        },
-                        entries: join_entries,
-                    }.into_variant();
-                    write_packet(&info_pkt, write, compression, cipher_enc).await?;
-                    for spawn_pkt in &spawn_pkts {
-                        write_packet(spawn_pkt, write, compression, cipher_enc).await?;
-                    }
-                }
-                if !left_eids.is_empty() {
-                    let remove_pkt: ClientboundGamePacket = ClientboundRemoveEntities {
-                        entity_ids: left_eids,
-                    }.into_variant();
-                    write_packet(&remove_pkt, write, compression, cipher_enc).await?;
-                }
-                if !left_uuids.is_empty() {
-                    let info_remove: ClientboundGamePacket = ClientboundPlayerInfoRemove {
-                        profile_ids: left_uuids,
-                    }.into_variant();
-                    write_packet(&info_remove, write, compression, cipher_enc).await?;
-                }
+                presence
+                    .apply_events(write, compression, cipher_enc, conn_id, events)
+                    .await?;
             }
         }
     }

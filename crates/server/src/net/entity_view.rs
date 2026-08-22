@@ -132,25 +132,109 @@ pub(crate) async fn send_entity_spawn<W: AsyncWrite + Unpin + Send>(
 /// that this client hasn't been sent yet. Called when the spatial view
 /// gains regions (join, chunk-border crossing): resting entities emit no
 /// events, so subscription alone would never reveal them.
-pub(crate) async fn backfill_region_entities<W: AsyncWrite + Unpin + Send>(
-    write: &mut W,
-    compression: Option<u32>,
-    cipher: &mut Option<azalea_crypto::Aes128CfbEnc>,
-    world: &World,
-    regions: &[event_bus::Region],
-    spawned_items: &mut HashSet<u64>,
-) -> Result<()> {
-    for region in regions {
-        for chunk in event_bus::SpatialSubscriber::chunks_of_region(*region) {
-            for id in world.entities().in_chunk(chunk) {
-                let Some(state) = world.entities().get(id) else { continue };
-                if is_client_entity(state.kind) && spawned_items.insert(id.0) {
-                    send_entity_spawn(write, compression, cipher, id, &state).await?;
+/// Which spatial entities this client has been sent — the client's
+/// ground truth for spawn/teleport/remove packet correctness.
+/// (Players are NOT tracked here; their render path is the registry's
+/// `PlayerEvent` plane, handled by `presence`.)
+pub(crate) struct EntityTracker {
+    spawned: HashSet<u64>,
+}
+
+impl EntityTracker {
+    pub fn new() -> Self {
+        Self { spawned: HashSet::new() }
+    }
+
+    /// Spawn-backfill entities already at rest in newly visible regions —
+    /// they emit no events, so the client would otherwise never see them.
+    pub async fn backfill<W: AsyncWrite + Unpin + Send>(
+        &mut self,
+        write: &mut W,
+        compression: Option<u32>,
+        cipher: &mut Option<azalea_crypto::Aes128CfbEnc>,
+        world: &World,
+        regions: &[event_bus::Region],
+    ) -> Result<()> {
+        for region in regions {
+            for chunk in event_bus::SpatialSubscriber::chunks_of_region(*region) {
+                for id in world.entities().in_chunk(chunk) {
+                    let Some(state) = world.entities().get(id) else { continue };
+                    if is_client_entity(state.kind) && self.spawned.insert(id.0) {
+                        send_entity_spawn(write, compression, cipher, id, &state).await?;
+                    }
                 }
             }
         }
+        Ok(())
     }
-    Ok(())
+
+    /// Project a batch of authoritative entity transitions (from the
+    /// spatial bus) onto this client: spawn / late-spawn / teleport /
+    /// remove packets, gated on what the client actually knows.
+    pub async fn apply_changes<W: AsyncWrite + Unpin + Send>(
+        &mut self,
+        write: &mut W,
+        compression: Option<u32>,
+        cipher: &mut Option<azalea_crypto::Aes128CfbEnc>,
+        changes: &[event_bus::EntityChange],
+    ) -> Result<()> {
+        use azalea_protocol::common::movements::{PositionMoveRotation, RelativeMovements};
+        use azalea_protocol::packets::game::{
+            ClientboundGamePacket, ClientboundRemoveEntities, ClientboundTeleportEntity,
+        };
+
+        for c in changes {
+            match c {
+                event_bus::EntityChange::Spawn { id, state } => {
+                    if is_client_entity(state.kind) && self.spawned.insert(id.0) {
+                        send_entity_spawn(write, compression, cipher, *id, state).await?;
+                    }
+                }
+                event_bus::EntityChange::Move { id, state } => {
+                    if !self.spawned.contains(&id.0) {
+                        // Entered our view mid-flight (or crossed in from
+                        // another region): late-spawn it.
+                        if is_client_entity(state.kind) && self.spawned.insert(id.0) {
+                            send_entity_spawn(write, compression, cipher, *id, state).await?;
+                        }
+                        continue;
+                    }
+                    let tp: ClientboundGamePacket = ClientboundTeleportEntity {
+                        id: item_wire_id(*id),
+                        change: PositionMoveRotation {
+                            pos: azalea_core::position::Vec3 {
+                                x: state.pos.x,
+                                y: state.pos.y,
+                                z: state.pos.z,
+                            },
+                            // Velocity: clients extrapolate between segment
+                            // endpoints (blocks/tick on the wire).
+                            delta: azalea_core::position::Vec3 {
+                                x: state.vel.x / 20.0,
+                                y: state.vel.y / 20.0,
+                                z: state.vel.z / 20.0,
+                            },
+                            look_direction: azalea_entity::LookDirection::new(0.0, 0.0),
+                        },
+                        relative: RelativeMovements::default(),
+                        on_ground: state.vel.y == 0.0,
+                    }
+                    .into_variant();
+                    write_packet(&tp, write, compression, cipher).await?;
+                }
+                event_bus::EntityChange::Despawn { id, .. } => {
+                    if self.spawned.remove(&id.0) {
+                        let rm: ClientboundGamePacket = ClientboundRemoveEntities {
+                            entity_ids: vec![item_wire_id(*id)],
+                        }
+                        .into_variant();
+                        write_packet(&rm, write, compression, cipher).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Mirror a player's position/rotation into the EntityStore (Phase 5).
