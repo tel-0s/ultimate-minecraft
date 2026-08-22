@@ -1,4 +1,70 @@
 {
+  "minecraft:banner_pattern": {
+    "no_item_required": [
+      "minecraft:square_bottom_left",
+      "minecraft:square_bottom_right",
+      "minecraft:square_top_left",
+      "minecraft:square_top_right",
+      "minecraft:stripe_bottom",
+      "minecraft:stripe_top",
+      "minecraft:stripe_left",
+      "minecraft:stripe_right",
+      "minecraft:stripe_center",
+      "minecraft:stripe_middle",
+      "minecraft:stripe_downright",
+      "minecraft:stripe_downleft",
+      "minecraft:small_stripes",
+      "minecraft:cross",
+      "minecraft:straight_cross",
+      "minecraft:triangle_bottom",
+      "minecraft:triangle_top",
+      "minecraft:triangles_bottom",
+      "minecraft:triangles_top",
+      "minecraft:diagonal_left",
+      "minecraft:diagonal_up_right",
+      "minecraft:diagonal_up_left",
+      "minecraft:diagonal_right",
+      "minecraft:circle",
+      "minecraft:rhombus",
+      "minecraft:half_vertical",
+      "minecraft:half_horizontal",
+      "minecraft:half_vertical_right",
+      "minecraft:half_horizontal_bottom",
+      "minecraft:border",
+      "minecraft:gradient",
+      "minecraft:gradient_up"
+    ],
+    "pattern_item/bordure_indented": [
+      "minecraft:curly_border"
+    ],
+    "pattern_item/creeper": [
+      "minecraft:creeper"
+    ],
+    "pattern_item/field_masoned": [
+      "minecraft:bricks"
+    ],
+    "pattern_item/flow": [
+      "minecraft:flow"
+    ],
+    "pattern_item/flower": [
+      "minecraft:flower"
+    ],
+    "pattern_item/globe": [
+      "minecraft:globe"
+    ],
+    "pattern_item/guster": [
+      "minecraft:guster"
+    ],
+    "pattern_item/mojang": [
+      "minecraft:mojang"
+    ],
+    "pattern_item/piglin": [
+      "minecraft:piglin"
+    ],
+    "pattern_item/skull": [
+      "minecraft:skull"
+    ]
+  },
   "minecraft:block": {
     "acacia_logs": [
       "minecraft:acacia_log",
@@ -2945,6 +3011,183 @@
       "minecraft:drown"
     ]
   },
+  "minecraft:dialog": {
+    "pause_screen_additions": [],
+    "quick_actions": []
+  },
+  "minecraft:enchantment": {
+    "curse": [
+      "minecraft:binding_curse",
+      "minecraft:vanishing_curse"
+    ],
+    "double_trade_price": [
+      "#minecraft:treasure"
+    ],
+    "exclusive_set/armor": [
+      "minecraft:protection",
+      "minecraft:blast_protection",
+      "minecraft:fire_protection",
+      "minecraft:projectile_protection"
+    ],
+    "exclusive_set/boots": [
+      "minecraft:frost_walker",
+      "minecraft:depth_strider"
+    ],
+    "exclusive_set/bow": [
+      "minecraft:infinity",
+      "minecraft:mending"
+    ],
+    "exclusive_set/crossbow": [
+      "minecraft:multishot",
+      "minecraft:piercing"
+    ],
+    "exclusive_set/damage": [
+      "minecraft:sharpness",
+      "minecraft:smite",
+      "minecraft:bane_of_arthropods",
+      "minecraft:impaling",
+      "minecraft:density",
+      "minecraft:breach"
+    ],
+    "exclusive_set/mining": [
+      "minecraft:fortune",
+      "minecraft:silk_touch"
+    ],
+    "exclusive_set/riptide": [
+      "minecraft:loyalty",
+      "minecraft:channeling"
+    ],
+    "in_enchanting_table": [
+      "#minecraft:non_treasure"
+    ],
+    "non_treasure": [
+      "minecraft:protection",
+      "minecraft:fire_protection",
+      "minecraft:feather_falling",
+      "minecraft:blast_protection",
+      "minecraft:projectile_protection",
+      "minecraft:respiration",
+      "minecraft:aqua_affinity",
+      "minecraft:thorns",
+      "minecraft:depth_strider",
+      "minecraft:sharpness",
+      "minecraft:smite",
+      "minecraft:bane_of_arthropods",
+      "minecraft:knockback",
+      "minecraft:fire_aspect",
+      "minecraft:looting",
+      "minecraft:sweeping_edge",
+      "minecraft:efficiency",
+      "minecraft:silk_touch",
+      "minecraft:unbreaking",
+      "minecraft:fortune",
+      "minecraft:power",
+      "minecraft:punch",
+      "minecraft:flame",
+      "minecraft:infinity",
+      "minecraft:luck_of_the_sea",
+      "minecraft:lure",
+      "minecraft:loyalty",
+      "minecraft:impaling",
+      "minecraft:riptide",
+      "minecraft:channeling",
+      "minecraft:multishot",
+      "minecraft:quick_charge",
+      "minecraft:piercing",
+      "minecraft:density",
+      "minecraft:breach",
+      "minecraft:lunge"
+    ],
+    "on_mob_spawn_equipment": [
+      "#minecraft:non_treasure"
+    ],
+    "on_random_loot": [
+      "#minecraft:non_treasure",
+      "minecraft:binding_curse",
+      "minecraft:vanishing_curse",
+      "minecraft:frost_walker",
+      "minecraft:mending"
+    ],
+    "on_traded_equipment": [
+      "#minecraft:non_treasure"
+    ],
+    "prevents_bee_spawns_when_mining": [
+      "minecraft:silk_touch"
+    ],
+    "prevents_decorated_pot_shattering": [
+      "minecraft:silk_touch"
+    ],
+    "prevents_ice_melting": [
+      "minecraft:silk_touch"
+    ],
+    "prevents_infested_spawns": [
+      "minecraft:silk_touch"
+    ],
+    "smelts_loot": [
+      "minecraft:fire_aspect"
+    ],
+    "tooltip_order": [
+      "minecraft:binding_curse",
+      "minecraft:vanishing_curse",
+      "minecraft:riptide",
+      "minecraft:channeling",
+      "minecraft:wind_burst",
+      "minecraft:frost_walker",
+      "minecraft:lunge",
+      "minecraft:sharpness",
+      "minecraft:smite",
+      "minecraft:bane_of_arthropods",
+      "minecraft:impaling",
+      "minecraft:power",
+      "minecraft:density",
+      "minecraft:breach",
+      "minecraft:piercing",
+      "minecraft:sweeping_edge",
+      "minecraft:multishot",
+      "minecraft:fire_aspect",
+      "minecraft:flame",
+      "minecraft:knockback",
+      "minecraft:punch",
+      "minecraft:protection",
+      "minecraft:blast_protection",
+      "minecraft:fire_protection",
+      "minecraft:projectile_protection",
+      "minecraft:feather_falling",
+      "minecraft:fortune",
+      "minecraft:looting",
+      "minecraft:silk_touch",
+      "minecraft:luck_of_the_sea",
+      "minecraft:efficiency",
+      "minecraft:quick_charge",
+      "minecraft:lure",
+      "minecraft:respiration",
+      "minecraft:aqua_affinity",
+      "minecraft:soul_speed",
+      "minecraft:swift_sneak",
+      "minecraft:depth_strider",
+      "minecraft:thorns",
+      "minecraft:loyalty",
+      "minecraft:unbreaking",
+      "minecraft:infinity",
+      "minecraft:mending"
+    ],
+    "tradeable": [
+      "#minecraft:non_treasure",
+      "minecraft:binding_curse",
+      "minecraft:vanishing_curse",
+      "minecraft:frost_walker",
+      "minecraft:mending"
+    ],
+    "treasure": [
+      "minecraft:binding_curse",
+      "minecraft:vanishing_curse",
+      "minecraft:swift_sneak",
+      "minecraft:soul_speed",
+      "minecraft:frost_walker",
+      "minecraft:mending",
+      "minecraft:wind_burst"
+    ]
+  },
   "minecraft:entity_type": {
     "accepts_iron_golem_gift": [
       "minecraft:copper_golem"
@@ -3457,6 +3700,24 @@
       "minecraft:resonate_15",
       "minecraft:shriek",
       "#minecraft:shrieker_can_listen"
+    ]
+  },
+  "minecraft:instrument": {
+    "goat_horns": [
+      "#minecraft:regular_goat_horns",
+      "#minecraft:screaming_goat_horns"
+    ],
+    "regular_goat_horns": [
+      "minecraft:ponder_goat_horn",
+      "minecraft:sing_goat_horn",
+      "minecraft:seek_goat_horn",
+      "minecraft:feel_goat_horn"
+    ],
+    "screaming_goat_horns": [
+      "minecraft:admire_goat_horn",
+      "minecraft:call_goat_horn",
+      "minecraft:yearn_goat_horn",
+      "minecraft:dream_goat_horn"
     ]
   },
   "minecraft:item": {

@@ -248,7 +248,22 @@ pub(crate) async fn send_tags<W: AsyncWrite + Unpin + Send>(
 /// Entry ordering defines numeric IDs starting from 0. The order must match
 /// the vanilla server's ordering for the Known Packs optimization to work.
 pub(crate) fn registry_entries() -> Vec<(String, Vec<String>)> {
-    vec![
+    // Synchronized registries whose element lists are derived from the
+    // vanilla client jar (see `examples/gen_vanilla_tags.rs`): MC 26.x
+    // resolves delayed holder components against these at configuration
+    // finish ("Missing element minecraft:trim_material/redstone"), so
+    // every synchronized registry with data must be declared. With
+    // Known Packs only the NAMES go on the wire; the client loads the
+    // data from its own pack.
+    static JAR_DERIVED: std::sync::LazyLock<Vec<(String, Vec<String>)>> =
+        std::sync::LazyLock::new(|| {
+            let parsed: std::collections::BTreeMap<String, Vec<String>> =
+                serde_json::from_str(include_str!("vanilla_registries.json"))
+                    .expect("vanilla_registries.json parses (regenerate with gen_vanilla_tags)");
+            parsed.into_iter().collect()
+        });
+
+    let mut entries: Vec<(String, Vec<String>)> = vec![
         ("minecraft:dimension_type".into(), vec![
             "minecraft:overworld".into(),
             "minecraft:overworld_caves".into(),
@@ -374,7 +389,14 @@ pub(crate) fn registry_entries() -> Vec<(String, Vec<String>)> {
             "minecraft:day".into(), "minecraft:early_game".into(),
             "minecraft:moon".into(), "minecraft:villager_schedule".into(),
         ]),
-    ]
+    ];
+    // Append the jar-derived registries not already declared above.
+    for (name, elems) in JAR_DERIVED.iter() {
+        if !entries.iter().any(|(n, _)| n == name) {
+            entries.push((name.clone(), elems.clone()));
+        }
+    }
+    entries
 }
 
 
@@ -403,6 +425,40 @@ mod tests {
             &vec!["minecraft:overworld".to_string(), "minecraft:the_end".to_string()],
         );
         assert!(get("minecraft:worldgen/biome").len() >= 60);
+    }
+
+    /// Every SYNCHRONIZED registry from vanilla 26.2's
+    /// RegistryDataLoader that ships data in the client jar must be
+    /// declared: configuration-finish resolves delayed holder components
+    /// against the received set ("Missing element
+    /// minecraft:trim_material/minecraft:redstone" refused connect #4).
+    #[test]
+    fn configuration_declares_every_synchronized_registry_with_data() {
+        let regs = registry_entries();
+        for (name, min) in [
+            ("minecraft:chat_type", 7),
+            ("minecraft:trim_pattern", 18),
+            ("minecraft:trim_material", 11),
+            ("minecraft:banner_pattern", 43),
+            ("minecraft:enchantment", 43),
+            ("minecraft:jukebox_song", 22),
+            ("minecraft:instrument", 8),
+            ("minecraft:dialog", 3),
+            ("minecraft:sulfur_cube_archetype", 12),
+            ("minecraft:test_environment", 1),
+            ("minecraft:test_instance", 1),
+        ] {
+            let entries = regs
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("must declare {name}"))
+                .1
+                .len();
+            assert!(entries >= min, "{name}: {entries} entries, expected >= {min}");
+        }
+        // The element the fourth real-client refusal named.
+        let (_, trims) = regs.iter().find(|(n, _)| n == "minecraft:trim_material").unwrap();
+        assert!(trims.contains(&"minecraft:redstone".to_string()));
     }
 
     /// The complete REQUIRED-NON-EMPTY set from vanilla 26.2's

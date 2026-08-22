@@ -40,6 +40,30 @@ const REGISTRIES: &[(&str, &str)] = &[
     ("minecraft:timeline", "timeline/"),
     ("minecraft:painting_variant", "painting_variant/"),
     ("minecraft:worldgen/biome", "worldgen/biome/"),
+    ("minecraft:banner_pattern", "banner_pattern/"),
+    ("minecraft:enchantment", "enchantment/"),
+    ("minecraft:dialog", "dialog/"),
+    ("minecraft:instrument", "instrument/"),
+];
+
+/// Synchronized dynamic registries whose ELEMENT lists we also derive
+/// from the jar (the ones `registry_entries()` doesn't hand-declare for
+/// order-sensitivity or azalea-derivation reasons). MC 26.x resolves
+/// delayed holder components against these at configuration finish
+/// ("Missing element minecraft:trim_material / minecraft:redstone"), so
+/// every synchronized registry with data must be declared.
+const ELEMENT_REGISTRIES: &[(&str, &str)] = &[
+    ("minecraft:chat_type", "chat_type/"),
+    ("minecraft:trim_pattern", "trim_pattern/"),
+    ("minecraft:trim_material", "trim_material/"),
+    ("minecraft:banner_pattern", "banner_pattern/"),
+    ("minecraft:enchantment", "enchantment/"),
+    ("minecraft:jukebox_song", "jukebox_song/"),
+    ("minecraft:instrument", "instrument/"),
+    ("minecraft:dialog", "dialog/"),
+    ("minecraft:sulfur_cube_archetype", "sulfur_cube_archetype/"),
+    ("minecraft:test_environment", "test_environment/"),
+    ("minecraft:test_instance", "test_instance/"),
 ];
 
 fn main() {
@@ -92,6 +116,41 @@ fn main() {
         out.len(),
         total,
         jar_path,
+    );
+
+    // Element lists for the jar-derived registries.
+    let mut elements: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let names: Vec<String> = zip.file_names().map(|s| s.to_string()).collect();
+    for entry_name in names {
+        let Some(rel) = entry_name.strip_prefix("data/minecraft/") else {
+            continue;
+        };
+        let Some(rel) = rel.strip_suffix(".json") else {
+            continue;
+        };
+        if rel.contains("tags/") {
+            continue;
+        }
+        let Some((registry, element)) = ELEMENT_REGISTRIES.iter().find_map(|(reg, prefix)| {
+            rel.strip_prefix(prefix)
+                .filter(|e| !e.contains('/'))
+                .map(|e| (reg.to_string(), format!("minecraft:{e}")))
+        }) else {
+            continue;
+        };
+        elements.entry(registry).or_default().push(element);
+    }
+    for list in elements.values_mut() {
+        list.sort();
+    }
+    let dest = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/net/vanilla_registries.json");
+    std::fs::write(&dest, serde_json::to_string_pretty(&elements).unwrap()).expect("write");
+    let total: usize = elements.values().map(Vec::len).sum();
+    println!(
+        "wrote {} ({} registries, {} elements)",
+        dest.display(),
+        elements.len(),
+        total,
     );
 }
 
