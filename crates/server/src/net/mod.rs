@@ -4,3 +4,4 @@ pub mod entity_view;
 pub mod handshake;
 pub mod listener;
 pub mod presence;
+pub mod tags;

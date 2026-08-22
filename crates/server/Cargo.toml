@@ -46,3 +46,7 @@ azalea-inventory = "0.16"
 noise = "0.9"
 dashmap = "6"
 core_affinity = "0.8"
+
+[dev-dependencies]
+# Reads the vanilla client jar in examples/gen_vanilla_tags.rs
+zip = { version = "2", default-features = false, features = ["deflate"] }

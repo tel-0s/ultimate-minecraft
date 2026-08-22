@@ -224,37 +224,19 @@ pub(crate) async fn send_registries<W: AsyncWrite + Unpin + Send>(
     Ok(())
 }
 
-/// Send UpdateTags packet. The timeline registry needs tags to bind its entries.
+/// Send the complete vanilla tag networks (see `net::tags`): the
+/// client receives ALL tag data from the server, and MC 26.x resolves
+/// several eagerly at configuration finish.
 pub(crate) async fn send_tags<W: AsyncWrite + Unpin + Send>(
     write: &mut W,
     compression: Option<u32>,
     cipher: &mut Option<azalea_crypto::Aes128CfbEnc>,
 ) -> Result<()> {
-    use indexmap::IndexMap;
-
-    // Timeline entries: day=0, early_game=1, moon=2, villager_schedule=3
-    // Tags needed: in_overworld, in_nether, in_end (group entries by dimension)
-    let mut tag_map = IndexMap::new();
-    tag_map.insert(
-        Identifier::new("minecraft:timeline"),
-        vec![
-            Tags {
-                name: Identifier::new("minecraft:in_overworld"),
-                elements: vec![0, 1, 2, 3], // all timeline entries apply in overworld
-            },
-            Tags {
-                name: Identifier::new("minecraft:in_nether"),
-                elements: vec![0, 2], // day and moon (basic time cycles)
-            },
-            Tags {
-                name: Identifier::new("minecraft:in_end"),
-                elements: vec![0, 2], // day and moon
-            },
-        ],
-    );
+    static TAGS: std::sync::LazyLock<TagMap> =
+        std::sync::LazyLock::new(|| super::tags::build_tag_map(&registry_entries()));
 
     let tags_packet: ClientboundConfigPacket = ClientboundUpdateTags {
-        tags: TagMap(tag_map),
+        tags: TAGS.clone(),
     }.into_variant();
     write_packet(&tags_packet, write, compression, cipher).await?;
 
@@ -310,7 +292,7 @@ pub(crate) fn registry_entries() -> Vec<(String, Vec<String>)> {
             "minecraft:sonic_boom".into(), "minecraft:spear".into(),
             "minecraft:spit".into(), "minecraft:stalagmite".into(),
             "minecraft:starve".into(), "minecraft:sting".into(),
-            "minecraft:sweet_berry_bush".into(), "minecraft:thorns".into(),
+            "minecraft:sulfur_cube_hot".into(), "minecraft:sweet_berry_bush".into(), "minecraft:thorns".into(),
             "minecraft:thrown".into(), "minecraft:trident".into(),
             "minecraft:unattributed_fireball".into(), "minecraft:wind_charge".into(),
             "minecraft:wither".into(), "minecraft:wither_skull".into(),
