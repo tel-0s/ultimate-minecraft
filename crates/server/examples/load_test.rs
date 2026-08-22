@@ -247,7 +247,21 @@ async fn run_client(
                     let _ = reply_tx
                         .send(ServerboundAcceptTeleportation { id: p.id }.into_variant());
                 }
-                ClientboundGamePacket::LevelChunkWithLight(_) => {
+                ClientboundGamePacket::LevelChunkWithLight(pkt) => {
+                    // Parse the section blob through azalea-world — the
+                    // same layout a vanilla client reads. This is what
+                    // turns the swarm into a chunk-FORMAT validator, not
+                    // just a packet counter (the 26.x fluid_count field
+                    // slipped past the counting version).
+                    let mut cursor = std::io::Cursor::new(&pkt.chunk_data.data[..]);
+                    if let Err(e) = azalea_world::Chunk::read_with_dimension_height(
+                        &mut cursor,
+                        384,
+                        -64,
+                        &pkt.chunk_data.heightmaps,
+                    ) {
+                        panic!("server sent an unparseable chunk at ({}, {}): {e}", pkt.x, pkt.z);
+                    }
                     stats.chunks.fetch_add(1, Relaxed);
                 }
                 ClientboundGamePacket::BlockUpdate(_) => {

@@ -10,7 +10,7 @@ use azalea_protocol::packets::config::{
     ClientboundConfigPacket, ClientboundFinishConfiguration, ClientboundRegistryData,
     ClientboundSelectKnownPacks, ClientboundUpdateTags, ServerboundConfigPacket,
 };
-use azalea_protocol::common::tags::{TagMap, Tags};
+use azalea_protocol::common::tags::TagMap;
 use azalea_protocol::packets::status::c_status_response::SamplePlayer;
 use azalea_protocol::packets::login::{
     ClientboundLoginFinished, ClientboundLoginPacket,

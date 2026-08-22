@@ -11,7 +11,7 @@
 
 use ultimate_engine::causal::event::{Event, EventPayload};
 use ultimate_engine::world::World;
-use ultimate_engine::world::entity::{EntityId, EntityKind, EntityState, Nanos, Vec3};
+use ultimate_engine::world::entity::{EntityKind, EntityState, Nanos, Vec3};
 
 use super::entity::{is_still, kinematics_subject, plan_next, supported};
 

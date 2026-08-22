@@ -351,6 +351,35 @@ impl ChunkStreamer {
 
 // ── Chunk data ──────────────────────────────────────────────────────────
 
+/// Assemble azalea's typed light payload from masks + per-section nibble
+/// arrays (shared by LevelChunkWithLight and standalone LightUpdate).
+fn light_update_data(
+    sky_y_mask: BitSet,
+    block_y_mask: BitSet,
+    empty_sky_y_mask: BitSet,
+    empty_block_y_mask: BitSet,
+    sky_updates: Vec<Vec<u8>>,
+    block_updates: Vec<Vec<u8>>,
+) -> azalea_protocol::packets::game::c_light_update::ClientboundLightUpdatePacketData {
+    let boxed = |v: Vec<Vec<u8>>| -> std::sync::Arc<Box<[Box<[u8]>]>> {
+        std::sync::Arc::new(
+            v.into_iter()
+                .map(Vec::into_boxed_slice)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
+    };
+    azalea_protocol::packets::game::c_light_update::ClientboundLightUpdatePacketData {
+        sky_y_mask,
+        block_y_mask,
+        empty_sky_y_mask,
+        empty_block_y_mask,
+        sky_updates: boxed(sky_updates),
+        block_updates: boxed(block_updates),
+    }
+}
+
+
 /// Send a `ForgetLevelChunk` packet with correct bit handling, working around
 /// the `azalea-core` `ChunkPos` serialization bug for negative coordinates.
 ///
@@ -566,61 +595,20 @@ pub(crate) async fn send_chunk_from_world<W: AsyncWrite + Unpin + Send>(
     // Encode MOTION_BLOCKING heightmap (bit-packed u64 array).
     let heightmap_data = encode_heightmap(&highest_y, min_y);
 
-    // Build the chunk packet manually because azalea's AzBuf derive
-    // serializes heightmaps as a VarInt-prefixed Vec, but the MC protocol
-    // expects them as an NBT compound. azalea is a client lib (reads only).
-    use azalea_buf::AzBufVar;
-    use azalea_protocol::packets::ProtocolPacket;
-
-    let mut raw_packet = Vec::new();
-
-    // Packet ID for ClientboundLevelChunkWithLight
-    let dummy = azalea_protocol::packets::game::ClientboundLevelChunkWithLight {
-        x: 0, z: 0,
-        chunk_data: azalea_protocol::packets::game::c_level_chunk_with_light::ClientboundLevelChunkPacketData {
-            heightmaps: vec![], data: vec![].into_boxed_slice().into(), block_entities: vec![],
-        },
-        light_data: azalea_protocol::packets::game::c_light_update::ClientboundLightUpdatePacketData {
-            sky_y_mask: BitSet::new(0), block_y_mask: BitSet::new(0),
-            empty_sky_y_mask: BitSet::new(0), empty_block_y_mask: BitSet::new(0),
-            sky_updates: Default::default(), block_updates: Default::default(),
-        },
-    };
-    let packet_id = ClientboundGamePacket::LevelChunkWithLight(dummy).id();
-    (packet_id as u32).azalea_write_var(&mut raw_packet)?;
-
-    // x, z (Int, Int)
-    cx.azalea_write(&mut raw_packet)?;
-    cz.azalea_write(&mut raw_packet)?;
-
-    // Heightmaps as Prefixed Array (1.21.5+ format, NOT NBT).
-    // Format: VarInt(count) + for each: VarInt(type_enum) + VarInt(long_count) + i64[]
-    //
-    // We send MOTION_BLOCKING (enum 4) + WORLD_SURFACE (enum 1).
-    // Both use the same data (highest non-air block) which is sufficient for
-    // the client's renderer and sky-light calculations.
-    2u32.azalea_write_var(&mut raw_packet)?; // count = 2
-
-    // MOTION_BLOCKING (ordinal 4)
-    4u32.azalea_write_var(&mut raw_packet)?;
-    (heightmap_data.len() as u32).azalea_write_var(&mut raw_packet)?;
-    for &val in heightmap_data.iter() {
-        (val as i64).azalea_write(&mut raw_packet)?;
-    }
-
-    // WORLD_SURFACE (ordinal 1) — same data
-    1u32.azalea_write_var(&mut raw_packet)?;
-    (heightmap_data.len() as u32).azalea_write_var(&mut raw_packet)?;
-    for &val in heightmap_data.iter() {
-        (val as i64).azalea_write(&mut raw_packet)?;
-    }
-
-    // Data: VarInt(length) + raw section bytes
-    (section_data.len() as u32).azalea_write_var(&mut raw_packet)?;
-    raw_packet.extend_from_slice(&section_data);
-
-    // Block entities: VarInt(0)
-    0u32.azalea_write_var(&mut raw_packet)?;
+    // The packet is written through azalea's TYPED struct: the AzBuf
+    // derive tracks the wire format at every azalea (= MC) bump, so the
+    // outer packet can no longer drift the way the hand-rolled section
+    // encoder did (the 26.x fluid_count field). WORLD_SURFACE reuses the
+    // MOTION_BLOCKING data — sufficient for the renderer and sky light.
+    let chunk_data =
+        azalea_protocol::packets::game::c_level_chunk_with_light::ClientboundLevelChunkPacketData {
+            heightmaps: vec![
+                (azalea_core::heightmap_kind::HeightmapKind::MotionBlocking, heightmap_data.clone()),
+                (azalea_core::heightmap_kind::HeightmapKind::WorldSurface, heightmap_data),
+            ],
+            data: std::sync::Arc::new(section_data.into_boxed_slice()),
+            block_entities: vec![],
+        };
 
     // Ensure sky light is computed for this chunk (lazy, on first send).
     ensure_sky_light(world, cx, cz);
@@ -682,25 +670,17 @@ pub(crate) async fn send_chunk_from_world<W: AsyncWrite + Unpin + Send>(
     // whole runtime (found by the 1,000-player load test: 0 joins, ~0 CPU).
     drop(chunk_ref);
 
-    sky_y_mask.azalea_write(&mut raw_packet)?;
-    block_y_mask.azalea_write(&mut raw_packet)?;
-    empty_sky_y_mask.azalea_write(&mut raw_packet)?;
-    empty_block_y_mask.azalea_write(&mut raw_packet)?;
-
-    (sky_updates.len() as u32).azalea_write_var(&mut raw_packet)?;
-    for arr in &sky_updates {
-        (arr.len() as u32).azalea_write_var(&mut raw_packet)?;
-        raw_packet.extend_from_slice(arr);
+    let packet: ClientboundGamePacket = azalea_protocol::packets::game::ClientboundLevelChunkWithLight {
+        x: cx,
+        z: cz,
+        chunk_data,
+        light_data: light_update_data(
+            sky_y_mask, block_y_mask, empty_sky_y_mask, empty_block_y_mask,
+            sky_updates, block_updates,
+        ),
     }
-
-    (block_updates.len() as u32).azalea_write_var(&mut raw_packet)?;
-    for arr in &block_updates {
-        (arr.len() as u32).azalea_write_var(&mut raw_packet)?;
-        raw_packet.extend_from_slice(arr);
-    }
-
-    // Write the raw packet with framing
-    azalea_protocol::write::write_raw_packet(&raw_packet, write, compression, cipher).await?;
+    .into_variant();
+    write_packet(&packet, write, compression, cipher).await?;
 
     Ok(())
 }
@@ -744,6 +724,12 @@ pub(crate) fn write_section_from_blocks(
     non_air_count: u16,
     biomes: &[u32; 64],
 ) -> Result<()> {
+    // 26.x: sections carry a fluid count next to the block count
+    // (client-side rendering bookkeeping; fluids are first-class now).
+    let fluid_count = blocks_in
+        .iter()
+        .filter(|b| crate::block::is_fluid(**b))
+        .count() as i16;
     use azalea_buf::AzBufVar;
 
     // Palette: lookup keyed by state_id; cap palette length so we fall
@@ -773,6 +759,7 @@ pub(crate) fn write_section_from_blocks(
     let bpe = bpe.max(4);
 
     (non_air_count as i16).azalea_write(buf)?;
+    fluid_count.azalea_write(buf)?;
     bpe.azalea_write(buf)?;
     (palette.len() as u32).azalea_write_var(buf)?;
     for &id in &palette {
@@ -806,8 +793,16 @@ pub(crate) fn write_section_from_blocks(
 pub(crate) fn write_single_section(buf: &mut Vec<u8>, block_state_id: u32, biomes: &[u32; 64]) -> Result<()> {
     use azalea_buf::AzBufVar;
 
-    // Block count (i16)
+    // Block count (i16), then the 26.x fluid count.
     4096i16.azalea_write(buf)?;
+    let fluid_count: i16 = match u16::try_from(block_state_id)
+        .ok()
+        .map(ultimate_engine::world::block::BlockId)
+    {
+        Some(id) if crate::block::is_fluid(id) => 4096,
+        _ => 0,
+    };
+    fluid_count.azalea_write(buf)?;
     // Block states: single-valued palette (bpe=0, value, NO data array)
     0u8.azalea_write(buf)?;
     block_state_id.azalea_write_var(buf)?;
@@ -823,7 +818,8 @@ pub(crate) fn write_single_section(buf: &mut Vec<u8>, block_state_id: u32, biome
 pub(crate) fn write_empty_section(buf: &mut Vec<u8>, biomes: &[u32; 64]) -> Result<()> {
     use azalea_buf::AzBufVar;
 
-    // Block count: 0 (no non-air blocks)
+    // Block count: 0 (no non-air blocks), then the 26.x fluid count.
+    0i16.azalea_write(buf)?;
     0i16.azalea_write(buf)?;
     // Block states: single-valued palette = air (0)
     0u8.azalea_write(buf)?;
@@ -983,49 +979,127 @@ pub(crate) async fn send_light_updates<W: AsyncWrite + Unpin + Send>(
         // the matching comment in send_chunk_from_world).
         drop(chunk_ref);
 
-        // Build the LightUpdate packet manually (azalea's Write impls
-        // don't always match the server-side wire format).
-        use azalea_buf::AzBufVar;
-        use azalea_protocol::packets::ProtocolPacket;
-
-        let mut raw = Vec::new();
-
-        // Packet ID
-        let dummy = azalea_protocol::packets::game::ClientboundLightUpdate {
-            x: 0, z: 0,
-            light_data: azalea_protocol::packets::game::c_light_update::ClientboundLightUpdatePacketData {
-                sky_y_mask: BitSet::new(0), block_y_mask: BitSet::new(0),
-                empty_sky_y_mask: BitSet::new(0), empty_block_y_mask: BitSet::new(0),
-                sky_updates: Default::default(), block_updates: Default::default(),
-            },
-        };
-        let packet_id = ClientboundGamePacket::LightUpdate(dummy).id();
-        (packet_id as u32).azalea_write_var(&mut raw)?;
-
-        // Chunk X, Chunk Z (VarInt)
-        (cx as u32).azalea_write_var(&mut raw)?;
-        (cz as u32).azalea_write_var(&mut raw)?;
-
-        // Light data — same format as the tail of LevelChunkWithLight
-        sky_y_mask.azalea_write(&mut raw)?;
-        block_y_mask.azalea_write(&mut raw)?;
-        empty_sky_y_mask.azalea_write(&mut raw)?;
-        empty_block_y_mask.azalea_write(&mut raw)?;
-
-        (sky_updates.len() as u32).azalea_write_var(&mut raw)?;
-        for arr in &sky_updates {
-            (arr.len() as u32).azalea_write_var(&mut raw)?;
-            raw.extend_from_slice(arr);
+        let packet: ClientboundGamePacket = azalea_protocol::packets::game::ClientboundLightUpdate {
+            x: cx,
+            z: cz,
+            light_data: light_update_data(
+                sky_y_mask, block_y_mask, empty_sky_y_mask, empty_block_y_mask,
+                sky_updates, block_updates,
+            ),
         }
-
-        (block_updates.len() as u32).azalea_write_var(&mut raw)?;
-        for arr in &block_updates {
-            (arr.len() as u32).azalea_write_var(&mut raw)?;
-            raw.extend_from_slice(arr);
-        }
-
-        azalea_protocol::write::write_raw_packet(&raw, write, compression, cipher).await?;
+        .into_variant();
+        write_packet(&packet, write, compression, cipher).await?;
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use azalea_core::position::{ChunkSectionBiomePos, ChunkSectionBlockPos};
+    use azalea_registry::DataRegistry;
+    use azalea_world::Section as AzaleaSection;
+    use std::io::Cursor;
+    use ultimate_engine::world::block::BlockId;
+
+    // These round-trip our hand-encoded section bytes through
+    // AZALEA-WORLD'S OWN PARSER — the same wire layout a vanilla client
+    // implements. The protocol swarm never parses section bytes (it
+    // counts packets), which is how the 26.x `fluid_count` field went
+    // unnoticed until a real client's "No value with id N" palette
+    // crash; an azalea version bump changes this parser in lockstep with
+    // the format, so drift now fails here instead of at a login screen.
+
+    fn parse(buf: &[u8]) -> AzaleaSection {
+        let mut cursor = Cursor::new(buf);
+        let sec = AzaleaSection::azalea_read(&mut cursor).expect("azalea parses our section");
+        assert_eq!(
+            cursor.position() as usize,
+            buf.len(),
+            "azalea must consume the section EXACTLY (leftover bytes = format drift)"
+        );
+        sec
+    }
+
+    #[test]
+    fn full_section_roundtrips_through_azalea() {
+        let mut blocks = [BlockId::AIR; 4096];
+        let mut non_air = 0u16;
+        for i in 0..2048 {
+            blocks[i] = crate::block::STONE;
+            non_air += 1;
+        }
+        for i in 2048..2100 {
+            blocks[i] = crate::block::WATER;
+            non_air += 1;
+        }
+        let biomes = [3u32; 64];
+
+        let mut buf = Vec::new();
+        write_section_from_blocks(&mut buf, &blocks, non_air, &biomes).unwrap();
+        let sec = parse(&buf);
+
+        assert_eq!(sec.block_count, non_air);
+        assert_eq!(sec.fluid_count, 52, "the 26.x fluid count field");
+        // Spot-check cells through azalea's own indexing.
+        assert_eq!(
+            u32::from(sec.get_block_state(ChunkSectionBlockPos::new(0, 0, 0))),
+            crate::block::STONE.0 as u32
+        );
+        assert_eq!(
+            u32::from(sec.get_block_state(ChunkSectionBlockPos::new(15, 15, 15))),
+            0u32,
+            "top cell is air"
+        );
+        assert_eq!(
+            sec.biomes.get(ChunkSectionBiomePos::new(2, 1, 3)).protocol_id(),
+            3
+        );
+    }
+
+    #[test]
+    fn single_and_empty_sections_roundtrip_through_azalea() {
+        let biomes = [7u32; 64];
+
+        let mut buf = Vec::new();
+        write_single_section(&mut buf, crate::block::WATER.0 as u32, &biomes).unwrap();
+        let sec = parse(&buf);
+        assert_eq!(sec.block_count, 4096);
+        assert_eq!(sec.fluid_count, 4096, "all-water section is all fluid");
+        assert_eq!(
+            u32::from(sec.get_block_state(ChunkSectionBlockPos::new(8, 8, 8))),
+            crate::block::WATER.0 as u32
+        );
+
+        let mut buf = Vec::new();
+        write_empty_section(&mut buf, &biomes).unwrap();
+        let sec = parse(&buf);
+        assert_eq!(sec.block_count, 0);
+        assert_eq!(sec.fluid_count, 0);
+        assert_eq!(sec.biomes.get(ChunkSectionBiomePos::new(0, 0, 0)).protocol_id(), 7);
+    }
+
+    #[test]
+    fn heterogeneous_biomes_roundtrip_through_azalea() {
+        let mut biomes = [0u32; 64];
+        for (i, b) in biomes.iter_mut().enumerate() {
+            *b = (i % 5) as u32; // force an indirect biome palette
+        }
+        let mut buf = Vec::new();
+        write_empty_section(&mut buf, &biomes).unwrap();
+        let sec = parse(&buf);
+        for z in 0..4u8 {
+            for x in 0..4u8 {
+                for y in 0..4u8 {
+                    let idx = (y as usize) * 16 + (z as usize) * 4 + (x as usize);
+                    assert_eq!(
+                        sec.biomes.get(ChunkSectionBiomePos::new(x, y, z)).protocol_id(),
+                        biomes[idx],
+                        "biome cell ({x},{y},{z})"
+                    );
+                }
+            }
+        }
+    }
 }
