@@ -273,6 +273,13 @@ pub(crate) fn registry_entries() -> Vec<(String, Vec<String>)> {
             "minecraft:the_nether".into(),
             "minecraft:the_end".into(),
         ]),
+        // The client's dimension data references per-dimension clocks
+        // (MC 26.x); leaving this registry undeclared fails vanilla
+        // configuration with "Unbound values in minecraft:world_clock".
+        (
+            "minecraft:world_clock".into(),
+            crate::registry::WORLD_CLOCK_REGISTRY.clone(),
+        ),
         // Derived from azalea's biome table (single source with
         // `worldgen::Biome::registry_id`): the order of this list DEFINES
         // the numeric biome ids in every chunk packet.
@@ -371,4 +378,27 @@ pub(crate) fn registry_entries() -> Vec<(String, Vec<String>)> {
 /// Generate an offline-mode UUID from a player name.
 pub(crate) fn offline_uuid(name: &str) -> Uuid {
     Uuid::new_v3(&Uuid::NAMESPACE_URL, format!("OfflinePlayer:{}", name).as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configuration_declares_the_reference_required_registries() {
+        let regs = registry_entries();
+        let get = |name: &str| -> &Vec<String> {
+            &regs.iter().find(|(n, _)| n == name).unwrap_or_else(|| {
+                panic!("configuration must declare {name}")
+            }).1
+        };
+        assert_eq!(get("minecraft:dimension_type").len(), 4);
+        // MC 26.x: dimension data references these clocks; a vanilla
+        // client refuses to finish configuration without them.
+        assert_eq!(
+            get("minecraft:world_clock"),
+            &vec!["minecraft:overworld".to_string(), "minecraft:the_end".to_string()],
+        );
+        assert!(get("minecraft:worldgen/biome").len() >= 60);
+    }
 }

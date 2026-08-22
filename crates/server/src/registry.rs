@@ -172,20 +172,33 @@ pub fn fluid_level_ids(name: &str) -> [u16; 16] {
 
 // ── Biome wire IDs ───────────────────────────────────────────────────────
 
+/// Namespaced names of a derived data registry, in azalea's (= vanilla
+/// data-pack) order.
+fn registry_names<K: Clone>(all: &[K]) -> Vec<String>
+where
+    azalea_registry::identifier::Identifier: From<K>,
+{
+    all.iter()
+        .map(|k| azalea_registry::identifier::Identifier::from(k.clone()).to_string())
+        .collect()
+}
+
 /// The `minecraft:worldgen/biome` registry the server declares during
 /// configuration, in azalea's (= vanilla data-pack) order. **This list
 /// defines the numeric biome IDs in every chunk packet** — the client
 /// indexes into the registry exactly as sent. Derived, not hand-written,
 /// so an azalea version bump renumbers both sides together.
-pub static BIOME_REGISTRY: LazyLock<Vec<String>> = LazyLock::new(|| {
-    azalea_registry::data::BiomeKey::ALL
-        .iter()
-        .map(|k| {
-            let ident: azalea_registry::identifier::Identifier = k.clone().into();
-            ident.to_string()
-        })
-        .collect()
-});
+pub static BIOME_REGISTRY: LazyLock<Vec<String>> =
+    LazyLock::new(|| registry_names(azalea_registry::data::BiomeKey::ALL));
+
+/// The `minecraft:world_clock` registry (new in MC 26.x): the client's
+/// dimension data references per-dimension clocks, so configuration
+/// FAILS on a vanilla client unless the server declares these
+/// ("Unbound values in registry minecraft:world_clock"). Found the hard
+/// way: azalea-based smoke clients don't run vanilla's registry
+/// validation, so only a real client caught it.
+pub static WORLD_CLOCK_REGISTRY: LazyLock<Vec<String>> =
+    LazyLock::new(|| registry_names(azalea_registry::data::WorldClockKey::ALL));
 
 static BIOME_WIRE_IDS: LazyLock<HashMap<&'static str, u32>> = LazyLock::new(|| {
     BIOME_REGISTRY
@@ -233,6 +246,16 @@ mod tests {
         assert_eq!(block_prop(x_axis, "axis"), Some("x"));
         assert_eq!(block_name(x_axis), "oak_log");
         assert!(with_props(log, &[("no_such_prop", "1")]).is_none());
+    }
+
+    #[test]
+    fn world_clock_registry_has_the_referenced_clocks() {
+        // The client's overworld/end dimension data references exactly
+        // these; missing either reproduces the connect-refusal.
+        assert_eq!(
+            *WORLD_CLOCK_REGISTRY,
+            vec!["minecraft:overworld".to_string(), "minecraft:the_end".to_string()],
+        );
     }
 
     #[test]
