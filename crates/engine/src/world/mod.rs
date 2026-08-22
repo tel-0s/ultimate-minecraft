@@ -187,6 +187,42 @@ impl World {
         true
     }
 
+    /// Place `block` at the first replaceable cell scanning UP the column
+    /// from `base` (exclusive cap at `max_y`), ATOMICALLY: the scan and
+    /// the write happen under the chunk's write guard, so two concurrent
+    /// placements into the same column serialize — the second scan sees
+    /// the first write and climbs past it. Returns the chosen cell and
+    /// the block it replaced, or `None` when no cell below the cap is
+    /// free (or the chunk is missing).
+    ///
+    /// This is the `EntityMaterialize` landing scan. Without the guard,
+    /// two falling blocks materializing into one column from different
+    /// workers (a rebalance dual-ownership window) could both observe the
+    /// same free cell and double-place — one block silently overwritten.
+    /// Observed once in ~30 runs of the 160k bench before this fix.
+    pub fn place_first_replaceable_up(
+        &self,
+        base: BlockPos,
+        max_y: i64,
+        block: BlockId,
+    ) -> Option<(BlockPos, BlockId)> {
+        let cp = base.chunk();
+        let mut chunk = self.chunks.get_mut(&cp)?;
+        let mut y = base.y;
+        while y < max_y {
+            let cell = BlockPos::new(base.x, y, base.z);
+            let current = chunk.get_block(cell.local());
+            if self.is_replaceable(current) {
+                chunk.set_block(cell.local(), block);
+                drop(chunk);
+                self.dirty.insert(cp);
+                return Some((cell, current));
+            }
+            y += 1;
+        }
+        None
+    }
+
     /// Mark a chunk as having unsaved modifications without writing a
     /// block (persistence-format migration: a chunk loaded from a legacy
     /// save format re-saves in the current one on the next autosave).

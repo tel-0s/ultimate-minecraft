@@ -274,28 +274,28 @@ fn apply_event(world: &World, payload: &EventPayload, synth_log: &mut Vec<EventP
                 return false; // superseded: another transition won the entity
             }
             synth_log.push(EventPayload::EntitySet { id: *id, old: Some(*old), new: None });
-            // First replaceable cell scanning up (co-landing contention
-            // climbs here, inside the same atom; the scan is vertical so
-            // placement never leaves this event's chunk/owner).
+            // First replaceable cell scanning up. The scan+write is
+            // COLUMN-ATOMIC (under the chunk's write guard): the entity
+            // guard arbitrates which transition wins the entity, and the
+            // chunk guard arbitrates which co-landing materialize gets
+            // which cell — two concurrent scans serialize, the second
+            // climbs past the first's write instead of overwriting it.
+            // The scan is vertical, so placement never leaves this
+            // event's chunk/owner.
             let base = old.pos.block_pos();
-            let mut y = base.y;
-            while y < MATERIALIZE_SCAN_CAP {
-                let cell = crate::world::position::BlockPos::new(base.x, y, base.z);
-                let current = world.get_block(cell);
-                // "Replaceable" without game semantics: the server's rules
-                // guarantee `old.pos` rests atop a solid; the engine takes
-                // AIR as the free marker. Fluids and other replaceables
-                // are the rules' concern — they re-level via the notifies
-                // the materialize rule emits.
-                if world.is_replaceable(current) {
-                    world.set_block(cell, *block);
-                    synth_log.push(EventPayload::BlockSet { pos: cell, old: current, new: *block });
-                    return true;
+            match world.place_first_replaceable_up(base, MATERIALIZE_SCAN_CAP, *block) {
+                Some((cell, replaced)) => {
+                    synth_log.push(EventPayload::BlockSet {
+                        pos: cell,
+                        old: replaced,
+                        new: *block,
+                    });
                 }
-                y += 1;
+                // No free cell below the ceiling (or missing chunk): the
+                // block is voided — the despawn stands; matter loss only
+                // above build height.
+                None => {}
             }
-            // No free cell below the ceiling: the block is voided (the
-            // despawn stands — matter loss only above build height).
             true
         }
         // ATOMIC multi-cell rewrite (pistons): all-or-nothing under the
