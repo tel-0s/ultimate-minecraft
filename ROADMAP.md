@@ -300,8 +300,13 @@ causality is the only ordering.
       worker timer plane, injectable `Clock` (tests run lifecycles in
       virtual time). 5 new integration tests; trajectories bit-identical
       across worker counts.
-- [ ] AABB collision detection against block grid (MVP uses substep
-      trajectory sampling at planning time; true swept-AABB next)
+- [x] Exact swept collision ✓ (2026-08-21): `plan_segment` walks the
+      parabolic trajectory through the voxel grid by solving successive
+      cell-boundary crossing times (parabolic DDA) — no tunneling at any
+      speed (the 25 ms sampler stepped over 1-block walls above ~40 b/s;
+      pinned by 400 b/s regression tests), exact landing times, O(cells)
+      cost, bit-identical across worker counts. Per-kind AABB footprints
+      layer on top when larger mobs land.
 - [ ] Gravity, jumping, basic kinematics (items done; per-kind dispatch
       as kinds grow)
 - [x] Entity-entity interaction as causally-ordered events ✓ (pickup:
@@ -339,8 +344,15 @@ causality is the only ordering.
       Remaining for full unification: entity-based player rendering
       (retires `entity_spawn_cap` for real AOI), cross-gateway player
       visibility.
-- [ ] Mob spawning rules, basic mob AI (think = timed self-chained EntityWake;
-      AI cadence is a per-mob rate, not a global tick)
+- [x] Basic mob AI ✓ (2026-08-21, skeleton): think = timed self-chained
+      `EntityWake` at a per-mob jittered cadence (0.9-1.5 s). Chain
+      discipline: next-think deadline lives in `aux`; only the guarded
+      `EntitySet` advancing it mints a chain link, so wake storms can't
+      multiply chains (tested: 200-wake storm → ≤3 parked timers). Mobs
+      wander via ballistic hops on the exact-sweep kinematics and fall
+      via wake-on-block-change like any actor. `/summon [n]` is the
+      manual spawn path. Remaining: natural spawning rules, per-kind
+      AABBs, real behaviors (pathfinding, targeting).
 
 ## Phase 6 -- Scale & Optimization
 
@@ -961,3 +973,5 @@ one azalea table.
 | 2026-08-21 | Registry version boundary: generated block ids, derived biomes, name-based delta saves |
 | 2026-08-21 | **MC 26.2** (protocol 776) via azalea 0.16 + git pin — double version hop, smoke-tested live |
 | 2026-08-21 | net/ split (handshake / chunk_stream / entity_view) + gameplay layer |
+| 2026-08-21 | handle_play componentized (ChunkStreamer/EntityTracker/Presence/Avatar); cross-node player-eid collision fixed |
+| 2026-08-21 | P2: exact swept collision (parabolic DDA) + mob AI skeleton (/summon) |
