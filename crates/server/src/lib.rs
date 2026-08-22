@@ -1,4 +1,5 @@
 pub mod block;
+pub mod block_ids;
 pub mod cluster;
 pub mod config;
 pub mod dashboard;
@@ -9,6 +10,7 @@ pub mod persistence;
 pub mod physics;
 pub mod placement;
 pub mod player_registry;
+pub mod registry;
 pub mod rules;
 pub mod simulation;
 pub mod worldgen;

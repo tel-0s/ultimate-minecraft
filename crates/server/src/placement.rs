@@ -12,7 +12,7 @@ use ultimate_engine::world::block::BlockId;
 use ultimate_engine::world::position::BlockPos as EngineBlockPos;
 use ultimate_engine::world::World;
 
-use crate::persistence::lookup_block_state;
+use crate::registry::lookup_block_state;
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
@@ -139,7 +139,7 @@ pub fn orient_block(
     // Sort and look up the oriented state.
     props.sort();
     lookup_block_state(&name, &props)
-        .and_then(|id| BlockState::try_from(id as u32).ok())
+        .and_then(|id| BlockState::try_from(id.0 as u32).ok())
         .unwrap_or(default_state)
 }
 
@@ -478,7 +478,7 @@ pub fn compute_stair_shape_for_placement(
     props.sort();
 
     lookup_block_state(&name, &props)
-        .and_then(|id| BlockState::try_from(id as u32).ok())
+        .and_then(|id| BlockState::try_from(id.0 as u32).ok())
         .unwrap_or(state)
 }
 
@@ -554,7 +554,7 @@ pub fn update_adjacent_stair_shapes(
         props.sort();
 
         if let Some(new_id) = lookup_block_state(&name, &props) {
-            updates.push((npos, BlockId(new_id)));
+            updates.push((npos, new_id));
         }
     }
 

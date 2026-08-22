@@ -7,11 +7,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Cursor, Seek};
 use std::path::Path;
-use std::sync::LazyLock;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use azalea_block::{BlockState, BlockTrait};
 use serde::{Deserialize, Serialize};
 
 use ultimate_engine::world::block::BlockId;
@@ -22,39 +20,7 @@ use ultimate_engine::world::World;
 // ── MC 1.21.11 data version ─────────────────────────────────────────────────
 
 /// DataVersion tag written into every saved chunk. MC 1.21.11 = 4189.
-const DATA_VERSION: i32 = 4189;
-
-// ── Reverse lookup table: (name, properties) → BlockState ID ─────────────────
-
-/// Key for the reverse block lookup: `("stone", {})` or `("oak_stairs", {"facing": "north", ...})`.
-type BlockLookupKey = (String, Vec<(String, String)>);
-
-/// Lazily-built reverse lookup table: `(name, sorted_properties) → state_id`.
-static BLOCK_LOOKUP: LazyLock<HashMap<BlockLookupKey, u16>> = LazyLock::new(|| {
-    let mut map = HashMap::new();
-    for id in 0..=BlockState::MAX_STATE {
-        let state = BlockState::try_from(id as u32).unwrap();
-        let block: Box<dyn BlockTrait> = Box::<dyn BlockTrait>::from(state);
-        let name = block.id().to_string(); // "stone", "oak_stairs", etc.
-        let mut props: Vec<(String, String)> = block
-            .property_map()
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        props.sort();
-        map.insert((name, props), id);
-    }
-    map
-});
-
-/// Look up a block state ID by name and sorted property list.
-///
-/// Used by the placement system to resolve oriented block states.
-pub(crate) fn lookup_block_state(name: &str, props: &[(String, String)]) -> Option<u16> {
-    BLOCK_LOOKUP
-        .get(&(name.to_string(), props.to_vec()))
-        .copied()
-}
+const DATA_VERSION: i32 = crate::registry::MC_DATA_VERSION;
 
 /// Convert a palette entry (name + optional properties) back to a BlockId.
 fn palette_entry_to_block_id(entry: &PaletteEntry) -> BlockId {
@@ -73,8 +39,8 @@ fn palette_entry_to_block_id(entry: &PaletteEntry) -> BlockId {
         .unwrap_or_default();
     props.sort();
 
-    if let Some(&id) = BLOCK_LOOKUP.get(&(name.to_string(), props)) {
-        BlockId(id)
+    if let Some(id) = crate::registry::lookup_block_state(name, &props) {
+        id
     } else {
         tracing::warn!("Unknown block in save file: {}, defaulting to air", entry.name);
         BlockId::AIR
@@ -83,27 +49,21 @@ fn palette_entry_to_block_id(entry: &PaletteEntry) -> BlockId {
 
 /// Convert a BlockId to a palette entry (name + optional properties).
 fn block_id_to_palette_entry(id: BlockId) -> PaletteEntry {
-    if id == BlockId::AIR {
+    let Some((bare, props)) = crate::registry::block_parts(id) else {
         return PaletteEntry {
             name: "minecraft:air".into(),
             properties: None,
         };
-    }
-    let state = BlockState::try_from(id.0 as u32).unwrap_or(BlockState::AIR);
-    let block: Box<dyn BlockTrait> = Box::<dyn BlockTrait>::from(state);
-    let name = format!("minecraft:{}", block.id());
-    let prop_map = block.property_map();
-    let properties = if prop_map.is_empty() {
+    };
+    let properties = if props.is_empty() {
         None
     } else {
-        Some(
-            prop_map
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-        )
+        Some(props.iter().cloned().collect())
     };
-    PaletteEntry { name, properties }
+    PaletteEntry {
+        name: format!("minecraft:{bare}"),
+        properties,
+    }
 }
 
 // ── Chunk NBT structs (serde) ────────────────────────────────────────────────
@@ -566,8 +526,9 @@ pub fn load_into(
 
     let start = Instant::now();
 
-    // Force the reverse lookup table to initialize before we start loading.
-    let _ = &*BLOCK_LOOKUP;
+    // Force the registry's reverse lookup table to initialize before we
+    // start loading.
+    crate::registry::warm_block_tables();
 
     let mut total_chunks = 0usize;
     let mut stale_chunks = 0usize;

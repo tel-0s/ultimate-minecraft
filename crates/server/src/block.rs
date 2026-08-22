@@ -1,31 +1,15 @@
 //! Minecraft block type definitions and property lookups.
 //!
 //! BlockId values are MC block state IDs (from azalea-block), so they can be
-//! used directly in protocol chunk data without any mapping layer.
+//! used directly in protocol chunk data without any mapping layer. The
+//! named constants are GENERATED (`src/block_ids.rs`, regenerated with
+//! `cargo run --example gen_block_ids`) so an azalea version bump can
+//! never leave a stale hand-written number behind; name↔id translation
+//! itself lives in `crate::registry`.
 
 use ultimate_engine::world::block::BlockId;
 
-// ── MC block state IDs (from azalea-block for MC 1.21.11) ────────────────
-// These match the vanilla protocol, so BlockId can be used directly in chunks.
-
-pub const AIR: BlockId = BlockId(0);
-pub const STONE: BlockId = BlockId(1);
-pub const GRASS_BLOCK: BlockId = BlockId(9);  // snowy=false
-pub const DIRT: BlockId = BlockId(10);
-pub const BEDROCK: BlockId = BlockId(85);
-pub const SAND: BlockId = BlockId(118);
-pub const OAK_LOG: BlockId = BlockId(137);    // axis=y
-
-// Legacy aliases for engine tests (which use small sequential IDs)
-pub const GRASS: BlockId = GRASS_BLOCK;
-pub const LOG: BlockId = OAK_LOG;
-pub const LEAVES: BlockId = BlockId(259);     // oak_leaves default
-
-/// Source water block: `water[level=0]` (block state 86).
-pub const WATER: BlockId = BlockId(86);
-
-/// Source lava block: `lava[level=0]` (block state 102, verified via azalea).
-pub const LAVA: BlockId = BlockId(102);
+pub use crate::block_ids::*;
 
 // ── Fluid abstraction ────────────────────────────────────────────────────
 
@@ -37,11 +21,11 @@ pub enum FluidKind {
 }
 
 impl FluidKind {
-    /// Base block-state ID for this fluid (level 0 = source).
-    const fn base_id(self) -> u16 {
+    /// Per-level state ids (generated; no contiguity assumption).
+    const fn level_ids(self) -> &'static [u16; 16] {
         match self {
-            FluidKind::Water => 86,
-            FluidKind::Lava => 102,
+            FluidKind::Water => &WATER_LEVEL_IDS,
+            FluidKind::Lava => &LAVA_LEVEL_IDS,
         }
     }
 
@@ -56,29 +40,31 @@ impl FluidKind {
 
     /// Source block for this fluid (level 0).
     pub const fn source(self) -> BlockId {
-        BlockId(self.base_id())
+        BlockId(self.level_ids()[0])
     }
 
     /// Block ID for this fluid at a given level (0-15, clamped).
     pub const fn at_level(self, level: u8) -> BlockId {
         let l = if level > 15 { 15 } else { level };
-        BlockId(self.base_id() + l as u16)
+        BlockId(self.level_ids()[l as usize])
     }
 
     /// If `id` is this fluid, return its level (0-15). Otherwise `None`.
     pub const fn level(self, id: BlockId) -> Option<u8> {
-        let base = self.base_id();
-        if id.0 >= base && id.0 <= base + 15 {
-            Some((id.0 - base) as u8)
-        } else {
-            None
+        let ids = self.level_ids();
+        let mut l = 0;
+        while l < 16 {
+            if ids[l] == id.0 {
+                return Some(l as u8);
+            }
+            l += 1;
         }
+        None
     }
 
     /// Does `id` belong to this fluid at any level?
     pub const fn is_match(self, id: BlockId) -> bool {
-        let base = self.base_id();
-        id.0 >= base && id.0 <= base + 15
+        self.level(id).is_some()
     }
 }
 
@@ -132,9 +118,24 @@ pub fn lava_max_spread() -> u8 {
 
 // ── Block property queries ──────────────────────────────────────────────
 
-/// Does this block fall under gravity (like sand/gravel)?
+/// Does this block fall under gravity? Name-derived LUT over the whole
+/// state space (sand, gravel, concrete powders, anvils, ...), same
+/// pattern as the light LUTs below.
 pub fn has_gravity(id: BlockId) -> bool {
-    id == SAND
+    static GRAVITY_LUT: std::sync::LazyLock<Box<[bool]>> = std::sync::LazyLock::new(|| {
+        (0..=azalea_block::BlockState::MAX_STATE)
+            .map(|raw| {
+                let name = crate::registry::block_name(BlockId(raw as u16));
+                matches!(
+                    name,
+                    "sand" | "red_sand" | "gravel" | "suspicious_sand" | "suspicious_gravel"
+                        | "anvil" | "chipped_anvil" | "damaged_anvil"
+                        | "dragon_egg" | "scaffolding"
+                ) || name.ends_with("_concrete_powder")
+            })
+            .collect()
+    });
+    GRAVITY_LUT.get(id.0 as usize).copied().unwrap_or(false)
 }
 
 /// Can another block be placed in this space?
@@ -381,24 +382,9 @@ fn light_opacity_uncached(id: BlockId) -> u8 {
     }
 }
 
-/// Look up the *default-state* `BlockId` by Minecraft name (with or without
-/// the `minecraft:` namespace). Returns `None` for unknown blocks.
-///
-/// Used by worldgen presets that name blocks via JSON. Only resolves the
-/// default state of each block (no property overrides); for stateful
-/// placement (e.g. stairs facing a direction) use the placement module.
-pub fn block_id_from_name(name: &str) -> Option<BlockId> {
-    use azalea_block::BlockState;
-    use azalea_registry::builtin::BlockKind;
-    use std::str::FromStr;
-
-    let bare = name.strip_prefix("minecraft:").unwrap_or(name);
-    let kind = BlockKind::from_str(bare).ok()?;
-    // Default state lookup. azalea's BlockKind → BlockState conversion uses
-    // each block's `default` state, matching vanilla.
-    let state: u32 = BlockState::from(kind).into();
-    Some(BlockId::new(state as u16))
-}
+/// Look up the *default-state* `BlockId` by Minecraft name (re-exported
+/// from the registry; used by worldgen presets that name blocks via JSON).
+pub use crate::registry::block_id_from_name;
 
 /// Human-readable name for dashboard display.
 pub fn name(id: BlockId) -> String {

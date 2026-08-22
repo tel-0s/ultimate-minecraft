@@ -28,39 +28,10 @@ const REDSTONE_TICK: u64 = 100_000_000;
 
 // ── Block property plumbing ──────────────────────────────────────────────
 
-fn block_parts(id: BlockId) -> Option<(String, Vec<(String, String)>)> {
-    use azalea_block::{BlockState, BlockTrait};
-    let state = BlockState::try_from(id.0 as u32).ok()?;
-    let b: Box<dyn BlockTrait> = Box::<dyn BlockTrait>::from(state);
-    let props = b
-        .property_map()
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-    Some((b.id().to_string(), props))
-}
-
-fn block_name(id: BlockId) -> String {
-    block_parts(id).map(|(n, _)| n).unwrap_or_default()
-}
-
-fn get_prop(id: BlockId, key: &str) -> Option<String> {
-    block_parts(id)?.1.into_iter().find(|(k, _)| k == key).map(|(_, v)| v)
-}
-
-/// The same block with some properties changed (None if the combination
-/// doesn't exist in the state table).
-fn with_props(id: BlockId, changes: &[(&str, &str)]) -> Option<BlockId> {
-    let (name, mut props) = block_parts(id)?;
-    for (key, value) in changes {
-        match props.iter_mut().find(|(k, _)| k == key) {
-            Some((_, v)) => *v = value.to_string(),
-            None => return None,
-        }
-    }
-    props.sort();
-    crate::persistence::lookup_block_state(&name, &props).map(BlockId)
-}
+// Name/property resolution rides the registry's precomputed tables
+// (no per-call allocation; the old local helpers boxed a BlockTrait and
+// re-stringified the property map on every query).
+use crate::registry::{block_name, block_prop as get_prop, with_props};
 
 // ── Power model ──────────────────────────────────────────────────────────
 
@@ -82,16 +53,15 @@ pub fn wire_power_at(world: &World, pos: BlockPos) -> Option<u8> {
 
 /// Is this block's `lit` property true (lamps, torches)?
 pub fn is_lit(id: BlockId) -> bool {
-    get_prop(id, "lit").as_deref() == Some("true")
+    get_prop(id, "lit") == Some("true")
 }
 
 /// Full-strength power emitted by this block (levers, lit torches).
 fn source_power(id: BlockId) -> u8 {
-    let name = block_name(id);
-    match name.as_str() {
-        "lever" if get_prop(id, "powered").as_deref() == Some("true") => 15,
+    match block_name(id) {
+        "lever" if get_prop(id, "powered") == Some("true") => 15,
         "redstone_torch" | "redstone_wall_torch"
-            if get_prop(id, "lit").as_deref() == Some("true") =>
+            if get_prop(id, "lit") == Some("true") =>
         {
             15
         }
@@ -116,7 +86,7 @@ pub fn toggle_lever(id: BlockId) -> Option<BlockId> {
     if block_name(id) != "lever" {
         return None;
     }
-    let on = get_prop(id, "powered").as_deref() == Some("true");
+    let on = get_prop(id, "powered") == Some("true");
     with_props(id, &[("powered", if on { "false" } else { "true" })])
 }
 
@@ -134,7 +104,7 @@ pub fn redstone(world: &World, payload: &EventPayload) -> Vec<Event> {
         _ => return Vec::new(),
     };
     let id = world.get_block(pos);
-    let mut events = match block_name(id).as_str() {
+    let mut events = match block_name(id) {
         "redstone_wire" => wire_update(world, pos),
         "redstone_lamp" => lamp_update(world, pos, id),
         "redstone_torch" | "redstone_wall_torch" => torch_update(world, pos, id, payload),
@@ -142,7 +112,7 @@ pub fn redstone(world: &World, payload: &EventPayload) -> Vec<Event> {
     };
     let above = BlockPos::new(pos.x, pos.y + 1, pos.z);
     if matches!(
-        block_name(world.get_block(above)).as_str(),
+        block_name(world.get_block(above)),
         "redstone_torch" | "redstone_wall_torch"
     ) {
         events.push(Event { payload: EventPayload::BlockNotify { pos: above } });
@@ -213,7 +183,7 @@ fn wire_update(world: &World, origin: BlockPos) -> Vec<Event> {
             let nid = world.get_block(n);
             if is_wire(nid)
                 || matches!(
-                    block_name(nid).as_str(),
+                    block_name(nid),
                     "lever" | "redstone_torch" | "redstone_wall_torch" | "redstone_lamp"
                 )
             {
@@ -246,7 +216,7 @@ fn wire_update(world: &World, origin: BlockPos) -> Vec<Event> {
 }
 
 fn lamp_update(world: &World, pos: BlockPos, id: BlockId) -> Vec<Event> {
-    let lit = get_prop(id, "lit").as_deref() == Some("true");
+    let lit = get_prop(id, "lit") == Some("true");
     let want = powered_by_neighbors(world, pos);
     if lit == want {
         return Vec::new();
@@ -278,7 +248,7 @@ fn torch_update(world: &World, pos: BlockPos, id: BlockId, payload: &EventPayloa
             let nid = world.get_block(n);
             source_power(nid) > 0 || wire_power(nid).is_some_and(|p| p > 0)
         });
-    let lit = get_prop(id, "lit").as_deref() == Some("true");
+    let lit = get_prop(id, "lit") == Some("true");
     let want = !input_powered;
     if lit != want {
         if let Some(new_id) = with_props(id, &[("lit", if want { "true" } else { "false" })]) {

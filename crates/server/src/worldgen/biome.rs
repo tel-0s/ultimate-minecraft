@@ -31,20 +31,12 @@ pub enum Biome {
 
 impl Biome {
     /// Wire ID for the worldgen/biome registry sent during configuration.
-    /// MUST stay in sync with the alphabetical list in
-    /// `connection.rs::registry_data` — changing the order there breaks
-    /// every chunk packet.
-    pub const fn registry_id(self) -> u32 {
-        match self {
-            Self::Beach => 3,
-            Self::Desert => 14,
-            Self::Forest => 21,
-            Self::Ocean => 35,
-            Self::Plains => 40,
-            Self::River => 41,
-            Self::SnowyPlains => 46,
-            Self::StonyPeaks => 51,
-        }
+    /// Resolved through `registry::BIOME_REGISTRY` — the same derived list
+    /// the configuration phase sends — so the two can never drift apart
+    /// (they used to be maintained by hand in two files).
+    pub fn registry_id(self) -> u32 {
+        crate::registry::biome_wire_id(self.name())
+            .expect("worldgen biome must exist in the protocol biome registry")
     }
 
     pub const fn name(self) -> &'static str {
@@ -78,6 +70,26 @@ mod tests {
                     "{:?} and {:?} share registry ID", all[i], all[j],
                 );
             }
+        }
+    }
+
+    /// Pin the wire ids for the MC 1.21.11 biome table. On a protocol
+    /// bump these may legitimately shift — update the expectations after
+    /// confirming the new derived table; the point is that a shift is
+    /// SEEN, not silent.
+    #[test]
+    fn registry_ids_pinned_for_current_protocol() {
+        for (biome, id) in [
+            (Biome::Beach, 3),
+            (Biome::Desert, 14),
+            (Biome::Forest, 21),
+            (Biome::Ocean, 35),
+            (Biome::Plains, 40),
+            (Biome::River, 41),
+            (Biome::SnowyPlains, 46),
+            (Biome::StonyPeaks, 51),
+        ] {
+            assert_eq!(biome.registry_id(), id, "{biome:?}");
         }
     }
 
