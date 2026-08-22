@@ -344,6 +344,16 @@ causality is the only ordering.
       Remaining for full unification: entity-based player rendering
       (retires `entity_spawn_cap` for real AOI), cross-gateway player
       visibility.
+- [x] Natural mob spawning ✓ (2026-08-21): `spawning::MobSpawner` is the
+      simulation-layer framework's first real tenant — per-player spawn
+      ring (24-64), standable-ground probe, per-player + global caps,
+      128-block despawn sweep; pure guarded-event source, gateway-aware
+      (players read from EntityStore mirrors). Per-kind collision landed
+      with it: items/mobs pass through attachments and plants
+      (`blocks_entity_movement` LUT) — a pig or dropped item now falls
+      INTO a pressure plate's cell and presses it. Center-point support
+      kept consistent with the point sweep; Minkowski-dilated AABB
+      sweeps are the follow-up.
 - [x] Basic mob AI ✓ (2026-08-21, skeleton): think = timed self-chained
       `EntityWake` at a per-mob jittered cadence (0.9-1.5 s). Chain
       discipline: next-think deadline lives in `aux`; only the guarded
