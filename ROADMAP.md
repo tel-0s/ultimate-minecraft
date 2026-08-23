@@ -351,9 +351,16 @@ causality is the only ordering.
       (players read from EntityStore mirrors). Per-kind collision landed
       with it: items/mobs pass through attachments and plants
       (`blocks_entity_movement` LUT) — a pig or dropped item now falls
-      INTO a pressure plate's cell and presses it. Center-point support
-      kept consistent with the point sweep; Minkowski-dilated AABB
-      sweeps are the follow-up.
+      INTO a pressure plate's cell and presses it.
+- [x] Minkowski AABB sweeps ✓ (2026-08-22): the parabolic DDA tracks
+      each axis's LEADING FACE (± half-width; top rising / feet falling)
+      and slab-scans the box's cross-section at every crossing — a mob's
+      shoulder catches a doorframe, its head hits low ceilings, and
+      footprint support is back CONSISTENTLY (faces stop at
+      boundary−ε, so walls can't fake support). Mobs 0.3×0.9, items
+      0.125×0.25; falling blocks/players stay point entities. Piston-
+      crushed soft blocks now drop their items (exactly-once via the
+      compound arm + position-derived pop ids).
 - [x] Basic mob AI ✓ (2026-08-21, skeleton): think = timed self-chained
       `EntityWake` at a per-mob jittered cadence (0.9-1.5 s). Chain
       discipline: next-think deadline lives in `aux`; only the guarded
