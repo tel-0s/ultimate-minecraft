@@ -188,6 +188,19 @@ fn push_destroys_soft_blocks() {
         BlockId::new(1),
         "stone slid into the destroyed torch's cell"
     );
+    // The crushed torch drops its item — exactly once (position-derived
+    // pop id + the compound arm only running on effective apply).
+    let items: Vec<_> = world
+        .entities()
+        .snapshot()
+        .into_iter()
+        .filter(|(_, s)| s.kind == ultimate_server::rules::entity::KIND_ITEM)
+        .collect();
+    assert_eq!(items.len(), 1, "exactly one drop from the crushed torch");
+    assert_eq!(
+        ultimate_server::rules::entity::aux_block(items[0].1.aux),
+        state_of("redstone_torch"),
+    );
 }
 
 #[test]

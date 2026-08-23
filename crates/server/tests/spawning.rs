@@ -13,7 +13,7 @@ use ultimate_engine::world::position::{BlockPos, ChunkPos, LocalBlockPos};
 
 use ultimate_server::block;
 use ultimate_server::physics::{self, BlockAction, PhysicsHandle};
-use ultimate_server::rules::entity::{KIND_PLAYER, player_entity_id, player_state};
+use ultimate_server::rules::entity::{player_entity_id, player_state};
 use ultimate_server::rules::mob::KIND_MOB;
 use ultimate_server::simulation::SimulationLayer;
 use ultimate_server::spawning::MobSpawner;

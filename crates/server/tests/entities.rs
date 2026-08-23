@@ -507,3 +507,126 @@ fn spawn_and_landing_reach_spatial_subscribers() {
     assert!(saw_spawn, "clients must learn the item spawned");
     assert!(saw_move, "clients must learn the landing");
 }
+
+// ── Minkowski box sweep: entities collide as BOXES, not points ───────────
+//
+// Launch physics used below: v=(6,3,0) from the floor gives 0.3s of
+// flight (~1.8m); the wall plane at x=10 is reached at t≈0.2s, mid-air.
+// (First drafts used v_y=0.5 — 0.05s of flight — and measured a landing,
+// not the wall: the mob "stopped" 0.15m out with both tests vacuous.)
+
+fn launch_mob(
+    world: &World,
+    handle: &PhysicsHandle,
+    pos: ultimate_engine::world::entity::Vec3,
+    vel: ultimate_engine::world::entity::Vec3,
+) -> EntityId {
+    let id = world.entities().allocate_id();
+    let s0 = ultimate_engine::world::entity::EntityState {
+        kind: ultimate_server::rules::mob::KIND_MOB,
+        pos,
+        vel,
+        stamp: world.now(),
+        aux: ultimate_server::rules::mob::pack_mob_aux(u64::MAX >> 20, 0),
+    };
+    handle.submit_events(vec![Event {
+        payload: EventPayload::EntitySet { id, old: None, new: Some(s0) },
+    }]);
+    id
+}
+
+/// Wall across z at x=10 with a 1-block doorway at z=8; floor stays open.
+fn doorway_world() -> (Arc<World>, Arc<ManualClock>) {
+    let (world, clock) = flat_world_manual_clock(2);
+    for z in 0..16i64 {
+        if z == 8 {
+            continue;
+        }
+        for y in 5..9 {
+            world.set_block(BlockPos::new(10, y, z), BlockId::new(1));
+        }
+    }
+    (world, clock)
+}
+
+/// A mob (0.3 half-width) aimed at the doorway but OFFSET so its center
+/// would pass while its shoulder wouldn't: the box sweep must stop it at
+/// the wall face (the point sweep sailed through).
+#[test]
+fn mob_shoulder_catches_a_doorframe() {
+    let (world, clock) = doorway_world();
+    let handle = start(&world, 4);
+
+    // Center z=8.75: aims at the open column, but the +z shoulder
+    // (8.75+0.3) overlaps wall cell z=9.
+    let id = launch_mob(
+        &world,
+        &handle,
+        ultimate_engine::world::entity::Vec3::new(8.5, 5.0, 8.75),
+        ultimate_engine::world::entity::Vec3::new(6.0, 3.0, 0.0),
+    );
+    quiesce(&handle);
+    advance_and_settle(&clock, &handle, 2000);
+
+    let s = world.entities().get(id).expect("mob alive");
+    assert!(
+        s.pos.x < 10.0 - 0.29,
+        "shoulder must catch the doorframe: face stops before x=10, got x={}",
+        s.pos.x
+    );
+    assert!(s.pos.x > 9.0, "it flew until the wall, not a phantom stop, got x={}", s.pos.x);
+}
+
+/// The same doorway CENTERED: a mob whose whole box fits passes through.
+#[test]
+fn mob_fits_through_a_wide_enough_gap() {
+    let (world, clock) = doorway_world();
+    let handle = start(&world, 4);
+
+    // Center z=8.5: box spans 8.2..8.8 — entirely inside cell z=8.
+    let id = launch_mob(
+        &world,
+        &handle,
+        ultimate_engine::world::entity::Vec3::new(8.5, 5.0, 8.5),
+        ultimate_engine::world::entity::Vec3::new(6.0, 3.0, 0.0),
+    );
+    quiesce(&handle);
+    advance_and_settle(&clock, &handle, 2000);
+
+    let s = world.entities().get(id).expect("mob alive");
+    assert!(
+        s.pos.x > 10.0,
+        "a centered mob fits through the doorway, got x={}",
+        s.pos.x
+    );
+}
+
+/// A rising mob under a low ceiling: the TOP face collides.
+#[test]
+fn mob_head_hits_a_low_ceiling() {
+    let (world, clock) = flat_world_manual_clock(2);
+    // Ceiling leaving only the y=5 cell open: a 0.9-tall mob FITS
+    // standing, but a hop's rise must stop at its head.
+    for x in 6..12i64 {
+        for z in 6..12i64 {
+            world.set_block(BlockPos::new(x, 6, z), BlockId::new(1));
+        }
+    }
+    let handle = start(&world, 4);
+
+    let id = launch_mob(
+        &world,
+        &handle,
+        ultimate_engine::world::entity::Vec3::new(8.5, 5.0, 8.5),
+        ultimate_engine::world::entity::Vec3::new(0.0, 3.0, 0.0),
+    );
+    quiesce(&handle);
+    advance_and_settle(&clock, &handle, 1500);
+
+    let s = world.entities().get(id).expect("mob alive");
+    assert!(
+        (s.pos.y - 5.0).abs() < 1e-6,
+        "hop stopped by the ceiling, back on the floor, got y={}",
+        s.pos.y
+    );
+}

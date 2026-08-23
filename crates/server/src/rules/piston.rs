@@ -90,6 +90,20 @@ fn push_destroys(id: BlockId) -> bool {
         )
 }
 
+/// The item form a crushed soft block drops: wall torches drop their
+/// standing torch; grass-likes drop nothing (vanilla).
+fn crushed_drop_form(id: BlockId) -> Option<BlockId> {
+    use crate::registry::block_id_from_name;
+    let standing = match block_name(id) {
+        "wall_torch" => "torch",
+        "soul_wall_torch" => "soul_torch",
+        "redstone_wall_torch" => "redstone_torch",
+        "short_grass" | "tall_grass" | "fern" | "dead_bush" => return None,
+        other => other,
+    };
+    Some(block_id_from_name(standing).unwrap_or(id))
+}
+
 /// Is the piston powered? Any neighbor except the cell its face points
 /// into (vanilla ignores power arriving through the face).
 fn piston_powered(world: &World, pos: BlockPos, front: BlockPos) -> bool {
@@ -125,11 +139,31 @@ pub fn piston(world: &World, payload: &EventPayload) -> Vec<Event> {
         // its synthesized per-cell BlockSets don't evaluate rules, so the
         // world re-derives from notifies emitted here — gravity above
         // moved blocks, fluid re-levels, wire re-solves, other pistons.
+        // This arm runs ONLY on effective apply, which is what makes the
+        // destroyed-soft-block drops below exactly-once (paired with the
+        // position-derived pop ids, like attachment pops).
         EventPayload::AtomicBlockSet { writes } => {
             let mut events = Vec::new();
             for w in writes.iter() {
                 events.push(Event { payload: EventPayload::BlockNotify { pos: w.pos } });
                 events.extend(notify_neighbors(w.pos));
+                // A soft block the push crushed (its cell overwritten by
+                // the chain) drops its item, vanilla-style. Air and
+                // fluids were displaced, not destroyed; grass-likes drop
+                // nothing (same rule as attachment pops).
+                if push_destroys(w.old)
+                    && !crate::block::is_replaceable(w.old)
+                    && w.new != w.old
+                {
+                    if let Some(dropped) = crushed_drop_form(w.old) {
+                        events.extend(crate::rules::entity::spawn_item_events_with_id(
+                            world,
+                            crate::rules::entity::pop_item_id(w.pos),
+                            w.pos,
+                            dropped,
+                        ));
+                    }
+                }
             }
             events
         }
@@ -219,7 +253,7 @@ fn retract(
     world: &World,
     pos: BlockPos,
     id: BlockId,
-    facing: &str,
+    _facing: &str,
     d: (i64, i64, i64),
     sticky: bool,
 ) -> Vec<Event> {

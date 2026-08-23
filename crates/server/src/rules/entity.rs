@@ -239,14 +239,34 @@ pub(crate) fn collides(kind: EntityKind, id: BlockId) -> bool {
     }
 }
 
-/// Standing on a solid top face? Center-point, consistent with the
-/// point trajectory sweep — footprint-corner probing without a matching
-/// Minkowski-dilated sweep lets a box "stand" on a wall it is pressed
-/// against (found by the fast-item wall test). True per-kind AABB
-/// sweeps (dilating the DDA by the half-width) are the follow-up.
+/// Collision box per kind: (horizontal half-width, height). Feet at
+/// `pos.y`, top at `pos.y + height`. Falling blocks and players stay
+/// point entities — falling blocks must land exactly where instant
+/// gravity would put the block, and players are externally driven.
+pub(crate) fn entity_box(kind: EntityKind) -> (f64, f64) {
+    match kind {
+        k if k == crate::rules::mob::KIND_MOB => (0.3, 0.9),
+        k if k == KIND_ITEM => (0.125, 0.25),
+        _ => (0.0, 0.0),
+    }
+}
+
+/// Standing on a solid top face? Footprint probe over the box's four
+/// corners — CONSISTENT with the Minkowski sweep, which stops a face at
+/// a wall boundary minus epsilon: the footprint of a box pressed against
+/// a wall never overlaps the wall's cell, so walls can't fake support.
 pub(crate) fn supported(world: &World, kind: EntityKind, pos: Vec3) -> bool {
-    let below = Vec3::new(pos.x, pos.y - 0.06, pos.z).block_pos();
-    collides(kind, world.get_block(below))
+    let (h, _) = entity_box(kind);
+    let y = pos.y - 0.06;
+    let probes: &[(f64, f64)] = if h == 0.0 {
+        &[(0.0, 0.0)]
+    } else {
+        &[(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)]
+    };
+    probes.iter().any(|(sx, sz)| {
+        let below = Vec3::new(pos.x + sx * h, y, pos.z + sz * h).block_pos();
+        collides(kind, world.get_block(below))
+    })
 }
 
 /// EXACT swept collision: walk the parabolic trajectory
@@ -263,22 +283,41 @@ pub(crate) fn supported(world: &World, kind: EntityKind, pos: Vec3) -> bool {
 /// re-falls (side/ceiling stops re-plan straight down).
 fn plan_segment(world: &World, start: &EntityState) -> EntityState {
     let (p0, v0) = (start.pos, start.vel);
+    let (h, height) = entity_box(start.kind);
     let t_max = T_CAP as f64 / 1e9;
-    let mut cell = p0.block_pos();
-    // A rest pose sits EXACTLY on a cell boundary (y = k + 1.0). A
-    // non-rising entity there occupies the cell BELOW — without this the
-    // τ=0 double root of the floor plane is filtered as "already
-    // crossed" and the sweep never sees the entity enter it (planning a
-    // clean 1-second drop through the floor).
-    if p0.y == cell.y as f64 && v0.y <= 0.0 {
-        cell.y -= 1;
+
+    // Feet-cell attribution: a rest pose sits EXACTLY on a cell boundary
+    // (y = k + 1.0); a non-rising entity there occupies the cell BELOW —
+    // without this the τ=0 double root of the floor plane is filtered as
+    // "already crossed" and the sweep plans a clean drop through the
+    // floor.
+    let mut feet_cell_y = p0.y.floor() as i64;
+    if p0.y == feet_cell_y as f64 && v0.y <= 0.0 {
+        feet_cell_y -= 1;
     }
 
-    // Segment starts inside a solid cell (a block was placed into the
-    // entity's cell): pop onto the cell top, like the sampler did.
-    if collides(start.kind, world.get_block(cell)) {
+    // Occupied cell ranges (the box's Minkowski footprint on the grid).
+    let cell_range = |lo: f64, hi: f64| -> (i64, i64) { (lo.floor() as i64, hi.floor() as i64) };
+    let (x0_lo, x0_hi) = cell_range(p0.x - h, p0.x + h);
+    let (z0_lo, z0_hi) = cell_range(p0.z - h, p0.z + h);
+    let y0_hi = (p0.y + height).floor() as i64;
+
+    // Buried check: any overlapped cell collides → pop onto the feet
+    // cell's top, like the point version did.
+    let mut buried = false;
+    'buried: for cy in feet_cell_y..=y0_hi.max(feet_cell_y) {
+        for cx in x0_lo..=x0_hi {
+            for cz in z0_lo..=z0_hi {
+                if collides(start.kind, world.get_block(BlockPos::new(cx, cy, cz))) {
+                    buried = true;
+                    break 'buried;
+                }
+            }
+        }
+    }
+    if buried {
         return EntityState {
-            pos: Vec3::new(p0.x, cell.y as f64 + 1.0, p0.z),
+            pos: Vec3::new(p0.x, feet_cell_y as f64 + 1.0, p0.z),
             vel: Vec3::ZERO,
             stamp: start.stamp + BURIED_ESCAPE,
             ..*start
@@ -294,58 +333,107 @@ fn plan_segment(world: &World, start: &EntityState) -> EntityState {
         )
     };
 
-    // Linear DDA state per horizontal axis: time of next boundary
-    // crossing and the fixed per-cell time step.
-    let axis_init = |x0: f64, vx: f64, cx: i64| -> (f64, f64) {
-        if vx > 0.0 {
-            (((cx + 1) as f64 - x0) / vx, 1.0 / vx)
-        } else if vx < 0.0 {
-            ((cx as f64 - x0) / vx, -1.0 / vx)
+    // Linear DDA per horizontal axis, tracking the LEADING FACE (center
+    // offset ±h): time of next boundary crossing + fixed per-cell step.
+    // `layer` is the cell layer the leading face is about to enter.
+    let axis_init = |c0: f64, v: f64| -> (f64, f64, i64) {
+        if v > 0.0 {
+            let face = c0 + h;
+            let layer = face.floor() as i64 + 1;
+            ((layer as f64 - face) / v, 1.0 / v, layer)
+        } else if v < 0.0 {
+            let face = c0 - h;
+            let layer = face.floor() as i64; // enters layer-1 when face hits `layer`
+            ((face - layer as f64) / -v, 1.0 / -v, layer - 1)
         } else {
-            (f64::INFINITY, f64::INFINITY)
+            (f64::INFINITY, f64::INFINITY, 0)
         }
     };
-    let (mut t_x, dt_x) = axis_init(p0.x, v0.x, cell.x);
-    let (mut t_z, dt_z) = axis_init(p0.z, v0.z, cell.z);
+    let (mut t_x, dt_x, mut layer_x) = axis_init(p0.x, v0.x);
+    let (mut t_z, dt_z, mut layer_z) = axis_init(p0.z, v0.z);
 
-    // Next y-boundary crossing strictly after `t`, leaving the current
-    // cell. The parabola is concave (GRAVITY < 0), so it crosses any
-    // horizontal line at most twice: once rising (smaller root), once
-    // falling (larger root). Returns (t_cross, dy).
-    let next_y = |t: f64, cy: i64| -> (f64, i64) {
-        // Roots of ½g·τ² + v0y·τ + (p0.y - yb) = 0.
-        let roots = |yb: f64| -> (f64, f64) {
-            let (a, b, c) = (0.5 * GRAVITY, v0.y, p0.y - yb);
-            let disc = b * b - 4.0 * a * c;
-            if disc < 0.0 {
-                return (f64::INFINITY, f64::INFINITY);
-            }
-            let sq = disc.sqrt();
-            // a < 0: (−b+√)/2a is the SMALLER (rising) root.
-            let r1 = (-b + sq) / (2.0 * a);
-            let r2 = (-b - sq) / (2.0 * a);
-            (r1.min(r2), r1.max(r2))
-        };
-        const T_EPS: f64 = 1e-12;
-        // Rising exit through the ceiling plane…
-        let (up, _) = roots((cy + 1) as f64);
-        // …or falling exit through the floor plane.
-        let (_, down) = roots(cy as f64);
+    // Vertical: the parabola is concave, so each horizontal plane is
+    // crossed at most twice — once rising (smaller root), once falling
+    // (larger). The leading face is the TOP (y+height) while rising and
+    // the FEET (y) while falling; track both candidate crossings.
+    let roots = |plane: f64| -> (f64, f64) {
+        let (a, b, c) = (0.5 * GRAVITY, v0.y, p0.y - plane);
+        let disc = b * b - 4.0 * a * c;
+        if disc < 0.0 {
+            return (f64::INFINITY, f64::INFINITY);
+        }
+        let sq = disc.sqrt();
+        let r1 = (-b + sq) / (2.0 * a); // a < 0: the SMALLER (rising) root
+        let r2 = (-b - sq) / (2.0 * a);
+        (r1.min(r2), r1.max(r2))
+    };
+    const T_EPS: f64 = 1e-12;
+    // Next vertical crossing strictly after `t`. `top_layer`/`feet_layer`
+    // are the cell layers of the respective faces' current cells.
+    let next_y = |t: f64, top_layer: i64, feet_layer: i64| -> (f64, i64, i64) {
+        // Top face exits upward through plane (top_layer + 1): solve
+        // y(t) + height = plane.
+        let (up, _) = roots((top_layer + 1) as f64 - height);
+        // Feet exit downward through plane feet_layer.
+        let (_, down) = roots(feet_layer as f64);
         let up = if up > t + T_EPS { up } else { f64::INFINITY };
         let down = if down > t + T_EPS { down } else { f64::INFINITY };
-        if up < down { (up, 1) } else { (down, -1) }
+        if up < down { (up, 1, top_layer + 1) } else { (down, -1, feet_layer - 1) }
+    };
+    let mut top_layer = y0_hi;
+    let mut feet_layer = feet_cell_y;
+
+    // Scan the slab of cells the box's cross-section overlaps when a
+    // face enters a new layer on `axis` at time `t`.
+    let slab_hit = |world: &World, kind: EntityKind, axis: u8, layer: i64, t: f64| -> bool {
+        let p = at(t);
+        let (ylo, yhi) = ((p.y).floor() as i64, (p.y + height).floor() as i64);
+        let (xlo, xhi) = cell_range(p.x - h, p.x + h);
+        let (zlo, zhi) = cell_range(p.z - h, p.z + h);
+        let check = |cx: i64, cy: i64, cz: i64| -> bool {
+            collides(kind, world.get_block(BlockPos::new(cx, cy, cz)))
+        };
+        match axis {
+            0 => {
+                for cy in ylo..=yhi {
+                    for cz in zlo..=zhi {
+                        if check(layer, cy, cz) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            1 => {
+                for cx in xlo..=xhi {
+                    for cz in zlo..=zhi {
+                        if check(cx, layer, cz) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            _ => {
+                for cy in ylo..=yhi {
+                    for cx in xlo..=xhi {
+                        if check(cx, cy, layer) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
     };
 
     let mut t = 0.0;
     loop {
-        let (t_y, dy) = next_y(t, cell.y);
-        // Earliest crossing wins; ties break y-first (deterministic).
-        let (t_cross, axis) = if t_y <= t_x && t_y <= t_z {
-            (t_y, 1)
+        let (t_y, dy, y_layer) = next_y(t, top_layer, feet_layer);
+        let (t_cross, axis, layer) = if t_y <= t_x && t_y <= t_z {
+            (t_y, 1u8, y_layer)
         } else if t_x <= t_z {
-            (t_x, 0)
+            (t_x, 0u8, layer_x)
         } else {
-            (t_z, 2)
+            (t_z, 2u8, layer_z)
         };
 
         if t_cross > t_max {
@@ -359,39 +447,31 @@ fn plan_segment(world: &World, start: &EntityState) -> EntityState {
             };
         }
 
-        let entered = match axis {
-            1 => BlockPos::new(cell.x, cell.y + dy, cell.z),
-            0 => BlockPos::new(cell.x + v0.x.signum() as i64, cell.y, cell.z),
-            _ => BlockPos::new(cell.x, cell.y, cell.z + v0.z.signum() as i64),
-        };
-
-        if collides(start.kind, world.get_block(entered)) {
+        if slab_hit(world, start.kind, axis, layer, t_cross) {
             let hit = at(t_cross);
             let pos = match (axis, dy) {
-                // Landing on a top face: rest exactly on it.
-                (1, -1) => Vec3::new(hit.x, entered.y as f64 + 1.0, hit.z),
-                // Ceiling: stop just below the face.
-                (1, _) => Vec3::new(hit.x, entered.y as f64 - FACE_EPS, hit.z),
-                // Wall: stop just in front of the face; the follow-up
-                // evaluation finds no support and re-plans straight down.
-                // (The sampler used to VAULT side-grazes onto the wall
-                // top whenever the entity was falling — an artifact of
-                // its 0.5-block resolution, not vanilla behavior.)
+                // Landing: feet rest exactly on the entered layer's top.
+                (1, -1) => Vec3::new(hit.x, (layer + 1) as f64, hit.z),
+                // Ceiling: top face stops just below the entered layer.
+                (1, _) => Vec3::new(hit.x, layer as f64 - height - FACE_EPS, hit.z),
+                // Wall: the leading face stops just in front of the
+                // entered layer; the follow-up evaluation finds no
+                // support and re-plans straight down.
                 (0, _) => {
-                    let face = if v0.x > 0.0 {
-                        entered.x as f64 - FACE_EPS
+                    let x = if v0.x > 0.0 {
+                        layer as f64 - h - FACE_EPS
                     } else {
-                        (entered.x + 1) as f64 + FACE_EPS
+                        (layer + 1) as f64 + h + FACE_EPS
                     };
-                    Vec3::new(face, hit.y, hit.z)
+                    Vec3::new(x, hit.y, hit.z)
                 }
                 _ => {
-                    let face = if v0.z > 0.0 {
-                        entered.z as f64 - FACE_EPS
+                    let z = if v0.z > 0.0 {
+                        layer as f64 - h - FACE_EPS
                     } else {
-                        (entered.z + 1) as f64 + FACE_EPS
+                        (layer + 1) as f64 + h + FACE_EPS
                     };
-                    Vec3::new(hit.x, hit.y, face)
+                    Vec3::new(hit.x, hit.y, z)
                 }
             };
             return EntityState {
@@ -402,11 +482,23 @@ fn plan_segment(world: &World, start: &EntityState) -> EntityState {
             };
         }
 
-        cell = entered;
+        // Free crossing: the face advances into the layer.
         match axis {
-            0 => t_x += dt_x,
-            2 => t_z += dt_z,
-            _ => {}
+            0 => {
+                layer_x += if v0.x > 0.0 { 1 } else { -1 };
+                t_x += dt_x;
+            }
+            2 => {
+                layer_z += if v0.z > 0.0 { 1 } else { -1 };
+                t_z += dt_z;
+            }
+            _ => {
+                if dy == 1 {
+                    top_layer = layer;
+                } else {
+                    feet_layer = layer;
+                }
+            }
         }
         t = t_cross;
     }
